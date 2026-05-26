@@ -38,7 +38,7 @@ widestring = "1"
 sha2 = { version = "0.10", default-features = false }
 
 [target.'cfg(windows)'.dependencies.windows]
-version = "0.58"
+version = "0.61"
 features = [
   "Win32_Foundation",
   "Win32_Storage_FileSystem",

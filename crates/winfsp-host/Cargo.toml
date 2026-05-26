@@ -35,7 +35,7 @@ unicode-normalization = "0.1"
 # WinFsp 2.1 installed caused E0609 errors in winfsp crate internals.
 winfsp = "0.13"
 widestring = "1"
-sha2 = { version = "0.10", default-features = false }
+sha2 = { version = "0.11", default-features = false }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"

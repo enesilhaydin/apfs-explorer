@@ -1,0 +1,32 @@
+[workspace]
+members = [
+  "crates/apfs-core",
+  "crates/apfs",
+  "crates/apfs-write",
+  "crates/winfsp-host",
+  "crates/apfs-service",
+  "crates/apfs-tray",
+  "crates/installer",
+  "xtask",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0-only"
+rust-version = "1.77"
+repository = "https://github.com/USER/apfs-explorer"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unimplemented = "deny"
+todo = "deny"
+indexing_slicing = "warn"
+
+[workspace.dependencies]
+thiserror = "2"
+tracing = "0.1"
+tempfile = "3"
+unicode-normalization = "0.1"

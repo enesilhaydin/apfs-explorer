@@ -1,0 +1,97 @@
+# ============================================================
+#  ASLA COMMIT EDİLMEYECEK — sır / kimlik / yerel / büyük dosya
+#  (Git kökü ev dizini olabilir; bu repo izole ama yine de dikkat)
+# ============================================================
+
+# --- Sırlar / kimlik bilgileri (KESİN) ---
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+id_rsa
+id_ed25519
+id_ecdsa
+*.crt
+*.cer
+.env
+.env.*
+!.env.example
+*.secret
+secrets/
+credentials/
+*-pass
+*-password
+*.token
+.netrc
+.npmrc
+.cargo/credentials*
+*.gpg
+*.asc
+
+# --- Yerel / makine-özel ---
+.claude/settings.local.json
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# --- Rust build ---
+/target
+**/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# --- Bağımlılık / paket ---
+node_modules/
+**/node_modules/
+
+# --- Build / installer çıktısı ---
+installer/build/
+*.msi.tmp
+
+# --- Log / geçici ---
+*.log
+!docs/**/*.log
+tmp/
+*.tmp
+
+# --- Local reference PDF (Apple-copyrighted, freely downloadable; kept local) ---
+docs/Apple-File-System-Reference.pdf
+docs/refs/Apple-File-System-Reference.pdf
+
+# --- Disk imajları: SADECE tests/fixtures/ altında Git LFS ile ---
+*.dmg
+*.sparseimage
+*.img
+!tests/fixtures/**
+
+# Generated real APFS fixture (macOS hdiutil; regenerate via `cargo run -p xtask -- gen-fixture`)
+/tests/fixtures/apfs-tiny.img
+/tests/fixtures/apfs-tiny.img.manifest.json
+/tests/fixtures/apfs-large.img
+/tests/fixtures/apfs-large.img.manifest.json
+/tests/fixtures/.apfs-large-mnt/
+
+# Apple kext decompile cache — clean-room: raw Hex-Rays pseudocode never committed.
+# Algorithm summaries (written in our own words) live in docs/refs/apple-apfs-kext-symbols.md.
+.apple-cache/
+
+# Local reference repos (manually cloned for cross-check; not part of this project)
+linux-apfs-rw/
+apfs-fuse/
+libfsapfs/
+apfsprogs/
+go-apfs/
+
+# Dev-internal Claude Code instructions (cross-check workflow, IDA notes) — not published
+CLAUDE.md
+crates/*/CLAUDE.md
+xtask/CLAUDE.md
+
+# Dev-internal MCP + Claude Code state — local only, never published
+.mcp.json
+.claude/

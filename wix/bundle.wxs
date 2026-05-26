@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- One-installer bundle: ensure WinFsp is present (install the bundled
+     redistributable MSI only if its registry marker is absent), then
+     install our product MSI. Resolve on the box: the exact WinFsp MSI
+     filename/path (operator stages the official WinFsp 2.x MSI at
+     dist/winfsp.msi) and confirm the registry marker key/value. -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension"
+     xmlns:bal="http://schemas.microsoft.com/wix/BalExtension">
+  <Bundle Name="APFS Explorer for Windows"
+          Version="$(var.Version)"
+          Manufacturer="APFS Explorer Contributors"
+          UpgradeCode="2814EE00-F571-48A2-B9B6-B3B827DCF357">
+    <!-- UpgradeCode STABLE — do not regenerate -->
+    <BootstrapperApplicationRef
+      Id="WixStandardBootstrapperApplication.RtfLicense">
+      <bal:WixStandardBootstrapperApplication
+        LicenseFile="wix\license.rtf" />
+    </BootstrapperApplicationRef>
+
+    <!-- WinFsp present? marker = its WOW6432Node InstallDir value. -->
+    <util:RegistrySearch
+      Id="WinFspInstalled"
+      Variable="WinFspInstalled"
+      Root="HKLM"
+      Key="SOFTWARE\WOW6432Node\WinFsp"
+      Value="InstallDir"
+      Result="exists" />
+
+    <Chain>
+      <!-- WinFsp: silent install (/qn), no reboot prompt, restart manager
+           disabled to prevent spurious "close running apps" dialogs. -->
+      <MsiPackage Id="WinFsp"
+                  SourceFile="dist\winfsp.msi"
+                  Permanent="yes"
+                  Vital="yes"
+                  InstallCondition="NOT WinFspInstalled"
+                  MsiOptions="/qn /norestart MSIRESTARTMANAGERCONTROL=Disable" />
+      <MsiPackage Id="ApfsExplorer"
+                  SourceFile="dist\apfs-explorer.msi"
+                  Vital="yes" />
+    </Chain>
+  </Bundle>
+</Wix>

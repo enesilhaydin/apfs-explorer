@@ -1,0 +1,59 @@
+[package]
+name = "winfsp-host"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "apfs-mount"
+path = "src/main.rs"
+
+[[bin]]
+name = "apfs-dump"
+path = "src/dump.rs"
+
+[dependencies]
+apfs = { path = "../apfs" }
+apfs-core = { path = "../apfs-core" }
+# Step D write callbacks delegate to apfs-write API (create_file, write_file,
+# unlink, rename, mkdir). The crate's COW Transaction + checksum disciplines
+# all on-disk mutation; WinFsp callbacks just translate Windows semantics.
+apfs-write = { path = "../apfs-write" }
+# Windows hands us pre-composed UTF-16 for paths the kernel canonicalises
+# (e.g. "Yeni klasör"); APFS catalog DRECs may be stored decomposed.
+# Comparing raw bytes mismatches even though both forms render identically,
+# so canonical-case lookup must normalise both sides to NFD before
+# Unicode-aware case folding.
+unicode-normalization = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+# winfsp 0.13: targets WinFsp 2.1 SDK; 0.11 built against WinFsp 2.0 which
+# lacks UserContext field in _FSP_SERVICE — bindgen mismatch on box with
+# WinFsp 2.1 installed caused E0609 errors in winfsp crate internals.
+winfsp = "0.13"
+widestring = "1"
+sha2 = { version = "0.10", default-features = false }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_Ioctl",
+  "Win32_Security",
+]
+
+# winfsp-rs REQUIRES delay-loading of winfsp-x64.dll: the import must be
+# delay-loaded so winfsp_init()/FspLoad can resolve the DLL from the WinFsp
+# registry install path at runtime. Without build.rs winfsp_link_delayload()
+# the binary fails at load with STATUS_DLL_NOT_FOUND (0xC0000135) before
+# main() runs. See crates/winfsp-host/build.rs.
+[target.'cfg(windows)'.build-dependencies]
+winfsp = "0.13"
+
+[dev-dependencies]
+tempfile = { workspace = true }

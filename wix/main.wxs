@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- apfs-explorer product MSI. Built by `cargo wix` (WiX v3).
+     Resolve/confirm on the box: cargo-wix expects this at wix/main.wxs;
+     binary source paths are the release build outputs. -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="APFS Explorer for Windows"
+           Manufacturer="APFS Explorer Contributors"
+           Version="$(var.Version)"
+           UpgradeCode="9C0B4B24-2E88-465E-A60A-71BFC8D9D68D"
+           Language="1033">
+    <!-- UpgradeCode STABLE — do not regenerate -->
+    <Package InstallerVersion="500" Compressed="yes"
+             InstallScope="perMachine" />
+    <MajorUpgrade DowngradeErrorMessage=
+      "A newer version of APFS Explorer for Windows is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Add/Remove Programs icon (points to apfs-tray.exe icon resource). -->
+    <Icon Id="AppIcon.exe" SourceFile="$(var.TrayExe)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.exe" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/USER/apfs-explorer" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="apfs-explorer">
+          <Component Id="C_ApfsTray" Guid="A1A03825-B196-4009-A11A-A72A8BB2A3B8">
+            <File Id="F_ApfsTray"
+                  Source="$(var.TrayExe)"
+                  KeyPath="yes" Checksum="yes" />
+          </Component>
+          <Component Id="C_ApfsMount" Guid="A959BC49-36E7-418B-B2AF-3978D1C32533">
+            <File Id="F_ApfsMount"
+                  Source="$(var.MountExe)"
+                  KeyPath="yes" Checksum="yes" />
+          </Component>
+          <!-- Per-user autostart: HKCU Run -> apfs-tray. Per-user so no
+               UAC at logon; the agent runs in the user session (M5). -->
+          <Component Id="C_Autostart" Guid="FA1B4D7A-7557-4A4E-8F68-BA36512BF95D">
+            <RegistryValue
+              Root="HKCU"
+              Key="Software\Microsoft\Windows\CurrentVersion\Run"
+              Name="apfs-tray"
+              Type="string"
+              Value="&quot;[INSTALLFOLDER]apfs-tray.exe&quot;"
+              KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+      <!-- Start Menu shortcut under Programs\APFS Explorer. -->
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="APFS Explorer">
+          <Component Id="C_StartMenuShortcut"
+                     Guid="B3C2D1A0-9F4E-4B7C-8D5A-6E3F2A1B0C9D">
+            <Shortcut Id="SC_ApfsTray"
+                      Name="APFS Explorer"
+                      Description="Mount APFS volumes on Windows"
+                      Target="[INSTALLFOLDER]apfs-tray.exe"
+                      WorkingDirectory="INSTALLFOLDER" />
+            <RemoveFolder Id="RF_AppProgramsFolder"
+                          Directory="ApplicationProgramsFolder"
+                          On="uninstall" />
+            <RegistryValue Root="HKCU"
+                           Key="Software\APFSExplorer"
+                           Name="StartMenuShortcut"
+                           Type="integer"
+                           Value="1"
+                           KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Main" Title="APFS Explorer for Windows" Level="1">
+      <ComponentRef Id="C_ApfsTray" />
+      <ComponentRef Id="C_ApfsMount" />
+      <ComponentRef Id="C_Autostart" />
+      <ComponentRef Id="C_StartMenuShortcut" />
+    </Feature>
+  </Product>
+</Wix>

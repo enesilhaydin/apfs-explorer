@@ -1,0 +1,12 @@
+# Icon and screenshot assets
+
+Place the following here once generated:
+
+- `icon-256.png` — App icon (256x256)
+- `icon-tray.ico` — Tray icon (multi-resolution ICO: 16, 32, 48)
+- `social-preview.png` — GitHub social preview card (1280x640)
+- `installer-banner.bmp` — WiX installer welcome banner (493x312)
+- `installer-header.bmp` — WiX installer top header (493x58)
+- `demo.gif` — Mount → write → eject animation
+
+See `docs/icon-prompts.md` for AI generation prompts.

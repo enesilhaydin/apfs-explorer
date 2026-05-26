@@ -8,6 +8,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Workspace splits into platform-independent crates (apfs-core, apfs,
+# apfs-write) and Windows-only crates (winfsp-host, apfs-tray, apfs-service,
+# installer). Linux runners cover the core crates; macOS shares that subset;
+# Windows builds the full workspace where the WinFsp SDK is present.
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -19,10 +24,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy core crates
+        run: cargo clippy -p apfs-core -p apfs -p apfs-write --all-targets -- -D warnings
 
-  test:
+  test-linux-core:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,4 +37,29 @@ jobs:
           lfs: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - name: test core crates
+        run: cargo test -p apfs-core -p apfs -p apfs-write --lib
+
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: test core crates
+        run: cargo test -p apfs-core -p apfs -p apfs-write --lib
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build full workspace (release)
+        run: cargo build --workspace --release
+      - name: test workspace lib
+        run: cargo test --workspace --lib

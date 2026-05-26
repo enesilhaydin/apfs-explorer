@@ -15,7 +15,7 @@ path = "src/main.rs"
 winfsp-host = { path = "../winfsp-host" }
 
 [target.'cfg(windows)'.dependencies]
-tray-icon = "0.19"
+tray-icon = "0.24"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"

@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "APFS Explorer",
+  "version": "1.0.0",
+  "identifier": "com.apfsexplorer.gui",
+  "build": {
+    "frontendDist": "ui",
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
+    "devUrl": null
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "APFS Explorer",
+        "width": 760,
+        "height": 600,
+        "minWidth": 480,
+        "minHeight": 420,
+        "center": true,
+        "resizable": true,
+        "decorations": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "publisher": "Enes Ilhan AYDIN",
+    "category": "Utility",
+    "shortDescription": "Mount and browse APFS (Apple File System) volumes on Windows.",
+    "longDescription": "APFS Explorer mounts Apple File System (APFS) USB drives and disk images on Windows as a drive letter (via WinFsp) and lets you browse them read-only. Single-EXE layout: the GUI (apfs-explorer.exe) spawns the elevated mount helper (apfs-mount.exe) installed alongside it.",
+    "resources": ["apfs-mount.exe"],
+    "windows": {
+      "wix": {
+        "language": "en-US",
+        "fragmentPaths": ["wix/winfsp-launcher.wxs"],
+        "componentGroupRefs": ["WinFspLauncherClass"]
+      }
+    }
+  }
+}

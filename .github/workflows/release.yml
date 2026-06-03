@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-release:
+    name: Build MSI installer
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: windows-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            windows-cargo-registry-
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: windows-cargo-target-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            windows-cargo-target-release-
+
+      - name: Build release binary
+        run: cargo build --release -p winfsp-host
+
+      - name: Download WinFsp redistributable
+        shell: pwsh
+        run: |
+          # WinFsp 2.1 - must match the winfsp 0.13 / winfsp-sys 0.12.1 (WinFsp 2.1 SDK)
+          # the binary links against; bundling 2.0 produces a broken installer.
+          $url = 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile dist/winfsp.msi
+
+      - name: Install WiX 3.11
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/wixtoolset/wix3/releases/download/wix3112rtm/wix311-binaries.zip'
+          Invoke-WebRequest -Uri $url -OutFile wix.zip
+          Expand-Archive wix.zip -DestinationPath C:\wix
+          Add-Content $env:GITHUB_PATH 'C:\wix'
+
+      - name: Install Tauri CLI (prebuilt binary)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli
+
+      - name: Build installer (xtask package)
+        run: cargo run -p xtask -- package
+
+      - name: Extract changelog for this release
+        id: changelog
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $version = $tag.TrimStart('v')
+          $content = Get-Content CHANGELOG.md -Raw
+          $pattern = "## \[$version\].*?(?=## \[|\z)"
+          $match = [regex]::Match($content, $pattern, [System.Text.RegularExpressions.RegexOptions]::Singleline)
+          if ($match.Success) {
+            $notes = $match.Value.Trim()
+          } else {
+            $notes = "Release $tag"
+          }
+          $notes | Out-File -FilePath release_notes.txt -Encoding utf8
+          echo "notes_file=release_notes.txt" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: ${{ steps.changelog.outputs.notes_file }}
+          files: |
+            dist/apfs-explorer-setup.exe
+            dist/apfs-explorer.msi
+            dist/winfsp.msi
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-pre') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

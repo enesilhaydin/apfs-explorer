@@ -1,0 +1,116 @@
+# ============================================================
+#  NEVER COMMIT - secrets / credentials / local / large files
+#  (stay careful even though this repo is isolated)
+# ============================================================
+
+# --- Secrets / credentials ---
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+id_rsa
+id_ed25519
+id_ecdsa
+*.crt
+*.cer
+.env
+.env.*
+!.env.example
+*.secret
+secrets/
+credentials/
+*-pass
+*-password
+*.token
+.netrc
+.npmrc
+.cargo/credentials*
+*.gpg
+*.asc
+
+# --- Local / machine-specific ---
+.claude/settings.local.json
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# --- Rust build ---
+/target
+**/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# --- Dependencies / packages ---
+node_modules/
+**/node_modules/
+
+# --- Build / installer output ---
+installer/build/
+*.msi.tmp
+
+# --- Logs / temporary ---
+*.log
+!docs/**/*.log
+tmp/
+*.tmp
+
+# --- Local reference PDF (Apple-copyrighted, freely downloadable; kept local) ---
+docs/Apple-File-System-Reference.pdf
+docs/refs/Apple-File-System-Reference.pdf
+
+# --- Disk images: only under tests/fixtures/ via Git LFS ---
+*.dmg
+*.sparseimage
+*.img
+!tests/fixtures/**
+
+# Generated real APFS fixture (macOS hdiutil; regenerate via `cargo run -p xtask -- gen-fixture`)
+/tests/fixtures/apfs-tiny.img
+/tests/fixtures/apfs-tiny.img.manifest.json
+/tests/fixtures/apfs-large.img
+/tests/fixtures/apfs-large.img.manifest.json
+/tests/fixtures/.apfs-large-mnt/
+
+# Apple kext decompile cache - clean-room: raw Hex-Rays pseudocode never committed.
+# Local analysis/reference scratch - not published.
+.apple-cache/
+.cross-check-cache/
+
+# Local reference repositories (manually cloned; not part of this project).
+linux-apfs-rw/
+apfs-fuse/
+libfsapfs/
+apfsprogs/
+go-apfs/
+
+# Dev-internal instructions + local tooling state - not published.
+CLAUDE.md
+crates/*/CLAUDE.md
+xtask/CLAUDE.md
+.mcp.json
+.claude/
+
+# Dev-internal documentation + tooling kept local-only (never published).
+/docs/superpowers/
+/docs/ROADMAP.md
+/docs/icon-prompts.md
+/docs/RESUME-*.md
+/docs/m7-realdisk-proof.md
+/docs/m7-polish-benchmark.md
+/docs/m13-windows-smoke-test-2026-05-26.md
+/docs/tray-test-guide.md
+/docs/refs/*
+!/docs/refs/architecture.md
+!/docs/refs/testing.md
+!/docs/refs/error-handling-crash-safety.md
+/scripts/reindex-kb.md
+/tools/reindex_kb.py
+/docs/library-usage.md
+/docs/m8-realdisk-benchmark.md
+/docs/tested-platforms.md
+/tools/r156-exp/

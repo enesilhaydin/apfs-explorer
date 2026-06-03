@@ -1,0 +1,70 @@
+[package]
+name = "apfs-write"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+write = []
+
+[lints]
+workspace = true
+
+[dependencies]
+apfs-core = { path = "../apfs-core" }
+thiserror.workspace = true
+tracing.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+apfs-core = { path = "../apfs-core" }
+apfs = { path = "../apfs" }
+
+[[test]]
+name = "snapshot_scratch"
+path = "tests/snapshot_scratch.rs"
+
+[[test]]
+name = "chaos_write"
+path = "tests/chaos_write.rs"
+
+[[test]]
+name = "property_random_workload"
+path = "tests/property_random_workload.rs"
+
+[[test]]
+name = "property_mount_cycle"
+path = "tests/property_mount_cycle.rs"
+
+[[test]]
+name = "stress_many_snapshots"
+path = "tests/stress_many_snapshots.rs"
+
+[[test]]
+name = "stress_large_file"
+path = "tests/stress_large_file.rs"
+
+[[test]]
+name = "xattr_stream"
+path = "tests/xattr_stream.rs"
+
+[[test]]
+name = "integration_file_ops"
+path = "tests/integration_file_ops.rs"
+
+[[test]]
+name = "integration_txn_lifecycle"
+path = "tests/integration_txn_lifecycle.rs"
+
+[[test]]
+name = "integration_snapshot"
+path = "tests/integration_snapshot.rs"
+
+[[test]]
+name = "integration_fsview"
+path = "tests/integration_fsview.rs"
+
+[[test]]
+name = "integration_snapshot_revert"
+path = "tests/integration_snapshot_revert.rs"

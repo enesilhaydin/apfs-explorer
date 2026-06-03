@@ -1,0 +1,227 @@
+.\" apfs-mount.1 - manual page for apfs-mount
+.\" Generated for apfs-explorer project.
+.TH APFS\-MOUNT 1 "2026-05-26" "apfs-explorer v1.0" "User Commands"
+.SH NAME
+apfs\-mount \- mount APFS volumes on Windows via WinFsp
+.SH SYNOPSIS
+.B apfs\-mount
+.RB [ \-h | \-\-help ]
+.RB [ \-V | \-\-version ]
+.I SUBCOMMAND
+.RI [ OPTIONS ]
+.PP
+Subcommands:
+.PP
+.B apfs\-mount mount
+.RB [ \-d
+.IR DEVICE ]
+.RB [ \-v
+.IR VOLUME ]
+.RB [ \-l
+.IR LETTER ]
+.RB [ \-r ]
+.PP
+.B apfs\-mount snapshot
+.RB { list | create | delete | revert }
+.RB [ \-d
+.IR DEVICE ]
+.RB [ \-v
+.IR VOLUME ]
+.RB [ \-n
+.IR NAME ]
+.PP
+.B apfs\-mount clone
+.RB \-d
+.IR DEVICE
+.RB \-v
+.IR VOLUME
+.RB \-\-src
+.IR PATH
+.RB \-\-dst
+.IR PATH
+.PP
+.B apfs\-mount volume
+.RB { list | info }
+.RB [ \-d
+.IR DEVICE ]
+.SH DESCRIPTION
+.B apfs\-mount
+mounts APFS-formatted volumes as Windows drive letters using the WinFsp user-mode
+file system framework. It supports read and write access, snapshots, and
+copy-on-write file cloning.
+.PP
+.B apfs\-mount
+operates directly on block devices or disk image files. No kernel driver for the
+APFS format is required; WinFsp provides the VFS bridge.
+.PP
+The tool runs on Windows 10 / Windows 11 (x86-64). WinFsp 2.1 or later must be
+installed before use.
+.SH SUBCOMMANDS
+.SS mount
+Mount an APFS volume as a Windows drive letter.
+.TP
+.BR \-d ", " \-\-device " " \fIDEVICE\fR
+Block device or image file path. Examples:
+.br
+\fB\\\\\\\\.\\\\\\ PhysicalDrive1\fR (physical disk, requires elevation),
+.br
+\fBC:\\\\images\\\\disk.img\fR (image file).
+.TP
+.BR \-v ", " \-\-volume " " \fIVOLUME\fR
+Volume name to mount. If omitted and only one APFS volume is present in the
+container, that volume is selected automatically.
+.TP
+.BR \-l ", " \-\-letter " " \fILETTER\fR
+Drive letter to assign (e.g.\& \fBZ\fR). If omitted, the next available letter
+is assigned automatically.
+.TP
+.BR \-r ", " \-\-read\-only
+Mount in read-only mode. Writes return \fBACCESS_DENIED\fR.
+.TP
+.BR \-\-uid " " \fIUID\fR
+Override the UID reported for all files (default: current user).
+.TP
+.BR \-\-gid " " \fIGID\fR
+Override the GID reported for all files (default: current user primary group).
+.SS snapshot
+Manage APFS snapshots.
+.TP
+.B list
+Print all snapshots in the named volume.
+.TP
+.B create
+Create a new named snapshot of the current volume state. Requires \fB\-n\fR.
+.TP
+.B delete
+Delete a named snapshot. Requires \fB\-n\fR.
+.TP
+.B revert
+Revert the volume to a named snapshot. All data written after the snapshot is
+.B permanently discarded.
+Requires \fB\-n\fR.
+.TP
+.BR \-n ", " \-\-name " " \fINAME\fR
+Snapshot name for create / delete / revert operations.
+.SS clone
+Create a copy-on-write clone of a file within a mounted volume. The clone
+shares extents with the original until either is modified (reflink semantics).
+.TP
+.BR \-\-src " " \fIPATH\fR
+Source file path (absolute APFS path, e.g.\& \fB/Users/alice/doc.pdf\fR).
+.TP
+.BR \-\-dst " " \fIPATH\fR
+Destination file path for the clone.
+.SS volume
+Inspect APFS volumes in a container without mounting.
+.TP
+.B list
+List all volumes in the container with name, role, and feature flags.
+.TP
+.B info
+Print detailed information about a specific volume (use \fB\-v\fR to select).
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Print usage information and exit.
+.TP
+.BR \-V ", " \-\-version
+Print version information and exit.
+.TP
+.BR \-\-log\-level " " \fILEVEL\fR
+Set log verbosity: \fBerror\fR, \fBwarn\fR, \fBinfo\fR (default), \fBdebug\fR, \fBtrace\fR.
+.TP
+.BR \-\-log\-file " " \fIPATH\fR
+Write log output to \fIPATH\fR in addition to stderr.
+.SH EXAMPLES
+Mount the first APFS volume on a physical disk as drive Z:
+.PP
+.RS
+.nf
+apfs\-mount mount \-d \\\\.\\PhysicalDrive1 \-l Z
+.fi
+.RE
+.PP
+Mount a specific volume from a disk image in read-only mode:
+.PP
+.RS
+.nf
+apfs\-mount mount \-d C:\\images\\backup.img \-v Macintosh\\ HD \-r
+.fi
+.RE
+.PP
+List all volumes in a disk image:
+.PP
+.RS
+.nf
+apfs\-mount volume list \-d C:\\images\\backup.img
+.fi
+.RE
+.PP
+List snapshots on a volume:
+.PP
+.RS
+.nf
+apfs\-mount snapshot list \-d \\\\.\\PhysicalDrive1 \-v Data
+.fi
+.RE
+.PP
+Create a snapshot named "before-update":
+.PP
+.RS
+.nf
+apfs\-mount snapshot create \-d \\\\.\\PhysicalDrive1 \-v Data \-n before\-update
+.fi
+.RE
+.PP
+Revert a volume to a snapshot (destructive):
+.PP
+.RS
+.nf
+apfs\-mount snapshot revert \-d \\\\.\\PhysicalDrive1 \-v Data \-n before\-update
+.fi
+.RE
+.PP
+Clone a file within a mounted APFS volume:
+.PP
+.RS
+.nf
+apfs\-mount clone \-d C:\\images\\disk.img \-v Data \\
+    \-\-src /Users/alice/original.pdf \-\-dst /Users/alice/clone.pdf
+.fi
+.RE
+.SH FILES
+.TP
+.B %PROGRAMDATA%\\apfs\-mount\\apfs\-mount.log
+Default log file location when \fB\-\-log\-file\fR is not specified and logging
+is directed to a file by the system tray wrapper.
+.TP
+.B %LOCALAPPDATA%\\apfs\-mount\\config.toml
+Optional user configuration file. Overrides compiled-in defaults.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+General error (bad arguments, device not found, etc.). Error details on stderr.
+.TP
+.B 2
+Mount failed (WinFsp error, volume unreadable, or encrypted volume).
+.TP
+.B 3
+Snapshot operation failed (name conflict, volume has no snapshot support, etc.).
+.SH DIAGNOSTICS
+Enable debug logging with \fB\-\-log\-level debug\fR to trace B-tree lookups,
+block allocations, and WinFsp callbacks.
+.PP
+Encrypted volumes are detected at open time and rejected with a clear error
+message rather than returning corrupt data.
+.SH AUTHORS
+apfs-explorer contributors.
+.SH SEE ALSO
+.BR winfsp (1),
+.BR diskutil (8)
+.PP
+APFS specification: Apple File System Reference (developer.apple.com/support/downloads).
+.PP
+Project repository: https://github.com/your-org/apfs-explorer

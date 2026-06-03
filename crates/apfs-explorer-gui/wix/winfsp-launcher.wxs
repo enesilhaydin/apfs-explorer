@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Registers the apfs-mount WinFsp Launcher service class so the (non-elevated)
+  GUI can start/stop a globally-visible, read-only APFS mount via launchctl
+  without a per-mount UAC prompt.
+
+  Written under SOFTWARE\WOW6432Node\WinFsp\Services (where the WinFsp launcher
+  reads its service classes). ForceDeleteOnUninstall removes the class on
+  uninstall. The CommandLine is read-only by construction (it carries no
+  writable flag): %1 is the physical drive index, %2 is the drive letter the
+  GUI chose.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <ComponentGroup Id="WinFspLauncherClass" Directory="INSTALLDIR">
+      <Component Id="ApfsMountLauncherClass" Guid="*">
+        <RegistryKey Root="HKLM"
+                     Key="SOFTWARE\WOW6432Node\WinFsp\Services\apfs-mount"
+                     ForceDeleteOnUninstall="yes">
+          <RegistryValue Type="string" Name="Executable"
+                         Value="[INSTALLDIR]apfs-mount.exe" KeyPath="yes" />
+          <RegistryValue Type="string" Name="CommandLine"
+                         Value="--drive %1 --mount %2 --wait-for-kill" />
+          <RegistryValue Type="string" Name="Security"
+                         Value="D:P(A;;RPWPLC;;;WD)" />
+          <RegistryValue Type="integer" Name="JobControl" Value="1" />
+          <RegistryValue Type="integer" Name="Credentials" Value="0" />
+        </RegistryKey>
+      </Component>
+      <!-- Writable opt-in class: same helper, adds the writable flag. Still
+           safe - apfs-mount's snapshot-guard forces read-only on snapshotted
+           volumes; only clean-volume writes (fsck-validated) proceed. -->
+      <Component Id="ApfsMountLauncherClassRW" Guid="*">
+        <RegistryKey Root="HKLM"
+                     Key="SOFTWARE\WOW6432Node\WinFsp\Services\apfs-mount-rw"
+                     ForceDeleteOnUninstall="yes">
+          <RegistryValue Type="string" Name="Executable"
+                         Value="[INSTALLDIR]apfs-mount.exe" KeyPath="yes" />
+          <RegistryValue Type="string" Name="CommandLine"
+                         Value="--drive %1 --mount %2 --writable --wait-for-kill" />
+          <RegistryValue Type="string" Name="Security"
+                         Value="D:P(A;;RPWPLC;;;WD)" />
+          <RegistryValue Type="integer" Name="JobControl" Value="1" />
+          <RegistryValue Type="integer" Name="Credentials" Value="0" />
+        </RegistryKey>
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

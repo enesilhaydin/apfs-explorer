@@ -1,0 +1,55 @@
+name: Feature request
+description: Suggest a new feature or enhancement for APFS Explorer
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Please describe your use case
+        clearly so we can understand the need.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Feature description
+      description: What would you like to see added or changed?
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: >
+        Describe the concrete scenario where this feature would be useful.
+        Who benefits, and how often?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: >
+        Have you found any workarounds or alternative approaches? Why are they
+        insufficient?
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: How important is this to you?
+      options:
+        - Nice to have
+        - Important for my workflow
+        - Blocking my use case
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing issues and this is not a duplicate.
+          required: true

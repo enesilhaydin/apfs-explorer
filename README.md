@@ -15,7 +15,7 @@
 
 ---
 
-[![Release](https://img.shields.io/github/v/release/enesilhaydin/apfs-explorer)](https://github.com/enesilhaydin/apfs-explorer/releases)
+[![Release](https://img.shields.io/github/v/release/enesilhaydin/apfs-explorer?include_prereleases&sort=semver)](https://github.com/enesilhaydin/apfs-explorer/releases)
 [![Downloads](https://img.shields.io/github/downloads/enesilhaydin/apfs-explorer/total)](https://github.com/enesilhaydin/apfs-explorer/releases)
 [![Stars](https://img.shields.io/github/stars/enesilhaydin/apfs-explorer?style=social)](https://github.com/enesilhaydin/apfs-explorer/stargazers)
 [![License](https://img.shields.io/badge/license-GPL--3.0--only-blue)](LICENSE)

@@ -84,13 +84,22 @@ per-transaction copy-on-write flush overhead, mitigated by cleanup batching.
 ## Architecture
 
 ```mermaid
-graph LR
-  A[USB / .img] --> B[WinFsp kernel driver]
-  B --> C[apfs-mount.exe]
-  C --> D[apfs crate]
-  D --> E[apfs-write COW txn]
-  D --> F[apfs-core parsers]
+graph TD
+  GUI["apfs-explorer.exe (Tauri GUI)"] -->|start via WinFsp Launcher| MOUNT
+  EXPLORER["Windows Explorer (drive letter)"] <--> WINFSP["WinFsp driver"]
+  WINFSP <-->|filesystem callbacks| MOUNT["apfs-mount.exe (winfsp-host)"]
+  MOUNT -->|raw read / write| DISK[("APFS USB / .img")]
+  MOUNT --> APFS["apfs (FsView, high-level read)"]
+  MOUNT --> WRITE["apfs-write (copy-on-write transactions)"]
+  WRITE --> APFS
+  APFS --> CORE["apfs-core (on-disk structs, B-tree, block device)"]
 ```
+
+Crate layering: `apfs-core` (on-disk format + B-tree engine) is the base; `apfs`
+builds the read-only `FsView` on top; `apfs-write` adds copy-on-write mutation;
+`winfsp-host` (the `apfs-mount.exe` binary) wires all three into WinFsp callbacks.
+The GUI never links the engine: it starts `apfs-mount.exe` through the WinFsp
+Launcher so the drive is visible to a non-elevated Explorer.
 
 ---
 

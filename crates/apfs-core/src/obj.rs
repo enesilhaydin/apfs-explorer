@@ -10,7 +10,10 @@ pub const OBJECT_TYPE_NX_SUPERBLOCK: u32 = 0x0000_0001;
 pub const OBJECT_TYPE_BTREE: u32 = 0x0000_0002;
 pub const OBJECT_TYPE_BTREE_NODE: u32 = 0x0000_0003;
 pub const OBJECT_TYPE_OMAP: u32 = 0x0000_000b;
+pub const OBJECT_TYPE_CHECKPOINT_MAP: u32 = 0x0000_000c;
 pub const OBJECT_TYPE_FS: u32 = 0x0000_000d; // apfs_superblock_t (volume superblock)
+/// Subtype of the nodes of a sealed volume's file-extent tree.
+pub const OBJECT_TYPE_FEXT_TREE: u32 = 0x0000_001f;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjPhys {

@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Registers the apfs-mount WinFsp Launcher service class so the (non-elevated)
-  GUI can start/stop a globally-visible, read-only APFS mount via launchctl
-  without a per-mount UAC prompt.
+  Registers the apfs-mount WinFsp Launcher service class so the GUI (elevated
+  once when it opens) can start/stop a globally-visible, read-only APFS mount
+  via launchctl without a per-mount UAC prompt.
 
   Written under SOFTWARE\WOW6432Node\WinFsp\Services (where the WinFsp launcher
   reads its service classes). ForceDeleteOnUninstall removes the class on
@@ -21,8 +21,14 @@
                          Value="[INSTALLDIR]apfs-mount.exe" KeyPath="yes" />
           <RegistryValue Type="string" Name="CommandLine"
                          Value="--drive %1 --mount %2 --wait-for-kill" />
+          <!-- Administrators and SYSTEM only. WD (Everyone) let any user on
+               the machine ask the launcher to start this service, and the
+               launcher runs it as SYSTEM with Credentials=0, so an ordinary
+               account could obtain raw access to any physical drive by
+               number - read-write for the -rw service, and reading a disk
+               raw bypasses every file permission on it either way. -->
           <RegistryValue Type="string" Name="Security"
-                         Value="D:P(A;;RPWPLC;;;WD)" />
+                         Value="D:P(A;;RPWPLC;;;BA)(A;;RPWPLC;;;SY)" />
           <RegistryValue Type="integer" Name="JobControl" Value="1" />
           <RegistryValue Type="integer" Name="Credentials" Value="0" />
         </RegistryKey>
@@ -38,8 +44,14 @@
                          Value="[INSTALLDIR]apfs-mount.exe" KeyPath="yes" />
           <RegistryValue Type="string" Name="CommandLine"
                          Value="--drive %1 --mount %2 --writable --wait-for-kill" />
+          <!-- Administrators and SYSTEM only. WD (Everyone) let any user on
+               the machine ask the launcher to start this service, and the
+               launcher runs it as SYSTEM with Credentials=0, so an ordinary
+               account could obtain raw access to any physical drive by
+               number - read-write for the -rw service, and reading a disk
+               raw bypasses every file permission on it either way. -->
           <RegistryValue Type="string" Name="Security"
-                         Value="D:P(A;;RPWPLC;;;WD)" />
+                         Value="D:P(A;;RPWPLC;;;BA)(A;;RPWPLC;;;SY)" />
           <RegistryValue Type="integer" Name="JobControl" Value="1" />
           <RegistryValue Type="integer" Name="Credentials" Value="0" />
         </RegistryKey>

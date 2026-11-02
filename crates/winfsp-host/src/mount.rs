@@ -1,14 +1,20 @@
 //! WinFsp read-only host delegating to `apfs::FsView` (Windows-only).
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use apfs::FsView;
 use apfs_core::block_device::WritableBlockDevice;
 use apfs_write::file as apfs_write_file;
 use apfs_write::txn::{Transaction, TxnError};
 
-use crate::batch::{BatchQueue, DeferredOp};
+use crate::group::{
+    commit_group, write_in_group, write_in_group_keeping_names, GroupClock, GroupDev, GroupError,
+    Policy,
+};
+use crate::ops::{apply_op, HostOp, OpOutcome};
 use widestring::U16CStr;
 use winfsp::filesystem::{
     DirInfo,
@@ -23,7 +29,7 @@ use winfsp::filesystem::{
 // winfsp 0.13: FileSystemHost<T, S: OperationGuardStrategy = FineGuard>.
 // FileSystemHost::new() returns FileSystemHost<T, FineGuard> (the default).
 // Our Mutex<FsView> provides our own serialisation; FineGuard is fine here.
-use winfsp::host::{FileSystemHost, FineGuard, VolumeParams};
+use winfsp::host::{FileSystemHost, FileSystemParams, FineGuard, VolumeParams};
 
 use crate::cache::CachingBlockDevice;
 use crate::offset_dev::OffsetBlockDevice;
@@ -36,9 +42,63 @@ use crate::winraw::PhysicalDrive;
 type Dev = CachingBlockDevice<OffsetBlockDevice<PhysicalDrive>>;
 
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC0000034u32 as i32;
+const STATUS_MEDIA_WRITE_PROTECTED: i32 = 0xC00000A2u32 as i32;
 const STATUS_OBJECT_NAME_INVALID: i32 = 0xC0000033u32 as i32;
 const STATUS_NOT_IMPLEMENTED: i32 = 0xC0000002u32 as i32;
 const STATUS_IO_DEVICE_ERROR: i32 = 0xC0000185u32 as i32;
+const STATUS_DISK_FULL: i32 = 0xC000007Fu32 as i32;
+const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC0000035u32 as i32;
+const STATUS_DIRECTORY_NOT_EMPTY: i32 = 0xC0000101u32 as i32;
+const STATUS_NOT_SUPPORTED_OP: i32 = 0xC00000BBu32 as i32;
+const STATUS_INVALID_PARAMETER_OP: i32 = 0xC000000Du32 as i32;
+const STATUS_FILE_CORRUPT_ERROR: i32 = 0xC0000102u32 as i32;
+const STATUS_FILE_IS_OFFLINE: i32 = 0xC0000267u32 as i32;
+
+/// What a write operation's failure means to Windows.
+///
+/// Everything used to come back as a device error, so a full volume, a name
+/// that already exists, or an operation the engine refuses all looked to the
+/// caller like failing hardware - and applications report it that way. The
+/// cases that have an established meaning get it; anything genuinely unknown
+/// still says the device failed.
+fn ntstatus_for(err: &apfs_write::txn::TxnError) -> i32 {
+    use apfs_write::txn::TxnError as E;
+    match err {
+        E::NoFreeBlocks => STATUS_DISK_FULL,
+        E::AlreadyExists(_) => STATUS_OBJECT_NAME_COLLISION,
+        E::DirectoryNotEmpty(_) => STATUS_DIRECTORY_NOT_EMPTY,
+        E::NotFound(_) | E::SnapshotNotFound(_) => STATUS_OBJECT_NAME_NOT_FOUND,
+        E::Unsupported(_) => STATUS_NOT_SUPPORTED_OP,
+        E::InvalidArgument(_) => STATUS_INVALID_PARAMETER_OP,
+        _ => STATUS_IO_DEVICE_ERROR,
+    }
+}
+
+/// What a failed stat or read of a file means to Windows.
+///
+/// A compressed file whose content is not on the volume (macOS keeps such
+/// dataless files for cloud eviction) is offline, not broken; an encoding
+/// this build cannot decode is not supported; a damaged decmpfs record is a
+/// corrupt file. Everything else still says the device failed.
+fn ntstatus_for_fs(err: &apfs::FsError) -> i32 {
+    use apfs_core::container::ContainerError as C;
+    use apfs_core::decmpfs::DecmpfsError as D;
+    match err {
+        apfs::FsError::Container(C::Decmpfs(D::Dataless(_))) => STATUS_FILE_IS_OFFLINE,
+        apfs::FsError::Container(C::Decmpfs(D::UnsupportedMethod(_))) => STATUS_NOT_SUPPORTED_OP,
+        apfs::FsError::Container(C::Decmpfs(_)) => STATUS_FILE_CORRUPT_ERROR,
+        _ => STATUS_IO_DEVICE_ERROR,
+    }
+}
+
+/// Map a failed stat or read to its Windows meaning, keeping the real cause
+/// on stderr; `step` names the operation.
+fn fs_err(step: &str) -> impl FnOnce(apfs::FsError) -> winfsp::FspError + '_ {
+    move |e| {
+        eprintln!("mount_apfs: {step} failed: {e:?}");
+        winfsp::FspError::NTSTATUS(ntstatus_for_fs(&e))
+    }
+}
 
 /// Map a fallible mount step to a WinFsp IO error while surfacing the real
 /// underlying cause to stderr. WinFsp only carries an opaque NTSTATUS, so
@@ -86,44 +146,175 @@ const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 /// `write_at` directly; a read-only mount still uses a writable-trait
 /// device whose `write_at` returns an error at runtime.
 ///
-/// The FsView is stored inside `Option` so a write callback can take the
-/// device for one Transaction commit cycle and then reopen a fresh FsView
-/// from the returned device (`FsView::into_dev` + `FsView::open`). The
-/// option is `None` only briefly during the transaction; read callbacks
-/// outside that window can safely `as_mut().expect(...)`.
+/// Write operations are grouped (see `crate::group`): each runs at once in
+/// the open write transaction and reports its own outcome, and the reader
+/// reads through that transaction, so every lookup sees every operation
+/// already reported done. The group is committed when it has been idle for
+/// a moment, has been open for a few seconds or holds many operations, on an
+/// explicit flush, and at unmount - the volume on disk is always one
+/// checkpoint or the next. The FsView is stored inside `Option` so a commit
+/// can take it, commit, and reopen it on the plain device.
 pub struct ApfsFs<D: WritableBlockDevice + Send + 'static> {
-    fs: Mutex<Option<FsView<D>>>,
-    /// Deferred-op batch queue for amortising per-op commit cost (M8 #2).
-    /// rename / set_basic_info / truncate_fast ops are enqueued here and
-    /// flushed as one Transaction when the threshold is reached or on an
-    /// explicit flush call (cleanup, unmount, reads that need consistency).
-    batch: BatchQueue,
-    /// Shared dirty flag: `true` when there are uncommitted batched ops.
-    /// Updated after every enqueue and flush. The tray process reads the
-    /// corresponding status file (written by the mount loop) instead of
-    /// accessing this directly; this field drives that file.
-    dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    fs: Arc<Mutex<Option<View<D>>>>,
+    /// The open group's operation count and times.
+    clock: Arc<Mutex<GroupClock>>,
+    policy: Policy,
+    /// How many open handles hold written content that has not reached the
+    /// disk yet: a file's bytes wait in its handle until it is cleaned up.
+    dirty_handles: Arc<AtomicUsize>,
+    /// Whether a group holds operations not yet committed.
+    group_open: Arc<AtomicBool>,
+    /// Shared dirty flag: `true` while a handle holds written content or a
+    /// group is open. The tray process reads the corresponding status file
+    /// (written by the mount loop) instead of accessing this directly; this
+    /// field drives that file.
+    dirty: Arc<AtomicBool>,
     /// #137/BUG-02 fallback: set `true` only when a begin/commit failure left
     /// us unable to even reopen a read-only FsView from the recovered device
     /// (so the mount has no live view). While `true`, `with_writable` fails
     /// fast instead of touching a half-dead mount. The common write-error case
     /// stays recoverable (device handed back via begin/commit_recoverable, a
     /// fresh FsView is reopened, mount keeps serving read-only).
-    broken: std::sync::atomic::AtomicBool,
+    broken: Arc<AtomicBool>,
+    /// Tells the flusher thread to stop.
+    stop: Arc<AtomicBool>,
+    /// Commits a group that has gone idle or old.
+    flusher: Option<std::thread::JoinHandle<()>>,
+    /// The mount was not opened for writing, or was turned read-only (a
+    /// volume with snapshots). WinFsp's read-only volume flag does not stop
+    /// the write callbacks, so every one checks this itself: without it a
+    /// read-only mount took writes it could never commit, and the snapshot
+    /// guard's mount wrote to the disk.
+    read_only: bool,
 }
 
-/// Per-open handle: the normalized `/`-path plus a lazily-filled cache of
-/// the file's fully-decompressed content. The volume is read-only, so the
-/// content is immutable for the handle's lifetime; caching it makes a
-/// sequential file read O(size) ONCE instead of O(size) per WinFsp read
-/// chunk (Windows reads a file in many small chunks, each of which would
-/// otherwise re-read+re-decompress the whole file from the device).
+/// The reader of a mounted volume: on the plain device, or through the
+/// open write transaction.
+pub type View<D> = FsView<GroupDev<D>>;
+
+/// Directory entries read_directory takes from the listing at a time; a
+/// buffer holds a few hundred.
+const DIR_PAGE: usize = 256;
+
+/// How often the flusher looks at the open group.
+const FLUSH_TICK: Duration = Duration::from_millis(50);
+
+/// The kernel's info and data caching window when `APFS_INFO_TIMEOUT_MS` is
+/// not set. Measured through WinFsp: renaming 300 files 364 -> 258 ms and
+/// removing 150 473 -> 135 ms (NTFS 265 and 125).
+const DEFAULT_INFO_TIMEOUT_MS: u32 = 1000;
+
+/// The longest window `APFS_INFO_TIMEOUT_MS` may ask for. WinFsp turns
+/// on data caching when the window never expires (`u32::MAX`), and with it
+/// on, CopyFile of 4 GiB or more hung in the kernel: the stuck copies could
+/// not be ended and held their unwritten cache pages (20 GB of memory)
+/// until Windows restarted. No setting may get there.
+const MAX_INFO_TIMEOUT_MS: u32 = 60_000;
+
+/// The window to use for `APFS_INFO_TIMEOUT_MS` = `setting`: the default
+/// when unset or unreadable, never more than [`MAX_INFO_TIMEOUT_MS`].
+fn info_timeout_ms(setting: Option<&str>) -> u32 {
+    setting
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_INFO_TIMEOUT_MS)
+        .min(MAX_INFO_TIMEOUT_MS)
+}
+
+/// Flusher ticks between writes of the `APFS_STATS` counts (one second).
+const STATS_DUMP_TICKS: u32 = 20;
+
+/// Commits the open group; run before the process is stopped from outside
+/// (the launcher stops a mount by ending its process, which runs no
+/// destructors). One mount per process, so one hook.
+static ON_STOP: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
+/// How long the kernel may answer file, directory and security queries from
+/// what it was last told, in milliseconds (`APFS_INFO_TIMEOUT_MS`; 0 asks
+/// the mount every time). Every change goes through the mount, so what the
+/// kernel keeps stays current.
+///
+/// File information is kept for this window, not without limit. WinFsp
+/// caches file data only when it never expires, and that read faster (a
+/// second read of a file came from memory), but with it on, a copy of a
+/// file of 4 GiB or more made with CopyFile (Copy-Item, Explorer) waited
+/// forever in the kernel and never reached the mount, while the same size
+/// written through a FileStream went through. Without data caching such
+/// copies complete.
+pub fn apply_info_timeouts(vp: &mut VolumeParams) {
+    let ms = info_timeout_ms(std::env::var("APFS_INFO_TIMEOUT_MS").ok().as_deref());
+    if ms > 0 {
+        vp.file_info_timeout(ms)
+            .dir_info_timeout(ms)
+            .security_timeout(ms)
+            .volume_info_timeout(ms)
+            .flush_and_purge_on_cleanup(true);
+    }
+}
+
+/// Host options shared by both mounts: register get_dir_info_by_name, which
+/// PassQueryDirectoryFileName sends single-name queries to.
+pub fn host_params(vp: VolumeParams) -> FileSystemParams {
+    let mut params = FileSystemParams::default_params(vp);
+    params.use_dir_info_by_name = true;
+    params
+}
+
+/// Commit the open write group before the process goes away.
+pub fn commit_before_exit() {
+    if let Some(f) = ON_STOP.get() {
+        f();
+    }
+    crate::stats::dump();
+}
+
+/// Recompute the shared dirty flag.
+fn refresh_dirty(dirty: &AtomicBool, handles: &AtomicUsize, group_open: &AtomicBool) {
+    dirty.store(
+        handles.load(Ordering::SeqCst) > 0 || group_open.load(Ordering::SeqCst),
+        Ordering::Relaxed,
+    );
+}
+
+/// Commit the open group when `when` says so, and reopen the reader on the
+/// plain device. Locks the view, then the clock - the order every path
+/// takes. A commit that fails loses the group, as a power cut would; the
+/// volume stays at the checkpoint before it, and the reader is reopened
+/// from there.
+fn commit_group_if<D: WritableBlockDevice>(
+    fs: &Mutex<Option<View<D>>>,
+    clock: &Mutex<GroupClock>,
+    broken: &AtomicBool,
+    group_open: &AtomicBool,
+    when: impl FnOnce(&GroupClock) -> bool,
+) -> Result<(), i32> {
+    let mut g = fs.lock().map_err(|_| STATUS_IO_DEVICE_ERROR)?;
+    let mut c = clock.lock().map_err(|_| STATUS_IO_DEVICE_ERROR)?;
+    if !when(&c) {
+        return Ok(());
+    }
+    let _t = crate::stats::timed("commit");
+    let view = g.take().ok_or(STATUS_IO_DEVICE_ERROR)?;
+    let sel = view.selector();
+    let (committed, reopened) = commit_group(view, sel, &mut c);
+    group_open.store(false, Ordering::SeqCst);
+    match reopened {
+        Ok(v) => *g = Some(v),
+        Err(e) => {
+            broken.store(true, Ordering::SeqCst);
+            eprintln!("commit: reopening the volume after the commit failed: {e:?}");
+        }
+    }
+    committed.map_err(|e| {
+        eprintln!("commit: the write group was lost: {e:?}");
+        STATUS_IO_DEVICE_ERROR
+    })
+}
+
+/// Per-open handle: the normalized `/`-path, the content written through it
+/// that has not reached the disk yet, and its delete-on-close disposition.
+/// Reads go to the device for the range asked; nothing is cached here.
 pub struct Handle {
     path: String,
-    /// Read-side content cache (read-only field-of-use; M4b). Populated
-    /// lazily on first Read so subsequent Read chunks for the same handle
-    /// don't re-traverse extents + decompress.
-    content: std::sync::Mutex<Option<std::sync::Arc<Vec<u8>>>>,
     /// Write-side dirty buffer. Step D: WinFsp Write callbacks are
     /// chunked (offset + buf), but apfs_write::write_file takes the
     /// whole content at once. We accumulate writes into this buffer and
@@ -156,9 +347,9 @@ fn guard<T>(f: impl FnOnce() -> winfsp::Result<T>) -> winfsp::Result<T> {
     }
 }
 
-/// One-line label for a batched op, used by the #156 self-verify forensic log.
-fn describe_op(op: &crate::batch::DeferredOp) -> String {
-    use crate::batch::DeferredOp::*;
+/// One-line label for a catalog op, used by the #156 self-verify forensic log.
+fn describe_op(op: &HostOp) -> String {
+    use HostOp::*;
     match op {
         Rename {
             parent_ino,
@@ -194,20 +385,109 @@ fn describe_op(op: &crate::batch::DeferredOp) -> String {
 }
 
 impl<D: WritableBlockDevice + Send + 'static> ApfsFs<D> {
-    pub fn new(fs: FsView<D>) -> Self {
+    pub fn new(fs: View<D>) -> Self {
+        let fs = Arc::new(Mutex::new(Some(fs)));
+        let clock = Arc::new(Mutex::new(GroupClock::default()));
+        let policy = Policy::default();
+        let dirty_handles = Arc::new(AtomicUsize::new(0));
+        let group_open = Arc::new(AtomicBool::new(false));
+        let dirty = Arc::new(AtomicBool::new(false));
+        let broken = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let flusher = {
+            let (fs, clock, broken, stop) =
+                (fs.clone(), clock.clone(), broken.clone(), stop.clone());
+            let (dirty, dirty_handles, group_open) =
+                (dirty.clone(), dirty_handles.clone(), group_open.clone());
+            std::thread::Builder::new()
+                .name("apfs-flusher".into())
+                .spawn(move || {
+                    let mut ticks: u32 = 0;
+                    while !stop.load(Ordering::SeqCst) {
+                        std::thread::sleep(FLUSH_TICK);
+                        // The counts also reach their file while the mount
+                        // runs, so a mount that is killed or stuck still
+                        // shows what it was doing.
+                        ticks = ticks.wrapping_add(1);
+                        if ticks % STATS_DUMP_TICKS == 0 {
+                            crate::stats::dump();
+                        }
+                        let due = |c: &GroupClock| c.due(Instant::now(), &policy);
+                        if let Err(status) = commit_group_if(&fs, &clock, &broken, &group_open, due)
+                        {
+                            eprintln!("flusher: commit failed ({status:#x})");
+                        }
+                        refresh_dirty(&dirty, &dirty_handles, &group_open);
+                    }
+                })
+                .map_err(|e| eprintln!("flusher thread not started: {e}"))
+                .ok()
+        };
+        {
+            let (fs, clock, broken, group_open) = (
+                fs.clone(),
+                clock.clone(),
+                broken.clone(),
+                group_open.clone(),
+            );
+            let hook: Box<dyn Fn() + Send + Sync> = Box::new(move || {
+                if let Err(status) =
+                    commit_group_if(&fs, &clock, &broken, &group_open, GroupClock::is_open)
+                {
+                    eprintln!("stop: the last write group was not committed ({status:#x})");
+                }
+            });
+            if ON_STOP.set(hook).is_err() {
+                eprintln!("stop: a second mount in this process has no commit-on-stop hook");
+            }
+        }
         Self {
-            fs: Mutex::new(Some(fs)),
-            batch: BatchQueue::new(),
-            dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            broken: std::sync::atomic::AtomicBool::new(false),
+            fs,
+            clock,
+            policy,
+            dirty_handles,
+            group_open,
+            dirty,
+            broken,
+            stop,
+            flusher,
+            read_only: false,
         }
     }
 
-    /// Returns `true` when there are pending batched writes that have not yet
-    /// been committed to disk. The tray supervisor polls this to drive the
-    /// dirty/clean indicator in the tray menu header.
+    /// Serve the volume read-only: every write callback answers that the
+    /// medium is write-protected.
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// The answer of every write callback on a read-only mount.
+    fn refuse_if_read_only(&self) -> winfsp::Result<()> {
+        if self.read_only {
+            return Err(winfsp::FspError::NTSTATUS(STATUS_MEDIA_WRITE_PROTECTED));
+        }
+        Ok(())
+    }
+
+    /// Commit the open group now, if there is one.
+    fn commit_now(&self) -> winfsp::Result<()> {
+        let r = commit_group_if(
+            &self.fs,
+            &self.clock,
+            &self.broken,
+            &self.group_open,
+            GroupClock::is_open,
+        );
+        refresh_dirty(&self.dirty, &self.dirty_handles, &self.group_open);
+        r.map_err(winfsp::FspError::NTSTATUS)
+    }
+
+    /// Returns `true` while some open handle holds written content that has
+    /// not reached the disk, or a write group is not committed yet. The tray
+    /// supervisor polls this to drive the dirty/clean indicator.
     pub fn is_dirty(&self) -> bool {
-        self.batch.has_pending()
+        self.dirty_handles.load(Ordering::SeqCst) > 0 || self.group_open.load(Ordering::SeqCst)
     }
 
     /// Returns a clone of the shared dirty flag. The mount loop in `main.rs`
@@ -217,13 +497,125 @@ impl<D: WritableBlockDevice + Send + 'static> ApfsFs<D> {
         self.dirty.clone()
     }
 
-    /// Sync the dirty flag from the batch queue state. Called after every
-    /// enqueue and after every flush so the arc stays accurate.
-    fn sync_dirty_flag(&self) {
-        self.dirty.store(
-            self.batch.has_pending(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+    /// Write `buffer` into the file of `context` on the volume, as one
+    /// operation of the open write group. `write_to_eof` writes at the end;
+    /// `constrained_io` (paging I/O) never makes the file longer. Returns
+    /// the bytes written, or `None` when the range writer declines the file
+    /// and nothing changed.
+    fn write_in_place(
+        &self,
+        context: &Handle,
+        buffer: &[u8],
+        offset: u64,
+        write_to_eof: bool,
+        constrained_io: bool,
+        file_info: &mut FileInfo,
+    ) -> winfsp::Result<Option<u32>> {
+        let (parent_ino, name) = self
+            .resolve_parent_and_name(None, &context.path)
+            .ok_or(winfsp::FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND))?;
+        let size = self.size_of(&context.path)?;
+        let start = if write_to_eof { size } else { offset };
+        let data = if constrained_io {
+            let room = usize::try_from(size.saturating_sub(start)).unwrap_or(usize::MAX);
+            buffer.get(..buffer.len().min(room)).unwrap_or(&[])
+        } else {
+            buffer
+        };
+        let write = || {
+            self.with_writable_keeping_names(|txn, vsb_raw, omap_raw| {
+                apfs_write_file::write_range(txn, vsb_raw, omap_raw, parent_ino, &name, start, data)
+            })
+        };
+        let mut outcome = write()?;
+        if outcome == apfs_write_file::RangeWrite::Declined
+            && self.own_plain_stream(&context.path, parent_ino, &name)?
+        {
+            outcome = write()?;
+        }
+        if outcome == apfs_write_file::RangeWrite::Declined {
+            return Ok(None);
+        }
+        self.self_verify(&format!("write_range({name})"));
+        let mut fs_guard = self
+            .fs
+            .lock()
+            .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+        let fs = fs_guard
+            .as_mut()
+            .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+        if let Ok(Some(attr)) = fs.getattr(&context.path) {
+            Self::fill_info(&attr, file_info);
+        }
+        Ok(Some(data.len() as u32))
+    }
+
+    /// Give the file at `path` a plain data stream of its own, the state
+    /// `write_range` writes into, and say whether anything changed. A
+    /// stream a macOS clone shares is given by reference (nothing copied);
+    /// a compressed file is read back and written plain, as macOS does on
+    /// the first write to one.
+    fn own_plain_stream(&self, path: &str, parent_ino: u64, name: &str) -> winfsp::Result<bool> {
+        if self.with_writable_keeping_names(|txn, vsb_raw, omap_raw| {
+            apfs_write_file::unshare_stream(txn, vsb_raw, omap_raw, parent_ino, name)
+        })? {
+            return Ok(true);
+        }
+        let content = {
+            let mut fs_guard = self
+                .fs
+                .lock()
+                .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+            let fs = fs_guard
+                .as_mut()
+                .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+            let attr = fs
+                .getattr(path)
+                .map_err(fs_err("getattr"))?
+                .ok_or(winfsp::FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND))?;
+            if attr.bsd_flags & apfs_core::inode::UF_COMPRESSED == 0 {
+                return Ok(false);
+            }
+            let size = usize::try_from(attr.size)
+                .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+            fs.read(path, 0, size).map_err(fs_err("read"))?
+        };
+        self.with_writable_keeping_names(|txn, vsb_raw, omap_raw| {
+            apfs_write_file::overwrite_existing_file(
+                txn, vsb_raw, omap_raw, parent_ino, name, &content,
+            )
+        })?;
+        Ok(true)
+    }
+
+    /// The size of the file at `path` as the volume has it.
+    fn size_of(&self, path: &str) -> winfsp::Result<u64> {
+        let mut fs_guard = self
+            .fs
+            .lock()
+            .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+        let fs = fs_guard
+            .as_mut()
+            .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+        Ok(fs
+            .getattr(path)
+            .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?
+            .ok_or(winfsp::FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND))?
+            .size)
+    }
+
+    /// A handle's write buffer came into being (`true`) or was taken out of
+    /// it (`false`); keep the count and the shared flag in step.
+    fn note_write_buffer(&self, created: bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if created {
+            self.dirty_handles.fetch_add(1, SeqCst);
+        } else {
+            let _ = self
+                .dirty_handles
+                .fetch_update(SeqCst, SeqCst, |n| Some(n.saturating_sub(1)));
+        }
+        refresh_dirty(&self.dirty, &self.dirty_handles, &self.group_open);
     }
 
     /// Resolve `(parent_ino, canonical_on_disk_name)` from a WinFsp-supplied
@@ -246,6 +638,13 @@ impl<D: WritableBlockDevice + Send + 'static> ApfsFs<D> {
         };
         let mut g = self.fs.lock().ok()?;
         let fs = g.as_mut()?;
+        // The entry as the volume itself compares names: on a volume that
+        // hashes them this reads only the records with the name's hash, so
+        // the cost no longer grows with the directory (a write drops the
+        // cached listings, and every callback after it listed again).
+        if let Some((dir, e)) = fs.entry(&path).ok().flatten() {
+            return Some((dir, e.name));
+        }
         // Windows volumes are advertised case-insensitive (VolumeParams
         // case_sensitive_search=false) so the kernel hands us paths in
         // whichever case the user typed (often UPPERCASE). The on-disk
@@ -298,128 +697,77 @@ impl<D: WritableBlockDevice + Send + 'static> ApfsFs<D> {
             .map(|s| s.to_string())
     }
 
-    /// Run a closure inside an apfs-write Transaction, reopening the FsView
-    /// after a successful commit or aborting (returning the device) on
-    /// error. The closure receives the staged transaction plus fresh
-    /// vsb_raw / vol_omap_raw byte slices read from the device.
-    /// Failures from `op` are propagated; the mount stays alive (the
-    /// device is returned via `Transaction::abort` and a fresh FsView is
-    /// opened from it).
+    /// Run a write operation in the open group (opening one when none is).
+    /// The closure receives the transaction plus the volume superblock and
+    /// object-map header as the group has them. It lands whole or not at
+    /// all: a failure reports its own status and leaves the group's other
+    /// operations. A group that has reached its operation limit is committed
+    /// here; otherwise the flusher thread or a flush commits it.
     fn with_writable<R, F>(&self, op: F) -> winfsp::Result<R>
     where
         F: FnOnce(&mut Transaction<D>, &[u8], &[u8]) -> Result<R, TxnError>,
     {
+        self.with_writable_as(false, op)
+    }
+
+    /// [`Self::with_writable`] for an operation that adds, removes and
+    /// renames no entry (a write, a resize, times, attributes, an extended
+    /// attribute): the mount's cached paths and listings stay valid.
+    fn with_writable_keeping_names<R, F>(&self, op: F) -> winfsp::Result<R>
+    where
+        F: FnOnce(&mut Transaction<D>, &[u8], &[u8]) -> Result<R, TxnError>,
+    {
+        self.with_writable_as(true, op)
+    }
+
+    fn with_writable_as<R, F>(&self, keeps_names: bool, op: F) -> winfsp::Result<R>
+    where
+        F: FnOnce(&mut Transaction<D>, &[u8], &[u8]) -> Result<R, TxnError>,
+    {
+        self.refuse_if_read_only()?;
         // #137/BUG-02: if a prior failure left the mount with no live view,
         // fail fast rather than touching a half-dead mount.
-        if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.broken.load(Ordering::SeqCst) {
             return Err(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR));
         }
-        // Acquire the lock and take the FsView out (None state).
-        let mut guard = self
-            .fs
-            .lock()
-            .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-        let mut view = guard
-            .take()
-            .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-        // Snapshot vsb/omap raw bytes from the latest on-disk state.
-        let (vsb_raw, omap_raw) = match view.read_vsb_omap_raw() {
-            Ok(p) => p,
-            Err(e) => {
-                // Restore the FsView and propagate as I/O error.
-                *guard = Some(view);
-                eprintln!("with_writable: read_vsb_omap_raw failed: {e:?}");
-                return Err(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR));
-            }
+        let _t = crate::stats::timed("write_op");
+        let (result, full) = {
+            let wait = crate::stats::timed("write_op_lock_wait");
+            let mut guard = self
+                .fs
+                .lock()
+                .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+            drop(wait);
+            let view = guard
+                .as_mut()
+                .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+            let mut clock = self
+                .clock
+                .lock()
+                .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+            let result = if keeps_names {
+                write_in_group_keeping_names(view, &mut clock, op)
+            } else {
+                write_in_group(view, &mut clock, op)
+            };
+            self.group_open.store(clock.is_open(), Ordering::SeqCst);
+            (result, clock.full(&self.policy))
         };
-        // Preserve which volume this view targets so the post-transaction
-        // reopen rebinds the SAME volume (a multi-volume container must not
-        // drift to a different volume across a writable commit).
-        let sel = view.selector();
-        let dev = view.into_dev();
-        let mut txn = match Transaction::begin_recoverable(dev) {
-            Ok(t) => t,
-            Err((dev_back, e)) => {
-                // #137/BUG-02: begin_recoverable hands the device back on
-                // failure, so reopen a fresh (read-only) FsView and keep the
-                // mount alive instead of leaking the handle / leaving it dead.
-                eprintln!("with_writable: Transaction::begin failed: {e:?}");
-                match FsView::open_selected(dev_back, sel) {
-                    Ok(new_view) => {
-                        *guard = Some(new_view);
-                    }
-                    Err(e2) => {
-                        // Could not even reopen - no live view; mark broken.
-                        self.broken.store(true, std::sync::atomic::Ordering::SeqCst);
-                        eprintln!(
-                            "with_writable: FsView reopen after begin failure failed: {e2:?}"
-                        );
-                    }
-                }
-                return Err(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR));
-            }
-        };
-        let result = op(&mut txn, &vsb_raw, &omap_raw);
+        refresh_dirty(&self.dirty, &self.dirty_handles, &self.group_open);
         match result {
             Ok(r) => {
-                match txn.commit_recoverable() {
-                    Ok(mut dev_back) => {
-                        // Defense-in-depth: drop any read-ahead cache before
-                        // reopening so the next container open re-reads the
-                        // post-commit nx_superblock/checkpoint state from the
-                        // durable inner device. write-through invalidates the
-                        // written ranges already; this guards against any
-                        // residual aliasing across the FS reopen boundary.
-                        dev_back.invalidate_read_cache();
-                        match FsView::open_selected(dev_back, sel) {
-                            Ok(new_view) => {
-                                *guard = Some(new_view);
-                                Ok(r)
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "with_writable: FsView reopen after commit failed: {e:?}"
-                                );
-                                Err(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))
-                            }
-                        }
-                    }
-                    Err((mut dev_back, e)) => {
-                        // #137/BUG-02: commit_recoverable hands the device back
-                        // even on a mid-commit failure. The last DURABLE
-                        // checkpoint is intact (partial pre-NXSB writes are not
-                        // yet the active checkpoint), so reopen a fresh FsView
-                        // and keep the mount alive (read-only fallback) rather
-                        // than leaking the handle / leaving the mount dead.
-                        eprintln!("with_writable: commit failed: {e:?}");
-                        dev_back.invalidate_read_cache();
-                        match FsView::open_selected(dev_back, sel) {
-                            Ok(new_view) => {
-                                *guard = Some(new_view);
-                            }
-                            Err(e2) => {
-                                self.broken.store(true, std::sync::atomic::Ordering::SeqCst);
-                                eprintln!(
-                                    "with_writable: FsView reopen after commit failure failed: {e2:?}"
-                                );
-                            }
-                        }
-                        Err(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))
-                    }
+                if full {
+                    let _full = crate::stats::timed("write_op.commit_when_full");
+                    self.commit_now()?;
                 }
+                Ok(r)
             }
-            Err(e) => {
-                // Discard staged changes, recover the device, reopen FsView.
-                let dev_back = txn.abort();
-                match FsView::open_selected(dev_back, sel) {
-                    Ok(new_view) => {
-                        *guard = Some(new_view);
-                    }
-                    Err(e2) => {
-                        eprintln!("with_writable: FsView reopen after abort failed: {e2:?}");
-                    }
-                }
+            Err(GroupError::Txn(e)) => {
                 eprintln!("with_writable: op failed: {e:?}");
+                Err(winfsp::FspError::NTSTATUS(ntstatus_for(&e)))
+            }
+            Err(GroupError::Fs(e)) => {
+                eprintln!("with_writable: reading the volume failed: {e:?}");
                 Err(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))
             }
         }
@@ -435,49 +783,32 @@ impl<D: WritableBlockDevice + Send + 'static> ApfsFs<D> {
     /// default a temp-dir file) and marks the mount broken to FREEZE further ops,
     /// so the first failure is captured instead of being buried by later writes.
     ///
-    /// Read-only: begins a transaction, runs `verify_fsroot`, then aborts (it
-    /// stages no writes). No-op unless the env flag is set.
+    /// Read-only: walks the catalog as the open write group has it (reads go
+    /// through the transaction; nothing is staged). No-op unless the env flag
+    /// is set, and when no group is open (nothing changed since the check
+    /// that ran before the last commit).
     fn self_verify(&self, label: &str) {
         if std::env::var("APFS_SELF_VERIFY").as_deref() != Ok("1") {
             return;
         }
-        if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.broken.load(Ordering::SeqCst) {
             return;
         }
         let mut guard = match self.fs.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
-        let mut view = match guard.take() {
-            Some(v) => v,
-            None => return,
+        let Some(view) = guard.as_mut() else {
+            return;
         };
-        let (vsb_raw, omap_raw) = match view.read_vsb_omap_raw() {
-            Ok(p) => p,
-            Err(_) => {
-                *guard = Some(view);
-                return;
-            }
+        let Ok((vsb_raw, omap_raw)) = view.read_vsb_omap_raw() else {
+            return;
         };
-        let sel = view.selector();
-        let dev = view.into_dev();
-        let mut txn = match Transaction::begin_recoverable(dev) {
-            Ok(t) => t,
-            Err((dev_back, _)) => {
-                if let Ok(v) = FsView::open_selected(dev_back, sel) {
-                    *guard = Some(v);
-                }
-                return;
-            }
+        let GroupDev::Open(txn) = view.dev_mut() else {
+            return;
         };
         let bsz = txn.nx.block_size as usize;
-        let res = apfs_write_file::verify_fsroot(&mut txn, &vsb_raw, &omap_raw, bsz);
-        // Read-only walk: discard (no writes were staged) and reopen the view.
-        let dev_back = txn.abort();
-        match FsView::open_selected(dev_back, sel) {
-            Ok(v) => *guard = Some(v),
-            Err(_) => self.broken.store(true, std::sync::atomic::Ordering::SeqCst),
-        }
+        let res = apfs_write_file::verify_fsroot(txn, &vsb_raw, &omap_raw, bsz);
         drop(guard);
         // Append a heartbeat for EVERY check (not only violations) so the log
         // confirms the self-check actually fired and shows the per-op tree health
@@ -505,111 +836,122 @@ impl<D: WritableBlockDevice + Send + 'static> ApfsFs<D> {
         }
     }
 
-    /// Flush all pending batched ops into a single Transaction commit.
+    /// Free space on the volume, as the spaceman currently reports it.
+    fn free_bytes(&self) -> winfsp::Result<u64> {
+        let mut fs_guard = self
+            .fs
+            .lock()
+            .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+        let fs = fs_guard
+            .as_mut()
+            .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+        // An open group has taken space the committed space manager does not
+        // show yet; its own count does.
+        if let GroupDev::Open(txn) = fs.dev_mut() {
+            return Ok(txn
+                .sm
+                .free_count
+                .saturating_mul(u64::from(txn.nx.block_size)));
+        }
+        Ok(fs.volume_size().map(|(_, free)| free).unwrap_or(u64::MAX))
+    }
+
+    /// Refuse a write the volume cannot hold, before accepting it.
     ///
-    /// Called on: explicit threshold exceeded (from enqueue), cleanup callback,
-    /// read callbacks that need consistency (get_volume_info, read_directory),
-    /// and clean shutdown. Skips `with_writable` if the queue is empty.
-    ///
-    /// Each op is replayed in enqueue order inside one transaction; if any op
-    /// returns `TxnError`, the transaction is aborted and the error is returned
-    /// as `STATUS_IO_DEVICE_ERROR`. The remaining ops are discarded to avoid
-    /// replaying against a potentially inconsistent on-disk state.
-    ///
-    /// `TruncateFast` ops that return `FastPathDeclined` (boundary-cut shrinks)
-    /// are collected and replayed after the batch transaction commits via the
-    /// read+rewrite slow path. This allows shrink ops to be queued in the batch
-    /// without special-casing them at enqueue time (M8 #3).
-    fn flush_batch(&self) -> winfsp::Result<()> {
-        let ops = self.batch.drain();
-        if ops.is_empty() {
+    /// The figure is what has been committed. The reserve covers the metadata
+    /// the write drags along - the catalog nodes, the extent records - which
+    /// is small next to any write big enough to matter but decides the last
+    /// one.
+    fn ensure_room_for(&self, bytes: u64) -> winfsp::Result<()> {
+        const METADATA_RESERVE: u64 = 256 * 1024;
+        let needed = bytes.saturating_add(METADATA_RESERVE);
+        if self.free_bytes()? >= needed {
             return Ok(());
         }
-        // Collect shrink ops that the fast path declines so we can fall back
-        // after the batch commits. Tuple: (parent_ino, name, path, new_size).
-        let mut shrink_fallbacks: Vec<(u64, String, String, u64)> = Vec::new();
-        // CRITICAL (#154): replay each op in its OWN transaction. A single
-        // transaction reads vsb/omap once and intra-transaction reads do NOT see
-        // this transaction's own staged writes, so replaying N catalog/VSB-
-        // mutating ops (rename, set_basic_info, truncate) in one txn makes every
-        // op COW from the SAME base and stage a fresh VSB for the same virtual
-        // oid. The commit's per-oid dedup then keeps only the LAST op's VSB +
-        // catalog, silently dropping every earlier op. Observed on a real USB:
-        // a batch of renames left all but one file un-renamed, with no error.
-        // Per-op `with_writable` re-reads the post-previous-commit on-disk state
-        // for each op, so they compose correctly. (Batching now coalesces the
-        // flush trigger, not the commit; rename is O(log N) since #140.)
-        for op in &ops {
-            match self.with_writable(|txn, vsb_raw, omap_raw| {
-                crate::batch::replay_op(op, txn, vsb_raw, omap_raw)
-            })? {
-                crate::batch::OpOutcome::Ok => {}
-                crate::batch::OpOutcome::Truncate(apfs_write_file::TruncateOutcome::Applied) => {}
-                crate::batch::OpOutcome::Truncate(
-                    apfs_write_file::TruncateOutcome::FastPathDeclined,
-                ) => {
-                    // Boundary-cut shrink: mark for slow-path fallback after the
-                    // batch. The fast path left on-disk size unchanged, so the
-                    // fallback sees the original bytes and can safely read+rewrite.
-                    if let crate::batch::DeferredOp::TruncateFast {
-                        parent_ino,
-                        name,
-                        path,
-                        new_size,
-                        ..
-                    } = op
-                    {
-                        shrink_fallbacks.push((*parent_ino, name.clone(), path.clone(), *new_size));
-                    }
-                }
+        Err(winfsp::FspError::NTSTATUS(STATUS_DISK_FULL))
+    }
+
+    /// Resize a file by reading it back and writing it cut or padded, the path
+    /// for a size the metadata-only resize declines (a cut inside a block, a
+    /// shared or compressed stream).
+    fn shrink_by_rewrite(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        path: &str,
+        new_size: u64,
+    ) -> winfsp::Result<()> {
+        // A read failure is propagated rather than silently zeroing the file.
+        let current_bytes = {
+            let mut fs_guard = self
+                .fs
+                .lock()
+                .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+            let fs = fs_guard
+                .as_mut()
+                .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+            // A path that is not there yet is a legitimately empty start; a
+            // getattr that FAILS is not, and must not be read as "size zero" -
+            // that turns a transient read error into a file full of zeros.
+            let size = fs
+                .getattr(path)
+                .map_err(fs_err("getattr"))?
+                .map(|a| a.size)
+                .unwrap_or(0);
+            if size > 0 {
+                fs.read(path, 0, size as usize).map_err(fs_err("read"))?
+            } else {
+                Vec::new()
             }
-            // #156 forensic self-check after each committed op (no-op unless
-            // APFS_SELF_VERIFY=1). Pinpoints the FIRST op that breaks the catalog.
-            self.self_verify(&describe_op(op));
+        };
+        let mut new_content = current_bytes;
+        new_content.resize(new_size as usize, 0u8);
+        self.with_writable_keeping_names(|txn, vsb_raw, omap_raw| {
+            apfs_write_file::overwrite_existing_file(
+                txn,
+                vsb_raw,
+                omap_raw,
+                parent_ino,
+                name,
+                &new_content,
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Carry out a catalog operation now, in its own transaction, and hand
+    /// its real outcome back to the caller.
+    ///
+    /// These operations used to be queued and replayed at a later flush. A
+    /// rename whose target existed then failed inside that flush, where no
+    /// caller could hear it: Windows had already been told the rename
+    /// succeeded, the failure was logged, and the file kept its old name.
+    /// Running the operation at once gives Windows the real status (a
+    /// collision for an existing target, for one) while the request is
+    /// still open, and keeps the on-disk order the order of the requests.
+    fn apply_now(&self, op: HostOp) -> winfsp::Result<()> {
+        let run = |txn: &mut Transaction<D>, vsb_raw: &[u8], omap_raw: &[u8]| {
+            apply_op(&op, txn, vsb_raw, omap_raw)
+        };
+        let outcome = match op {
+            HostOp::Rename { .. } | HostOp::MoveEntry { .. } => self.with_writable(run)?,
+            HostOp::SetInodeAttrs { .. } | HostOp::TruncateFast { .. } => {
+                self.with_writable_keeping_names(run)?
+            }
+        };
+        if let OpOutcome::Truncate(apfs_write_file::TruncateOutcome::FastPathDeclined) = outcome {
+            if let HostOp::TruncateFast {
+                parent_ino,
+                name,
+                path,
+                new_size,
+                ..
+            } = &op
+            {
+                self.shrink_by_rewrite(*parent_ino, name, path, *new_size)?;
+            }
         }
-        // Slow fallback for boundary-cut shrinks declined by truncate_file_fast.
-        // Each op runs in its own transaction (rare path; typical whole-extent
-        // shrinks are handled by the fast path above).
-        for (parent_ino, name, path, new_size) in shrink_fallbacks {
-            // Read the current on-disk content via the path stored in the op.
-            // A read failure is propagated rather than silently zeroing the
-            // file (mirrors the same guard in set_file_size slow path).
-            let current_bytes = {
-                let mut fs_guard = self
-                    .fs
-                    .lock()
-                    .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-                let fs = fs_guard
-                    .as_mut()
-                    .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-                let size = fs
-                    .getattr(&path)
-                    .ok()
-                    .flatten()
-                    .map(|a| a.size)
-                    .unwrap_or(0);
-                if size > 0 {
-                    fs.read(&path, 0, size as usize)
-                        .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?
-                } else {
-                    Vec::new()
-                }
-            };
-            let mut new_content = current_bytes;
-            new_content.resize(new_size as usize, 0u8);
-            self.with_writable(|txn, vsb_raw, omap_raw| {
-                apfs_write_file::overwrite_existing_file(
-                    txn,
-                    vsb_raw,
-                    omap_raw,
-                    parent_ino,
-                    &name,
-                    &new_content,
-                )
-            })?;
-        }
-        // Queue is now drained: mark clean.
-        self.sync_dirty_flag();
+        self.self_verify(&describe_op(&op));
         Ok(())
     }
 
@@ -639,28 +981,59 @@ impl<D: WritableBlockDevice + Send + 'static> ApfsFs<D> {
         let target_str = std::str::from_utf8(target)
             .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
         let win_path: String = target_str.replace('/', "\\");
-        let utf16: Vec<u16> = win_path.encode_utf16().collect();
-        let path_bytes = utf16.len() * 2;
-        let total = 20usize.saturating_add(path_bytes);
+
+        // A symbolic link's reparse data carries two names: the one the object
+        // manager resolves (SubstituteName) and the one shown to the user
+        // (PrintName). For a target on a drive they are not the same string -
+        // resolution needs the NT form, `\??\Z:\dir\file`, and handing back
+        // the plain `Z:\dir\file` gets ERROR_INVALID_NAME, which is what every
+        // absolute link did. A relative target is the same in both, and is
+        // marked as relative so it is resolved against the link's directory.
+        let drive_absolute = {
+            let b = win_path.as_bytes();
+            b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
+        };
+        // A target that was absolute in POSIX terms means nothing to Windows;
+        // it is passed through as-is rather than dressed up as an NT path that
+        // would not resolve either.
+        let posix_absolute = target_str.starts_with('/');
+        let substitute = if drive_absolute {
+            format!("\\??\\{win_path}")
+        } else {
+            win_path.clone()
+        };
+        let relative = !drive_absolute && !posix_absolute;
+
+        let sub16: Vec<u16> = substitute.encode_utf16().collect();
+        let print16: Vec<u16> = win_path.encode_utf16().collect();
+        let sub_bytes = sub16.len() * 2;
+        let print_bytes = print16.len() * 2;
+        let total = 20usize
+            .saturating_add(sub_bytes)
+            .saturating_add(print_bytes);
         if out.len() < total {
             return Err(winfsp::FspError::NTSTATUS(STATUS_BUFFER_OVERFLOW));
         }
         out[0..4].copy_from_slice(&IO_REPARSE_TAG_SYMLINK.to_le_bytes());
-        out[4..6].copy_from_slice(&((12 + path_bytes) as u16).to_le_bytes());
+        // ReparseDataLength counts everything after the 8-byte header.
+        out[4..6].copy_from_slice(&((12 + sub_bytes + print_bytes) as u16).to_le_bytes());
         out[6..8].copy_from_slice(&0u16.to_le_bytes());
         out[8..10].copy_from_slice(&0u16.to_le_bytes());
-        out[10..12].copy_from_slice(&(path_bytes as u16).to_le_bytes());
-        out[12..14].copy_from_slice(&0u16.to_le_bytes());
-        out[14..16].copy_from_slice(&(path_bytes as u16).to_le_bytes());
-        let absolute = target_str.starts_with('/') || win_path.starts_with('\\');
-        let flags = if absolute {
-            0u32
-        } else {
+        out[10..12].copy_from_slice(&(sub_bytes as u16).to_le_bytes());
+        out[12..14].copy_from_slice(&(sub_bytes as u16).to_le_bytes());
+        out[14..16].copy_from_slice(&(print_bytes as u16).to_le_bytes());
+        let flags = if relative {
             SYMLINK_FLAG_RELATIVE
+        } else {
+            0u32
         };
         out[16..20].copy_from_slice(&flags.to_le_bytes());
-        for (i, &c) in utf16.iter().enumerate() {
+        for (i, &c) in sub16.iter().enumerate() {
             let p = 20 + i * 2;
+            out[p..p + 2].copy_from_slice(&c.to_le_bytes());
+        }
+        for (i, &c) in print16.iter().enumerate() {
+            let p = 20 + sub_bytes + i * 2;
             out[p..p + 2].copy_from_slice(&c.to_le_bytes());
         }
         Ok(total as u64)
@@ -768,6 +1141,29 @@ impl<D: WritableBlockDevice + Send + 'static> ApfsFs<D> {
     }
 }
 
+/// At unmount the flusher stops and the open group is committed, so what
+/// was reported done is on the disk when the volume goes away.
+impl<D: WritableBlockDevice + Send + 'static> Drop for ApfsFs<D> {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.flusher.take() {
+            if t.join().is_err() {
+                eprintln!("unmount: the flusher thread panicked");
+            }
+        }
+        if let Err(status) = commit_group_if(
+            &self.fs,
+            &self.clock,
+            &self.broken,
+            &self.group_open,
+            GroupClock::is_open,
+        ) {
+            eprintln!("unmount: the last write group was not committed ({status:#x})");
+        }
+        crate::stats::dump();
+    }
+}
+
 impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
     type FileContext = Handle;
 
@@ -777,6 +1173,7 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
         _sd: Option<&mut [std::ffi::c_void]>,
         resolve: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
+        let _t = crate::stats::timed("get_security_by_name");
         guard(|| {
             // P10: if WinFsp's resolver reports a reparse point on the path
             // (e.g. an APFS symlink as an intermediate component), return its
@@ -794,10 +1191,7 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
             let fs = fs_guard
                 .as_mut()
                 .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-            match fs
-                .getattr(&path)
-                .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?
-            {
+            match fs.getattr(&path).map_err(fs_err("getattr"))? {
                 None => Err(winfsp::FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND)),
                 Some(a) => {
                     let is_symlink = a.mode & S_IFMT == S_IFLNK;
@@ -818,8 +1212,20 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
                     } else {
                         0
                     };
+                    // `reparse` here does not mean "this file is a reparse
+                    // point" - it means "the path could not be walked to the
+                    // end because a reparse point is in the way", and then
+                    // `attributes` carries the index in the path where it sits,
+                    // not file attributes. That is what the resolver branch
+                    // above returns. Saying `true` for a symlink leaf handed
+                    // the kernel an attribute word to use as a path offset, and
+                    // every open of a symlink came back "the name of the file
+                    // cannot be resolved by the system". The leaf is reported
+                    // as an ordinary file carrying the reparse attribute; the
+                    // kernel then asks for its reparse data through
+                    // get_reparse_point.
                     Ok(FileSecurity {
-                        reparse: is_symlink,
+                        reparse: false,
                         sz_security_descriptor: 0,
                         attributes: base | hidden | reparse_bit,
                     })
@@ -836,6 +1242,7 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
         granted_access: u32,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
+        let _t = crate::stats::timed("open");
         guard(|| {
             let path = win_to_unix(file_name);
             let mut fs_guard = self
@@ -847,12 +1254,11 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
                 .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
             let attr = fs
                 .getattr(&path)
-                .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?
+                .map_err(fs_err("getattr"))?
                 .ok_or(winfsp::FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND))?;
             Self::fill_info(&attr, file_info.as_mut());
             Ok(Handle {
                 path,
-                content: std::sync::Mutex::new(None),
                 write_buf: std::sync::Mutex::new(None),
                 delete_on_close: std::sync::atomic::AtomicBool::new(create_options & 0x1000 != 0),
             })
@@ -866,6 +1272,7 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
         context: &Self::FileContext,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        let _t = crate::stats::timed("get_file_info");
         guard(|| {
             let mut fs_guard = self
                 .fs
@@ -876,7 +1283,7 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
                 .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
             let attr = fs
                 .getattr(&context.path)
-                .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?
+                .map_err(fs_err("getattr"))?
                 .ok_or(winfsp::FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND))?;
             Self::fill_info(&attr, file_info);
             Ok(())
@@ -889,47 +1296,55 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
         buffer: &mut [u8],
         offset: u64,
     ) -> winfsp::Result<u32> {
+        let _t = crate::stats::timed("read");
         guard(|| {
-            // Fill the per-handle content cache exactly once; subsequent
-            // chunked reads are served from RAM (no per-chunk whole-file
-            // re-read/re-decompress from the slow device).
-            let data = {
-                let mut slot = context
-                    .content
+            // A handle reads back what it wrote: its content waits in the
+            // handle until cleanup (seeded from the disk at the first write,
+            // so it is the whole file as this handle sees it), and the disk
+            // would still answer with the bytes from before.
+            {
+                let wb = context
+                    .write_buf
                     .lock()
                     .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-                match slot.as_ref() {
-                    Some(d) => std::sync::Arc::clone(d),
-                    None => {
-                        let mut fs_guard = self
-                            .fs
-                            .lock()
-                            .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-                        let fs = fs_guard
-                            .as_mut()
-                            .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-                        let full = fs
-                            .read(&context.path, 0, usize::MAX)
-                            .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-                        let arc = std::sync::Arc::new(full);
-                        *slot = Some(std::sync::Arc::clone(&arc));
-                        arc
-                    }
+                if let Some(content) = wb.as_ref() {
+                    let from = usize::try_from(offset)
+                        .unwrap_or(usize::MAX)
+                        .min(content.len());
+                    let n = (content.len() - from).min(buffer.len());
+                    buffer
+                        .get_mut(..n)
+                        .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?
+                        .copy_from_slice(
+                            content
+                                .get(from..from + n)
+                                .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?,
+                        );
+                    return Ok(n as u32);
                 }
-            };
-            let off = offset as usize;
-            if off >= data.len() {
-                return Ok(0);
             }
-            let end = off.saturating_add(buffer.len()).min(data.len());
-            let n = end - off;
-            let src = data
-                .get(off..end)
+            // Only the bytes asked for: the reader walks the extents the range
+            // touches, or decodes the chunks that cover it for a compressed
+            // file, so a large file costs no more than the part being read
+            // and no handle holds a copy of the whole file.
+            let mut fs_guard = self
+                .fs
+                .lock()
+                .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+            let fs = fs_guard
+                .as_mut()
                 .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+            let data = fs
+                .read(&context.path, offset, buffer.len())
+                .map_err(fs_err("read"))?;
+            let n = data.len().min(buffer.len());
             buffer
                 .get_mut(..n)
                 .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?
-                .copy_from_slice(src);
+                .copy_from_slice(
+                    data.get(..n)
+                        .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?,
+                );
             Ok(n as u32)
         })
     }
@@ -948,14 +1363,8 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
         marker: winfsp::filesystem::DirMarker,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
+        let _t = crate::stats::timed("read_directory");
         guard(|| {
-            // Flush pending batch ops so directory contents reflect all
-            // recent renames / setattr operations (M8 #2 consistency).
-            // P29: only pay the lock + drain when something is actually queued;
-            // a read-only listing (the common case) skips it entirely.
-            if self.batch.has_pending() {
-                self.flush_batch()?;
-            }
             let mut fs_guard = self
                 .fs
                 .lock()
@@ -963,89 +1372,130 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
             let fs = fs_guard
                 .as_mut()
                 .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-            let mut entries = fs
-                .read_dir(&context.path)
-                .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-            // CRITICAL: APFS stores directory entries in NAME-HASH order on
-            // case-insensitive / normalization-insensitive volumes (which is
-            // what macOS creates by default - j_drec_hashed_key_t). Hash order
-            // is NOT lexicographic. WinFsp resumes a multi-call enumeration by
-            // passing `marker` = the last name we returned and expects us to
-            // continue strictly AFTER it under BYTE-LEXICOGRAPHIC comparison.
-            // If we leave entries in hash order, the `name <= marker` skip
-            // below drops an arbitrary subset on the 2nd+ call (observed: a
-            // directory's subfolders vanish from the listing while remaining
-            // directly openable). Sorting here makes our iteration order match
-            // the comparison Windows uses, so the resume skip is correct.
-            entries.sort_by(|a, b| a.name.cmp(&b.name));
-
             // winfsp 0.13: DirMarker::inner() -> Option<&[u16]> (UTF-16 units).
             // None = first call; Some = resume strictly after this name.
             let resume: Option<String> = marker.inner().map(String::from_utf16_lossy);
-            tracing::debug!(
-                path = %context.path,
-                total = entries.len(),
-                marker = ?resume,
-                "read_directory"
-            );
+            tracing::debug!(path = %context.path, marker = ?resume, "read_directory");
+            // WinFsp resumes after the last name it was given, comparing byte
+            // for byte. APFS keeps most directories in name-hash order, so the
+            // listing is paged in name order (read_dir_after); left in hash
+            // order, a resumed listing dropped an arbitrary part of it. Only
+            // the pages this buffer takes are copied out of the listing.
+            let mut after = resume;
             let mut cursor = 0u32;
             let mut emitted = 0u32;
-            for e in &entries {
-                if let Some(m) = resume.as_deref() {
-                    if e.name.as_str() <= m {
-                        continue;
-                    }
-                }
-                let mut di = DirInfo::<255>::new();
-                // #153: emit the name via set_name_raw with NO trailing NUL.
-                // winfsp 0.13 `DirInfo::set_name` appends a NUL terminator and
-                // then folds it into the entry Size, so FSP_FSCTL_DIR_INFO's
-                // FileNameLength counts one extra wide char. The WinFsp FSD then
-                // pattern-matches against "name\0", which breaks any suffix glob:
-                // `*.txt` fails to match "a.txt\0" (it ends in \0, not "txt")
-                // while prefix globs like `b*` still match - exactly the
-                // "filtered listing returns empty" bug. FSP_FSCTL_DIR_INFO is
-                // length-prefixed (not NUL-terminated, like memfs), so emitting
-                // the bare UTF-16 units yields the correct FileNameLength and the
-                // FSD's `*.ext` matching works.
-                let name_utf16: Vec<u16> = e.name.encode_utf16().collect();
-                di.set_name_raw(name_utf16.as_slice())
+            let mut full = false;
+            'pages: loop {
+                let page = fs
+                    .read_dir_after(&context.path, after.as_deref(), DIR_PAGE)
                     .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-                let child = if context.path == "/" {
-                    format!("/{}", e.name)
-                } else {
-                    format!("{}/{}", context.path, e.name)
-                };
-                if let Some(a) = fs.getattr(&child).ok().flatten() {
-                    Self::fill_info(&a, di.file_info_mut());
+                for e in &page {
+                    let mut di = DirInfo::<255>::new();
+                    // #153: emit the name via set_name_raw with NO trailing NUL.
+                    // winfsp 0.13 `DirInfo::set_name` appends a NUL terminator and
+                    // then folds it into the entry Size, so FSP_FSCTL_DIR_INFO's
+                    // FileNameLength counts one extra wide char. The WinFsp FSD then
+                    // pattern-matches against "name\0", which breaks any suffix glob:
+                    // `*.txt` fails to match "a.txt\0" (it ends in \0, not "txt")
+                    // while prefix globs like `b*` still match - exactly the
+                    // "filtered listing returns empty" bug. FSP_FSCTL_DIR_INFO is
+                    // length-prefixed (not NUL-terminated, like memfs), so emitting
+                    // the bare UTF-16 units yields the correct FileNameLength and the
+                    // FSD's `*.ext` matching works.
+                    let name_utf16: Vec<u16> = e.name.encode_utf16().collect();
+                    di.set_name_raw(name_utf16.as_slice())
+                        .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+                    let child = if context.path == "/" {
+                        format!("/{}", e.name)
+                    } else {
+                        format!("{}/{}", context.path, e.name)
+                    };
+                    if let Some(a) = fs.getattr(&child).ok().flatten() {
+                        Self::fill_info(&a, di.file_info_mut());
+                    }
+                    if !di.append_to_buffer(buffer, &mut cursor) {
+                        // Buffer full - WinFsp will re-call with marker = the
+                        // last name that fit.
+                        full = true;
+                        break 'pages;
+                    }
+                    emitted += 1;
                 }
-                if !di.append_to_buffer(buffer, &mut cursor) {
-                    // Buffer full - WinFsp will re-call with marker = this name.
+                if page.len() < DIR_PAGE {
                     break;
                 }
-                emitted += 1;
+                after = page.last().map(|e| e.name.clone());
             }
-            DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
+            // The end marker tells WinFsp the directory has nothing more.
+            // Written after a full buffer it ended every listing at its
+            // first buffer, some 500 names, though the rest still opened.
+            if !full {
+                DirInfo::<255>::finalize_buffer(buffer, &mut cursor);
+            }
             tracing::debug!(path = %context.path, emitted, "read_directory done");
             Ok(cursor)
         })
     }
 
+    /// One name in a directory, for the query WinFsp sends when a program
+    /// asks whether a name exists (a copy asks for every file it copies).
+    /// Without it WinFsp answers by reading the whole directory in small
+    /// pieces: copying 1000 files into one folder made ~100 000
+    /// read_directory calls. The name is reported as the volume stores it.
+    fn get_dir_info_by_name(
+        &self,
+        context: &Self::FileContext,
+        file_name: &U16CStr,
+        out_dir_info: &mut DirInfo,
+    ) -> winfsp::Result<()> {
+        let _t = crate::stats::timed("get_dir_info_by_name");
+        guard(|| {
+            let mut fs_guard = self
+                .fs
+                .lock()
+                .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+            let fs = fs_guard
+                .as_mut()
+                .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+            let name = file_name.to_string_lossy();
+            let child = if context.path == "/" {
+                format!("/{name}")
+            } else {
+                format!("{}/{name}", context.path)
+            };
+            let (_, stored) = fs
+                .entry(&child)
+                .map_err(fs_err("entry"))?
+                .ok_or(winfsp::FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND))?;
+            let attr = fs
+                .getattr(&child)
+                .map_err(fs_err("getattr"))?
+                .ok_or(winfsp::FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND))?;
+            let name_utf16: Vec<u16> = stored.name.encode_utf16().collect();
+            out_dir_info.reset();
+            out_dir_info
+                .set_name_raw(name_utf16.as_slice())
+                .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+            Self::fill_info(&attr, out_dir_info.file_info_mut());
+            Ok(())
+        })
+    }
+
     /// FlushFileBuffers from user-space (Notepad++ save-as, atomic save
-    /// patterns). Windows expects this to succeed even when there is no
-    /// per-file flush work to do - our writes are buffered into the
-    /// handle and committed on Cleanup, and the inner block device is
-    /// opened FILE_FLAG_WRITE_THROUGH so any data we have already
-    /// written-through is already durable. Returning the default
-    /// STATUS_INVALID_DEVICE_REQUEST surfaces as "Incorrect function" /
-    /// "Incorrect function" on every save dialog. Refresh the session
-    /// FileInfo from the live FS so the caller sees the latest size.
+    /// patterns), or a flush of the whole volume. What the operations so far
+    /// have done is made durable: the open write group is committed. (A
+    /// handle's own buffered content still goes in at Cleanup.) Returning
+    /// the default STATUS_INVALID_DEVICE_REQUEST surfaces as "Incorrect
+    /// function" on every save dialog. Refresh the session FileInfo from the
+    /// live FS so the caller sees the latest size.
     fn flush(
         &self,
         context: Option<&Self::FileContext>,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        let _t = crate::stats::timed("flush");
         guard(|| {
+            self.commit_now()?;
             if let Some(ctx) = context {
                 let mut fs_guard = self
                     .fs
@@ -1072,8 +1522,6 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
     /// so Explorer doesn't claim the volume is full).
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
         guard(|| {
-            // Flush any pending batch ops so volume stats reflect the latest state.
-            self.flush_batch()?;
             let (total, free) = {
                 let mut fs_guard = self
                     .fs
@@ -1103,7 +1551,7 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
     ) -> winfsp::Result<()> {
         guard(|| {
             let label = volume_label.to_string_lossy();
-            self.with_writable(|txn, vsb_raw, _omap_raw| {
+            self.with_writable_keeping_names(|txn, vsb_raw, _omap_raw| {
                 apfs_write_file::set_volume_label(txn, vsb_raw, &label)
             })?;
             // Reflect back: update volume_info with the new label.
@@ -1127,10 +1575,41 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
         buffer: &[u8],
         offset: u64,
         write_to_eof: bool,
-        _constrained_io: bool,
+        constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
+        let _t = crate::stats::timed("write");
+        self.refuse_if_read_only()?;
         guard(|| {
+            // Refuse a write the volume has no room for, here, where the
+            // caller can still be told. The content waits in the handle and
+            // only reaches disk at cleanup, which has no way to return an error:
+            // filling a volume this way used to leave 37 zero-length files
+            // behind with every WriteAllBytes reporting success.
+            self.ensure_room_for(buffer.len() as u64)?;
+            // Written to the volume at once when the file allows it: only
+            // the blocks the write touches change, nothing waits in the
+            // handle, every handle reads what was written, and an error
+            // reaches the caller. A file the range writer declines (it is
+            // compressed, or a clone macOS made shares its stream) keeps its
+            // content in the handle until cleanup.
+            let buffered = context
+                .write_buf
+                .lock()
+                .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?
+                .is_some();
+            if !buffered {
+                if let Some(n) = self.write_in_place(
+                    context,
+                    buffer,
+                    offset,
+                    write_to_eof,
+                    constrained_io,
+                    file_info,
+                )? {
+                    return Ok(n);
+                }
+            }
             let mut wb = context
                 .write_buf
                 .lock()
@@ -1157,8 +1636,7 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
                     // content with zeros + the user's write.
                     let size = fs
                         .getattr(&context.path)
-                        .ok()
-                        .flatten()
+                        .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?
                         .map(|a| a.size)
                         .unwrap_or(0);
                     if size > 0 {
@@ -1169,6 +1647,7 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
                     }
                 };
                 *wb = Some(initial);
+                self.note_write_buffer(true);
             }
             let buf = wb
                 .as_mut()
@@ -1220,6 +1699,8 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
         _extra_buffer_is_reparse_point: bool,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
+        let _t = crate::stats::timed("create");
+        self.refuse_if_read_only()?;
         guard(|| {
             let path = win_to_unix(file_name);
             // FILE_DIRECTORY_FILE = 0x00000001 (winfsp_sys / NT API).
@@ -1284,7 +1765,6 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
             }
             Ok(Handle {
                 path,
-                content: std::sync::Mutex::new(None),
                 write_buf: std::sync::Mutex::new(None),
                 delete_on_close: std::sync::atomic::AtomicBool::new(create_options & 0x1000 != 0),
             })
@@ -1301,6 +1781,9 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
         // even if WinFsp doesn't pass FspCleanupDelete in flags
         // (PowerShell Remove-Item / Explorer "Delete" go through this
         // path; the recursive variant uses FILE_DELETE_ON_CLOSE only).
+        if delete_file {
+            self.refuse_if_read_only()?;
+        }
         context
             .delete_on_close
             .store(delete_file, std::sync::atomic::Ordering::SeqCst);
@@ -1308,17 +1791,7 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
     }
 
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
-        // Flush any pending batch ops before this file's cleanup runs.
-        // Required so that a rename-then-delete sequence sees the renamed
-        // name, and so that write-file sees post-truncate sizes (M8 #2).
-        // BUG-01: never swallow the flush result - a dropped error here is
-        // silent data loss (the user's batched writes did not reach disk).
-        if let Err(e) = self.flush_batch() {
-            tracing::error!(
-                "cleanup: flush_batch failed (batched writes may be lost): {:?}",
-                e
-            );
-        }
+        let _t = crate::stats::timed("cleanup");
         let dispatch_delete = (flags & 0x01) != 0;
         let handle_doc = context
             .delete_on_close
@@ -1337,6 +1810,9 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
         // existing names, so we delete the empty placeholder first).
         if !is_delete {
             let dirty = context.write_buf.lock().ok().and_then(|mut g| g.take()); // take so we don't re-flush
+            if dirty.is_some() {
+                self.note_write_buffer(false);
+            }
             if let Some(content) = dirty {
                 // Canonical linux-apfs-rw pattern (apfs_setsize + apfs_truncate
                 // + apfs_get_new_block): a SINGLE transaction frees the old
@@ -1351,7 +1827,7 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
                     // BUG-01: surface the write-flush result. Dropping it here
                     // silently loses the file's content on a USB stall /
                     // out-of-space / any write error.
-                    if let Err(e) = self.with_writable(|txn, vsb_raw, omap_raw| {
+                    if let Err(e) = self.with_writable_keeping_names(|txn, vsb_raw, omap_raw| {
                         apfs_write_file::overwrite_existing_file(
                             txn, vsb_raw, omap_raw, parent_ino, &name, &content,
                         )
@@ -1375,7 +1851,17 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
             }
             return;
         }
-        // delete branch (FspCleanupDelete = 0x01).
+        // delete branch (FspCleanupDelete = 0x01). Written content that was
+        // never closed goes with the file.
+        if context
+            .write_buf
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+            .is_some()
+        {
+            self.note_write_buffer(false);
+        }
         if let Some((parent_ino, canonical_name)) =
             self.resolve_parent_and_name(file_name, &context.path)
         {
@@ -1408,6 +1894,8 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
         new_file_name: &U16CStr,
         replace_if_exists: bool,
     ) -> winfsp::Result<()> {
+        let _t = crate::stats::timed("rename");
+        self.refuse_if_read_only()?;
         guard(|| {
             // Resolve the OLD name canonically - Windows often sends uppercase
             // paths through the FS even when the on-disk name is lowercase
@@ -1429,13 +1917,13 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
                 ),
                 _ => return Err(winfsp::FspError::NTSTATUS(STATUS_OBJECT_NAME_INVALID)),
             };
-            // Always materialise the new name in its Unicode NFD case-folded
-            // form: the on-disk catalog hashes the folded form, and
-            // create_file already writes it folded. Diverging here would
-            // yield a record the catalog cannot find on subsequent lookups.
-            // Unicode fold handles special-casing (U+0130/U+0131, sharp-s, sigma), etc.
-            // correctly where to_ascii_lowercase would silently truncate.
-            let new_name = apfs::case_fold::apfs_case_fold(&new_name_raw);
+            // Store the name the user gave. Only the directory-entry HASH is
+            // computed over the folded form, and only on a volume that asked
+            // for it; the name itself is written verbatim, which is what
+            // create_file does. Folding it here meant renaming a file to
+            // "MixedCase.TXT" put "mixedcase.txt" on disk, and that is the
+            // name Windows then listed.
+            let new_name = new_name_raw.clone();
             let new_parent_ino = {
                 let mut g = self
                     .fs
@@ -1450,19 +1938,19 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
                     .or_else(|| fs.lookup(&new_parent_path.to_lowercase()).ok().flatten())
                     .ok_or(winfsp::FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND))?
             };
-            // Batch path (M8 #2): enqueue and only flush when threshold is
-            // reached. On a 1000-rename workload this reduces Transaction
-            // commits from 1000 to ~16 (1000/64), amortising the B-tree
-            // rebuild and NXSB ring write cost.
+            // Carried out at once: Windows gets the real outcome of THIS
+            // rename (a collision when the target exists and replacing was
+            // not asked for) while the request is open, and the on-disk order
+            // is the request order.
             let op = if old_parent_ino == new_parent_ino {
-                DeferredOp::Rename {
+                HostOp::Rename {
                     parent_ino: old_parent_ino,
                     old_name,
                     new_name,
                     replace_if_exists,
                 }
             } else {
-                DeferredOp::MoveEntry {
+                HostOp::MoveEntry {
                     old_parent_ino,
                     old_name,
                     new_parent_ino,
@@ -1470,13 +1958,7 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
                     replace_if_exists,
                 }
             };
-            let flush_now = self.batch.enqueue(op);
-            if flush_now {
-                self.flush_batch()?;
-            } else {
-                self.sync_dirty_flag();
-            }
-            Ok(())
+            self.apply_now(op)
         })
     }
 
@@ -1493,6 +1975,8 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
         last_change_time: u64,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        let _t = crate::stats::timed("set_basic_info");
+        self.refuse_if_read_only()?;
         guard(|| {
             // FILE_ATTRIBUTE_READONLY = 0x1 (Windows SDK winnt.h)
             const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
@@ -1547,10 +2031,12 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
                 || bsd_flags_clear.is_some();
 
             if anything_to_persist {
-                if let Some((parent_ino, name)) = self.resolve_parent_and_name(None, &context.path)
-                {
-                    // Batch path (M8 #2): enqueue and flush on threshold.
-                    let op = DeferredOp::SetInodeAttrs {
+                let resolving = crate::stats::timed("set_basic_info.resolve");
+                let resolved = self.resolve_parent_and_name(None, &context.path);
+                drop(resolving);
+                let _applying = crate::stats::timed("set_basic_info.apply");
+                if let Some((parent_ino, name)) = resolved {
+                    let op = HostOp::SetInodeAttrs {
                         parent_ino,
                         name,
                         mode_set,
@@ -1562,15 +2048,7 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
                         bsd_flags_set,
                         bsd_flags_clear,
                     };
-                    let flush_now = self.batch.enqueue(op);
-                    if flush_now {
-                        if let Err(e) = self.flush_batch() {
-                            eprintln!("set_basic_info: batch flush failed: {e:?}");
-                            return Err(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR));
-                        }
-                    } else {
-                        self.sync_dirty_flag();
-                    }
+                    self.apply_now(op)?;
                 }
             }
 
@@ -1584,7 +2062,7 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
                 .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
             let attr = fs
                 .getattr(&context.path)
-                .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?
+                .map_err(fs_err("getattr"))?
                 .ok_or(winfsp::FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND))?;
             Self::fill_info(&attr, file_info);
             if creation_time != 0 {
@@ -1615,9 +2093,18 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
         set_allocation_size: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        let _t = crate::stats::timed("set_file_size");
+        self.refuse_if_read_only()?;
         guard(|| {
             // Current logical size - classifies a SetAllocationSize and drives
             // the truncate fast path below.
+            //
+            // A queued truncate has to be settled first when this call is the
+            // allocation-size half of the pair: .NET's SetLength issues
+            // SetEndOfFile(100) and then SetAllocationSize(4096), and comparing
+            // the second against the size still on disk (10000) made it look
+            // like a shrink rather than the bookkeeping it is. It then ran
+            // after the real cut and grew the file back to 4096.
             let current_size = {
                 let mut fs_guard = self
                     .fs
@@ -1626,9 +2113,11 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
                 let fs = fs_guard
                     .as_mut()
                     .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
+                // The size decides whether this call is a real truncate or
+                // just allocation bookkeeping to ignore. Reading a failure as
+                // zero decides it on a guess.
                 fs.getattr(&context.path)
-                    .ok()
-                    .flatten()
+                    .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?
                     .map(|a| a.size)
                     .unwrap_or(0)
             };
@@ -1658,24 +2147,18 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
             let (parent_ino, name) = self
                 .resolve_parent_and_name(None, &context.path)
                 .ok_or(winfsp::FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND))?;
-            // Batch path (M8 #3): ALL truncate ops - extends, zero-truncates,
-            // AND shrinks - are enqueued. flush_batch handles FastPathDeclined
-            // outcomes (boundary-cut shrinks) via the read+rewrite slow path
-            // after the batch commits. This removes the per-shrink forced flush
-            // that was causing 50 truncates to generate 50 commits (W4: 8.5x).
-            let op = DeferredOp::TruncateFast {
+            // The metadata-only resize runs now; when it declines (a cut
+            // inside a block, a shared or compressed stream) the read-and-
+            // rewrite path follows in the same call, so the size Windows sees
+            // afterwards is the size on disk.
+            let op = HostOp::TruncateFast {
                 parent_ino,
                 name: name.clone(),
                 path: context.path.clone(),
                 new_size,
                 current_size,
             };
-            let flush_now = self.batch.enqueue(op);
-            if flush_now {
-                self.flush_batch()?;
-            } else {
-                self.sync_dirty_flag();
-            }
+            self.apply_now(op)?;
             // Reflect size into file_info immediately (the op is staged).
             let mut fs_guard = self
                 .fs
@@ -1708,12 +2191,16 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
         _extra_buffer: Option<&[u8]>,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        let _t = crate::stats::timed("overwrite");
+        self.refuse_if_read_only()?;
         guard(|| {
             if let Ok(mut wb) = context.write_buf.lock() {
-                *wb = None;
+                if wb.take().is_some() {
+                    self.note_write_buffer(false);
+                }
             }
             if let Some((parent_ino, name)) = self.resolve_parent_and_name(None, &context.path) {
-                self.with_writable(|txn, vsb_raw, omap_raw| {
+                self.with_writable_keeping_names(|txn, vsb_raw, omap_raw| {
                     apfs_write_file::overwrite_existing_file(
                         txn,
                         vsb_raw,
@@ -1801,12 +2288,24 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
                 fs.read_symlink(&path)
                     .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?
             };
-            let target = target.ok_or(winfsp::FspError::NTSTATUS(STATUS_NOT_A_REPARSE_POINT))?;
+            // WinFsp asks this for every directory on the way to each file it
+            // opens, so a plain directory is the common answer, not a fault;
+            // at warn level it wrote one log line per path component.
+            let Some(target) = target else {
+                tracing::debug!(?path, "get_reparse_point_by_name: not a symlink");
+                return Err(winfsp::FspError::NTSTATUS(STATUS_NOT_A_REPARSE_POINT));
+            };
             let slice: &[u8] = if target.last() == Some(&0) {
                 &target[..target.len() - 1]
             } else {
                 &target[..]
             };
+            tracing::debug!(
+                ?path,
+                target = %String::from_utf8_lossy(slice),
+                buffer_len = buffer.len(),
+                "get_reparse_point_by_name: encoding symlink"
+            );
             Self::encode_symlink_reparse(slice, buffer)
         })
     }
@@ -1828,22 +2327,24 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
         file_name: &U16CStr,
         buffer: &[u8],
     ) -> winfsp::Result<()> {
+        self.refuse_if_read_only()?;
         guard(|| {
             let target = Self::decode_symlink_reparse(buffer)?;
             let path = win_to_unix(file_name);
             let (parent_ino, name) = self
                 .resolve_parent_and_name(None, &path)
                 .ok_or(winfsp::FspError::NTSTATUS(STATUS_OBJECT_NAME_NOT_FOUND))?;
-            // Txn 1: drop the empty placeholder created by the Create
-            // callback. If the path doesn't exist (rare), unlink returns
-            // NotFound and we still proceed to create the symlink.
-            let _ = self.with_writable(|txn, vsb_raw, omap_raw| {
-                apfs_write_file::unlink(txn, vsb_raw, omap_raw, parent_ino, &name)
-            });
-            // Txn 2: create the symlink record set.
+            // Replacing the placeholder the Create callback made with the
+            // symlink is one change, so it is one transaction: split across
+            // two, a crash or a failure between them left the name deleted and
+            // no symlink in its place - the file simply gone. A placeholder
+            // that is not there (rare, something else raced the create) is not
+            // an error; anything else the removal says is.
             self.with_writable(|txn, vsb_raw, omap_raw| {
-                apfs_write_file::create_symlink(txn, vsb_raw, omap_raw, parent_ino, &name, &target)
-                    .map(|_| ())
+                apfs_write_file::create_symlink(
+                    txn, vsb_raw, omap_raw, parent_ino, &name, &target, true,
+                )
+                .map(|_| ())
             })?;
             Ok(())
         })
@@ -1969,6 +2470,7 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
         buffer: &[u8],
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        self.refuse_if_read_only()?;
         guard(|| {
             // Resolve inode once before entering any transaction.
             let ino: u64 = {
@@ -2024,11 +2526,11 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
 
                 if value.is_empty() {
                     // Zero-length value = delete attribute (idempotent).
-                    self.with_writable(|txn, vsb_raw, omap_raw| {
+                    self.with_writable_keeping_names(|txn, vsb_raw, omap_raw| {
                         apfs_write_file::delete_xattr(txn, vsb_raw, omap_raw, ino, &name)
                     })?;
                 } else {
-                    self.with_writable(|txn, vsb_raw, omap_raw| {
+                    self.with_writable_keeping_names(|txn, vsb_raw, omap_raw| {
                         apfs_write_file::set_xattr(txn, vsb_raw, omap_raw, ino, &name, value)
                     })?;
                 }
@@ -2163,8 +2665,9 @@ pub(crate) fn ensure_winfsp_dll() {
 /// GENERIC_WRITE and the VolumeParams advertises a writable volume.
 /// (Read-only by default - safe default for production mounts.)
 ///
-/// Returns `(host, dirty_arc)`. The caller can poll `dirty_arc` to detect
-/// uncommitted batched writes for the tray dirty indicator.
+/// Returns `(host, dirty_arc)`. The caller can poll `dirty_arc` to learn
+/// whether some open handle still holds written content, for the tray's
+/// dirty indicator.
 ///
 /// Snapshot-guard for the writable gate (#149). Writing to a CLEAN volume is
 /// fsck-validated on real hardware; writing to a SNAPSHOTTED volume hits the
@@ -2220,6 +2723,7 @@ pub fn mount_apfs(
 ) -> winfsp::Result<(
     FileSystemHost<ApfsFs<Dev>, FineGuard>,
     std::sync::Arc<std::sync::atomic::AtomicBool>,
+    crate::winraw::DrivePresence,
 )> {
     // Self-provision the WinFsp DLL beside the exe before ANY winfsp call,
     // so the delay-loaded import resolves (else Win32 1285).
@@ -2265,8 +2769,13 @@ pub fn mount_apfs(
             }
         }
     };
+    // Watched by the caller: once the drive is pulled out, the mount ends
+    // instead of waiting on a device that will never answer again.
+    let presence =
+        crate::winraw::DrivePresence::open(pd.number()).map_err(io_err("DrivePresence::open"))?;
     let dev = CachingBlockDevice::new(OffsetBlockDevice::new(pd, range.offset, range.length));
-    let mut fsview = FsView::open_selected(dev, selector).map_err(io_err("FsView::open"))?;
+    let mut fsview =
+        FsView::open_selected(GroupDev::Plain(dev), selector).map_err(io_err("FsView::open"))?;
     // Snapshot-guard (#149): writing to a CLEAN volume is fsck-validated on real
     // hardware; writing to a SNAPSHOTTED volume hits the unproven snapshot-pinned
     // sm_fq free path (fsck-fails). Refuse writable + fall back to read-only when
@@ -2294,17 +2803,13 @@ pub fn mount_apfs(
         // below) carries the delete path; it is independent of directory queries.
         //   PostCleanupWhenModifiedOnly = 1   -> Cleanup only on modify
         .post_cleanup_when_modified_only(true)
-        // #153: do NOT set PassQueryDirectoryFileName. That flag opts the volume
-        // into the GetDirInfoByName fast path (winfsp `get_dir_info_by_name`),
-        // which we do not implement - so every name/pattern-filtered directory
-        // query (`dir *.txt`, Get-ChildItem -Filter) was routed to the default
-        // handler that returns STATUS_INVALID_DEVICE_REQUEST and came back EMPTY,
-        // while unfiltered listings worked. With the flag clear, the WinFsp FSD
-        // performs its own pattern matching over the full result set our
-        // `read_directory` emits (per winfsp.h: "the file system can choose to
-        // ignore [Pattern] as the FSD will always perform its own pattern
-        // matching on the returned results"). No GetDirInfoByName, no empty
-        // filtered listings.
+        // PassQueryDirectoryFileName: the FSD hands a query for one name to
+        // get_dir_info_by_name (registered through host_params) instead of
+        // listing the whole directory to match it. #153 saw filtered listings
+        // (`dir *.txt`, Get-ChildItem -Filter) come back empty with this flag
+        // when the callback was not there; measured on WinFsp 2.1 against
+        // both mount paths, they are complete with it.
+        .pass_query_directory_filename(true)
         // memfs sets persistent_acls = 1. Empirically required for the
         // Windows kernel to route CreateFile through our Create callback;
         // without it, CreateFile(CREATE_ALWAYS) returns ERROR_PATH_NOT_FOUND
@@ -2323,6 +2828,7 @@ pub fn mount_apfs(
         // read path already resolves reparse points; without this flag the
         // kernel never queries them.
         .reparse_points(true);
+    apply_info_timeouts(&mut vp);
     // NOTE: WinFsp 2.1 SDK (winfsp-sys 0.12 / winfsp 0.13) does not expose a
     // RemovableMedia bitfield in FSP_FSCTL_VOLUME_PARAMS - the field was present
     // in earlier WinFsp versions but is absent from the 2.1 bindgen output.
@@ -2330,9 +2836,9 @@ pub fn mount_apfs(
     // is a deferred enhancement tracked in the M13 roadmap.
 
     // winfsp 0.13: turbofish pins S=FineGuard so start() call is unambiguous
-    let fs = ApfsFs::new(fsview);
+    let fs = ApfsFs::new(fsview).read_only(!writable);
     let dirty_arc = fs.dirty_arc();
-    let mut host = FileSystemHost::<ApfsFs<Dev>, FineGuard>::new(vp, fs)
+    let mut host = FileSystemHost::<ApfsFs<Dev>, FineGuard>::new_with_options(host_params(vp), fs)
         .map_err(io_err("FileSystemHost::new"))?;
     // Plain drive-letter mount (WinFsp uses DefineDosDevice). Cross-elevation
     // visibility for the non-elevated Explorer is provided by the system-wide
@@ -2341,7 +2847,7 @@ pub fn mount_apfs(
     // ("the directory name is invalid") in empirical testing on this setup.
     host.mount(mountpoint).map_err(io_err("host.mount"))?;
     host.start().map_err(io_err("host.start"))?;
-    Ok((host, dirty_arc))
+    Ok((host, dirty_arc, presence))
 }
 
 // ---------------------------------------------------------------------------
@@ -2370,4 +2876,91 @@ pub fn write_status_file(
 ) -> std::io::Result<()> {
     let json = format!("{{\"drive\":{drive},\"mount\":{mount:?},\"dirty\":{dirty}}}\n");
     std::fs::write(path, json)
+}
+
+#[cfg(test)]
+mod info_timeout_tests {
+    use super::*;
+
+    /// No setting reaches the never-expiring window that turns WinFsp's
+    /// data caching on.
+    #[test]
+    fn the_info_window_never_turns_data_caching_on() {
+        assert_eq!(info_timeout_ms(None), DEFAULT_INFO_TIMEOUT_MS);
+        assert_eq!(info_timeout_ms(Some("0")), 0);
+        assert_eq!(info_timeout_ms(Some("250")), 250);
+        assert_eq!(
+            info_timeout_ms(Some("not a number")),
+            DEFAULT_INFO_TIMEOUT_MS
+        );
+        for huge in ["4294967295", "4294967294", "600000"] {
+            let ms = info_timeout_ms(Some(huge));
+            assert_eq!(ms, MAX_INFO_TIMEOUT_MS, "{huge}");
+            assert_ne!(ms, u32::MAX);
+        }
+    }
+}
+
+#[cfg(test)]
+mod reparse_tests {
+    use super::*;
+
+    /// Decode the parts of a symlink reparse buffer that decide whether the
+    /// object manager can resolve it.
+    fn parts(buf: &[u8], len: usize) -> (u32, String, String) {
+        let sub_off = u16::from_le_bytes([buf[8], buf[9]]) as usize;
+        let sub_len = u16::from_le_bytes([buf[10], buf[11]]) as usize;
+        let print_off = u16::from_le_bytes([buf[12], buf[13]]) as usize;
+        let print_len = u16::from_le_bytes([buf[14], buf[15]]) as usize;
+        let flags = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        let data_len = u16::from_le_bytes([buf[4], buf[5]]) as usize;
+        assert_eq!(data_len + 8, len, "ReparseDataLength must cover the body");
+        let wide = |off: usize, len: usize| -> String {
+            let start = 20 + off;
+            let units: Vec<u16> = buf[start..start + len]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16(&units).expect("utf16")
+        };
+        (flags, wide(sub_off, sub_len), wide(print_off, print_len))
+    }
+
+    #[test]
+    fn a_relative_target_is_marked_relative() {
+        let mut buf = [0u8; 512];
+        let n = ApfsFs::<Dev>::encode_symlink_reparse(b"target.txt", &mut buf).expect("encode")
+            as usize;
+        let (flags, sub, print) = parts(&buf, n);
+        assert_eq!(flags, SYMLINK_FLAG_RELATIVE);
+        assert_eq!(sub, "target.txt");
+        assert_eq!(print, "target.txt");
+    }
+
+    /// The name the object manager resolves has to be the NT form. Handing it
+    /// the plain drive path is ERROR_INVALID_NAME, which is what following an
+    /// absolute link used to give.
+    #[test]
+    fn a_drive_target_resolves_through_the_object_manager() {
+        let mut buf = [0u8; 512];
+        let n = ApfsFs::<Dev>::encode_symlink_reparse(b"Z:/dir/file.txt", &mut buf).expect("encode")
+            as usize;
+        let (flags, sub, print) = parts(&buf, n);
+        assert_eq!(flags, 0, "an absolute target is not relative");
+        assert_eq!(sub, "\\??\\Z:\\dir\\file.txt");
+        assert_eq!(print, "Z:\\dir\\file.txt", "the shown name stays plain");
+    }
+
+    /// A target that is absolute in POSIX terms means nothing on Windows and
+    /// is passed through rather than dressed up as an NT path.
+    #[test]
+    fn a_posix_target_is_left_alone() {
+        let mut buf = [0u8; 512];
+        let n = ApfsFs::<Dev>::encode_symlink_reparse(b"/etc/hosts", &mut buf).expect("encode")
+            as usize;
+        let (flags, sub, print) = parts(&buf, n);
+        assert_eq!(flags, 0);
+        assert_eq!(sub, "\\etc\\hosts");
+        assert_eq!(print, "\\etc\\hosts");
+    }
 }

@@ -61,8 +61,11 @@ dependencies = [
 name = "apfs-core"
 version = "0.0.0"
 dependencies = [
+ "lzfse_rust",
+ "miniz_oxide",
  "tempfile",
  "thiserror 2.0.18",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -87,6 +90,7 @@ version = "0.0.0"
 dependencies = [
  "apfs",
  "apfs-core",
+ "libc",
  "thiserror 2.0.18",
  "tracing",
  "unicode-normalization",
@@ -1834,6 +1838,12 @@ name = "log"
 version = "0.4.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
+
+[[package]]
+name = "lzfse_rust"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5edeac3ec657925dececc672bdd58fa2212291886ddcb3e08aa46924c78340c6"
 
 [[package]]
 name = "markup5ever"

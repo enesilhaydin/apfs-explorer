@@ -39,6 +39,12 @@ pub enum VolumeRole {
 
 impl VolumeRole {
     /// Decode the raw `apfs_role` u16 into a `VolumeRole`.
+    /// The low six bits are flags (system, user, recovery, VM, preboot,
+    /// installer); the rest is an enumeration shifted up by six: data 1,
+    /// baseband 2, update 3, xART 4, hardware 5, backup 6, enterprise 9,
+    /// pre-login 11. Update, xART, hardware and backup are therefore 0xC0,
+    /// 0x100, 0x140 and 0x180, not further single bits.
+    /// [CERTAIN: apfsprogs raw.h APFS_VOL_ROLE_* with APFS_VOLUME_ENUM_SHIFT 6]
     pub fn from_raw(raw: u16) -> Self {
         match raw {
             0x0000 => Self::None,
@@ -50,10 +56,10 @@ impl VolumeRole {
             0x0020 => Self::Installer,
             0x0040 => Self::Data,
             0x0080 => Self::Baseband,
-            0x0100 => Self::Update,
-            0x0200 => Self::Xart,
-            0x0400 => Self::Hardware,
-            0x0800 => Self::Backup,
+            0x00C0 => Self::Update,
+            0x0100 => Self::Xart,
+            0x0140 => Self::Hardware,
+            0x0180 => Self::Backup,
             other => Self::Other(other),
         }
     }
@@ -110,6 +116,24 @@ pub const APFS_INCOMPAT_CASE_INSENSITIVE: u64 = 0x0000_0001;
 /// which means directory-entry keys use the hashed form j_drec_hashed_key_t.
 pub const APFS_INCOMPAT_NORMALIZATION_INSENSITIVE: u64 = 0x0000_0008;
 
+/// `apfs_fs_flags` bit: the volume's file data is stored in the clear.
+///
+/// A volume formatted without encryption sets this bit. FileVault volumes
+/// leave it clear, and their file extents hold ciphertext that only the
+/// keybag-derived per-file keys can decode. Treat "bit clear" as encrypted:
+/// serving those extents as file content would hand the caller garbage.
+pub const APFS_FS_UNENCRYPTED: u64 = 0x0000_0001;
+
+/// apfs_incompatible_features bit: the volume is sealed (signed system volume).
+/// Its file extents live in a separate fext tree and the seal must be broken
+/// before any mutation, which we do not implement.
+pub const APFS_INCOMPAT_SEALED_VOLUME: u64 = 0x0000_0020;
+
+/// Offset of `apfs_fext_tree_oid` in the volume superblock.
+/// [linux-apfs-rw apfs_raw.h /*400*/ integrity_meta_oid + 8; decoded on a
+/// macOS cryptex volume: 0x408 names a physical FEXT_TREE root]
+const VSB_FEXT_TREE_OID: usize = 0x408;
+
 #[derive(Debug, Clone)]
 pub struct VolumeSuperblock {
     pub obj: ObjPhys,
@@ -119,6 +143,9 @@ pub struct VolumeSuperblock {
     pub incompatible_features: u64,
     pub omap_oid: u64,
     pub root_tree_oid: u64,
+    /// `apfs_fext_tree_oid` u64@0x408: on a sealed volume, the physical root
+    /// of the tree holding every file extent (the catalog holds none).
+    pub fext_tree_oid: u64,
     pub name: String,
     /// Volume UUID from `apfs_vol_uuid` [u8;16]@0xF0=240.
     /// Cross-check: linux-apfs-rw /*F0*/ + apfsprogs /*F0*/.
@@ -151,6 +178,7 @@ impl VolumeSuperblock {
         let incompatible_features = u64_le(block, 56)?;
         let omap_oid = u64_le(block, 128)?;
         let root_tree_oid = u64_le(block, 136)?;
+        let fext_tree_oid = u64_le(block, VSB_FEXT_TREE_OID)?;
         let fs_flags = u64_le(block, 264)?;
         let role = u16_le(block, 964)?;
         // apfs_vol_uuid at offset 0xF0 = 240 (16 bytes).
@@ -180,16 +208,36 @@ impl VolumeSuperblock {
             incompatible_features,
             omap_oid,
             root_tree_oid,
+            fext_tree_oid,
             name,
             uuid,
         })
     }
 
-    /// True if this is a system-managed volume (not user-visible).
-    /// Covers: PREBOOT 0x10, RECOVERY 0x04, VM 0x08, INSTALLER 0x20, BASEBAND 0x80.
+    /// True when the volume's file data is encrypted (FileVault).
+    ///
+    /// Encryption is a non-goal: the point of surfacing it is to refuse the
+    /// volume loudly instead of serving ciphertext as file content.
+    pub fn is_encrypted(&self) -> bool {
+        self.fs_flags & APFS_FS_UNENCRYPTED == 0
+    }
+
+    /// True when the volume is sealed (signed system volume). Mutating one
+    /// requires breaking the seal, which we do not implement.
+    pub fn is_sealed(&self) -> bool {
+        self.incompatible_features & APFS_INCOMPAT_SEALED_VOLUME != 0
+    }
+
+    /// True if this is a system-managed volume (not user-visible): the
+    /// recovery, VM, preboot or installer flag, or an enumerated role other
+    /// than data (baseband, update, xART, hardware, backup, enterprise,
+    /// pre-login and whatever comes after).
     pub fn is_system(&self) -> bool {
-        const SYSTEM_MASK: u16 = 0x10 | 0x04 | 0x08 | 0x20 | 0x80;
-        self.role & SYSTEM_MASK != 0
+        const SYSTEM_FLAGS: u16 = 0x10 | 0x04 | 0x08 | 0x20;
+        const ENUM_SHIFT: u16 = 6;
+        const ENUM_DATA: u16 = 1;
+        let enumerated = self.role >> ENUM_SHIFT;
+        self.role & SYSTEM_FLAGS != 0 || (enumerated != 0 && enumerated != ENUM_DATA)
     }
 
     /// True when directory-entry keys use the hashed form j_drec_hashed_key_t.
@@ -200,6 +248,18 @@ impl VolumeSuperblock {
         self.incompatible_features
             & (APFS_INCOMPAT_CASE_INSENSITIVE | APFS_INCOMPAT_NORMALIZATION_INSENSITIVE)
             != 0
+    }
+
+    /// True when the volume treats names that differ only in case as the same
+    /// name.
+    ///
+    /// This is NOT implied by [`names_are_hashed`]: a case-sensitive volume
+    /// (the `APFSX` personality) sets only NORMALIZATION_INSENSITIVE, so its
+    /// keys are hashed and its names need normalizing, but `README` and
+    /// `readme` are two different files. Folding case there resolves both to
+    /// whichever entry the scan reaches first.
+    pub fn is_case_insensitive(&self) -> bool {
+        self.incompatible_features & APFS_INCOMPAT_CASE_INSENSITIVE != 0
     }
 }
 
@@ -216,6 +276,10 @@ mod tests {
     ];
 
     fn make_apsb(role: u16, name: &str) -> [u8; 4096] {
+        make_apsb_with_flags(role, name, APFS_FS_UNENCRYPTED)
+    }
+
+    fn make_apsb_with_flags(role: u16, name: &str, fs_flags: u64) -> [u8; 4096] {
         let mut b = [0u8; 4096];
         // o_type at offset 24 (ObjPhys layout: cksum[0..8], oid[8..16], xid[16..24], o_type[24..28])
         b[24..28].copy_from_slice(&OBJECT_TYPE_FS.to_le_bytes());
@@ -226,7 +290,7 @@ mod tests {
         // apfs_root_tree_oid at offset 136
         b[136..144].copy_from_slice(&9u64.to_le_bytes());
         // apfs_fs_flags at offset 264
-        b[264..272].copy_from_slice(&0u64.to_le_bytes());
+        b[264..272].copy_from_slice(&fs_flags.to_le_bytes());
         // apfs_vol_uuid at offset 0xF0 = 240
         b[240..256].copy_from_slice(&TEST_UUID);
         // apfs_volname at offset 704 (NUL-padded; rest of array is already 0)
@@ -259,6 +323,31 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_volume_is_detected() {
+        // A volume formatted without encryption carries APFS_FS_UNENCRYPTED.
+        // FileVault volumes do not set it, and their file data is ciphertext.
+        let plain = VolumeSuperblock::parse(&make_apsb(0x40, "Data")).expect("parse plain");
+        assert!(
+            !plain.is_encrypted(),
+            "APFS_FS_UNENCRYPTED set must read as plaintext"
+        );
+
+        let enc = VolumeSuperblock::parse(&make_apsb_with_flags(0x40, "Data", 0)).expect("parse");
+        assert!(
+            enc.is_encrypted(),
+            "volume without APFS_FS_UNENCRYPTED must read as encrypted"
+        );
+
+        // Other flag bits must not clear the verdict on their own.
+        let enc2 =
+            VolumeSuperblock::parse(&make_apsb_with_flags(0x40, "Data", 0x4)).expect("parse");
+        assert!(
+            enc2.is_encrypted(),
+            "unrelated fs_flags bits must not imply plaintext"
+        );
+    }
+
+    #[test]
     fn volume_uuid_round_trips() {
         let b = make_apsb(0x02, "TestVol");
         let v = VolumeSuperblock::parse(&b).expect("parse APSB");
@@ -280,10 +369,10 @@ mod tests {
             (0x0020, VolumeRole::Installer),
             (0x0040, VolumeRole::Data),
             (0x0080, VolumeRole::Baseband),
-            (0x0100, VolumeRole::Update),
-            (0x0200, VolumeRole::Xart),
-            (0x0400, VolumeRole::Hardware),
-            (0x0800, VolumeRole::Backup),
+            (0x00C0, VolumeRole::Update),
+            (0x0100, VolumeRole::Xart),
+            (0x0140, VolumeRole::Hardware),
+            (0x0180, VolumeRole::Backup),
             (0x1234, VolumeRole::Other(0x1234)),
         ];
         for &(raw, expected) in cases {

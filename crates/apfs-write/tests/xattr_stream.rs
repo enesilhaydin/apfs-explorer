@@ -151,6 +151,66 @@ mod xattr_stream_tests {
         container.superblock.obj.xid
     }
 
+    /// Attach without mounting and let Apple's fsck judge the image. Warnings
+    /// count: fsck exits 0 on damage it considers repairable, and an id taken
+    /// from the wrong pool is exactly that kind of damage.
+    fn run_fsck(label: &str) {
+        let out = Command::new("hdiutil")
+            .args([
+                "attach",
+                "-nomount",
+                "-imagekey",
+                "diskimage-class=CRawDiskImage",
+                IMG,
+            ])
+            .output()
+            .expect("hdiutil attach");
+        assert!(out.status.success(), "{label}: hdiutil attach failed");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut apfs_dev = None;
+        let mut parent_dev = None;
+        for line in stdout.lines() {
+            let dev = line.split_whitespace().next().unwrap_or("");
+            if !dev.starts_with("/dev/disk") {
+                continue;
+            }
+            if parent_dev.is_none() && !dev.trim_start_matches("/dev/disk").contains('s') {
+                parent_dev = Some(dev.to_string());
+            }
+            if apfs_dev.is_none() && line.contains("Apple_APFS") {
+                apfs_dev = Some(dev.to_string());
+            }
+        }
+        let parent = parent_dev.expect("no whole-disk node");
+        let apfs = apfs_dev.expect("no Apple_APFS partition");
+        let rdev = apfs.replacen("/dev/disk", "/dev/rdisk", 1);
+        let fsck = Command::new("fsck_apfs").args(["-n", &rdev]).output();
+        let _ = Command::new("hdiutil").args(["detach", &parent]).status();
+        let fsck = fsck.expect("fsck_apfs spawn");
+        let report = String::from_utf8_lossy(&fsck.stdout).into_owned()
+            + &String::from_utf8_lossy(&fsck.stderr);
+        assert!(
+            fsck.status.success(),
+            "{label}: fsck_apfs reported corruption:\n{report}"
+        );
+        let complaints: Vec<&str> = report
+            .lines()
+            .filter(|l| {
+                let l = l.to_ascii_lowercase();
+                l.contains("warning:")
+                    || l.contains("overallocation")
+                    || l.contains("underallocation")
+                    || l.contains("is not valid")
+                    || l.contains("free id in use")
+            })
+            .collect();
+        assert!(
+            complaints.is_empty(),
+            "{label}: fsck_apfs flagged inconsistencies:\n{}",
+            complaints.join("\n")
+        );
+    }
+
     fn assert_parseable(label: &str) {
         let (base, len) = read_image_header();
         let inner = FileBlockDeviceRw::open_rw(IMG).expect("open rw parseable");
@@ -190,6 +250,10 @@ mod xattr_stream_tests {
             .status()
             .expect("hdiutil create");
         assert!(status.success(), "hdiutil create failed: {status}");
+        // hdiutil appends .dmg to -o, so the image the rest of the test opens
+        // does not exist under IMG until it is moved into place.
+        let created = format!("{IMG}.dmg");
+        std::fs::rename(&created, IMG).unwrap_or_else(|e| panic!("move {created} to {IMG}: {e}"));
     }
 
     // -----------------------------------------------------------------------
@@ -268,6 +332,7 @@ mod xattr_stream_tests {
         assert!(xid_after_x1 > xid_before_x1, "X1: XID not advanced");
         assert_parseable("after X1 (100 KiB xattr)");
         println!("  X1 PASS: XID {xid_before_x1:#x} → {xid_after_x1:#x} ({SIZE_100KIB} bytes)");
+        run_fsck("X1");
 
         // ---------------------------------------------------------------
         // X2: 1 MiB stream xattr (replace the 100 KiB one).
@@ -347,6 +412,7 @@ mod xattr_stream_tests {
         assert_parseable("after X4b (idempotent delete)");
         println!("  X4b PASS: idempotent delete ok");
 
+        run_fsck("final");
         println!("\nAll xattr_stream tests PASSED.");
     }
 }

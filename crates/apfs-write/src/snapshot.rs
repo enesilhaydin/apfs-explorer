@@ -64,9 +64,25 @@ fn encode_jkey(obj_id: u64, key_type: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 const VSBI_FS_ALLOC_COUNT: usize = 0x58;
+const VSBI_ROOT_TREE_OID: usize = 0x88;
 const VSBI_OMAP_OID: usize = 0x80;
 const VSBI_EXTENTREF_TREE_OID: usize = 0x90;
 const VSBI_SNAP_META_TREE_OID: usize = 0x98;
+const VSBI_NEXT_OBJ_ID: usize = 0xB0;
+/// One volume object-map mapping: `(oid, xid, paddr)`.
+use crate::file::OmapRec;
+
+/// One volume object map mapping, flags and size carried as stored.
+type OmapTriple = OmapRec;
+
+/// A catalog key's `obj_id_and_type` carries the type in the top byte.
+const OBJ_ID_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
+/// A `j_phys_ext_val`'s `len_and_kind` carries the kind in the top nibble.
+const PHYS_EXT_LEN_MASK: u64 = 0x0FFF_FFFF_FFFF_FFFF;
+const VSBI_NUM_FILES: usize = 0xB8;
+const VSBI_NUM_DIRECTORIES: usize = 0xC0;
+const VSBI_NUM_SYMLINKS: usize = 0xC8;
+const VSBI_NUM_OTHER_FSOBJECTS: usize = 0xD0;
 const VSBI_NUM_SNAPSHOTS: usize = 0xD8;
 const VSBI_LAST_MOD_TIME: usize = 0x100;
 /// `apfs_extentref_tree_type @ 0x78` - the u32 o_type+o_subtype of the
@@ -118,6 +134,21 @@ pub fn create_snapshot<D: WritableBlockDevice>(
     omap_raw: &[u8],
     snap_name: &str,
 ) -> Result<u64, TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, omap_raw)?;
+    let (vsb_raw, omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
+    crate::file::ensure_volume_mutable(vsb_raw)?;
+    // #139: RETAIN existing snapshots. Every entry already in the snap_meta
+    // tree is read here, the new snapshot is appended below, and the node is
+    // rebuilt with the full set so the on-disk tree matches the (incremented)
+    // snapshot counts. They are read before anything is allocated so a name
+    // that is refused costs nothing.
+    let existing_snap_meta_paddr = u64_from_le(vsb_raw, VSBI_SNAP_META_TREE_OID);
+    let mut entries: Vec<SnapEntry> = if existing_snap_meta_paddr != 0 {
+        read_all_snap_entries(txn, existing_snap_meta_paddr)?
+    } else {
+        Vec::new()
+    };
+    check_snapshot_name(snap_name, &entries)?;
     let bsz = txn.nx.block_size as usize;
     let snap_xid = txn.xid;
     // M7b-RT Subtask E refinement (empirical, post-Subtask-E full):
@@ -199,7 +230,6 @@ pub fn create_snapshot<D: WritableBlockDevice>(
     // user's host system) wrote. Reading the live volume's footer makes the
     // writer version-resilient (e.g. BTREE_HASHED set or unset).
     // [CERTAIN: see DEFAULT_SNAP_META_BT_FLAGS doc + the APFS specification p.129]
-    let existing_snap_meta_paddr = u64_from_le(vsb_raw, VSBI_SNAP_META_TREE_OID);
     let bt_flags = if existing_snap_meta_paddr != 0 {
         read_btn_info_flags(txn, existing_snap_meta_paddr).unwrap_or(DEFAULT_SNAP_META_BT_FLAGS)
     } else {
@@ -210,16 +240,13 @@ pub fn create_snapshot<D: WritableBlockDevice>(
     // o_type for the volume's extent-ref tree. Apple snap_metadata_val.extentref_tree_type
     // copies this verbatim (NOT a subtype). [ LOCKED, the APFS specification p.117]
     let old_extentref_type = u32_from_le(vsb_raw, VSBI_EXTENTREF_TREE_TYPE);
-    // #139: RETAIN existing snapshots. Read every entry already in the
-    // snap_meta tree, append this new snapshot, and rebuild the node with the
-    // full set so the on-disk tree matches the (incremented) snapshot counts.
-    // Previously this rebuilt a single-entry node, silently dropping every
-    // earlier snapshot and triggering fsck "Snapshot is invalid".
-    let mut entries: Vec<SnapEntry> = if existing_snap_meta_paddr != 0 {
-        read_all_snap_entries(txn, existing_snap_meta_paddr)?
-    } else {
-        Vec::new()
-    };
+    // The snapshot metadata record needs an object id of its own. Reusing 2 -
+    // the root directory's inode number - hands the snapshot the identity of a
+    // live object, so a checker walking object ids sees the same id claimed
+    // both by an inode and by snapshot metadata. Take the volume's next free
+    // id instead and advance the counter below, exactly as a file creation
+    // does.
+    let snap_inum = u64_from_le(vsb_raw, VSBI_NEXT_OBJ_ID);
     entries.push(SnapEntry {
         xid: snap_xid,
         extentref_tree_oid: old_extentref_oid,
@@ -227,7 +254,7 @@ pub fn create_snapshot<D: WritableBlockDevice>(
         sblock_oid: frozen_paddr,
         create_time: now_ns,
         change_time: now_ns,
-        inum: 2, // ROOT_DIR_INO_NUM ( empirical)
+        inum: snap_inum,
         name: name_bytes.clone(),
     });
     entries.sort_by_key(|e| e.xid);
@@ -246,6 +273,9 @@ pub fn create_snapshot<D: WritableBlockDevice>(
     }
     let old_num_snaps = u64_from_le(&new_vsb, VSBI_NUM_SNAPSHOTS);
     write_u64_le(&mut new_vsb, VSBI_NUM_SNAPSHOTS, old_num_snaps + 1);
+    // Consume the id handed to the snapshot metadata record above so no later
+    // object is created with the same one.
+    write_u64_le(&mut new_vsb, VSBI_NEXT_OBJ_ID, snap_inum + 1);
     write_u64_le(&mut new_vsb, VSBI_LAST_MOD_TIME, now_ns);
     // Q3: live volume gets the new empty extentref tree.
     write_u64_le(&mut new_vsb, VSBI_EXTENTREF_TREE_OID, new_extentref_paddr);
@@ -279,7 +309,13 @@ pub fn create_snapshot<D: WritableBlockDevice>(
     // 2nd+ snapshot. [#139]
     let old_snapshot_tree_paddr = u64_from_le(omap_raw, OMAP_SNAPSHOT_TREE_OID_OFF);
 
-    {
+    // How much the rebuilt volume omap b-tree grew or shrank. It is a 1:1 COW
+    // pair only while the tree fits one node; past that the rebuild allocates a
+    // different number of nodes than it frees.
+    // Whether the live catalog root was copied under this transaction here;
+    // it is not when an earlier change in the same transaction already did.
+    let mut live_fsroot_copied = false;
+    let vol_tree_node_delta: i64 = {
         let mut new_omap = omap_raw.to_vec();
         if new_omap.len() < bsz {
             new_omap.resize(bsz, 0);
@@ -295,100 +331,58 @@ pub fn create_snapshot<D: WritableBlockDevice>(
         // OLD volume omap header + b-tree have no remaining referrer.
         let old_vol_tree_paddr = u64_from_le(&new_omap, 48);
         let old_vomap_paddr = u64_from_le(vsb_raw, VSBI_OMAP_OID);
-        let new_vol_tree_paddr = txn.alloc_block()?;
         let mut tree_buf = vec![0u8; bsz];
         txn.read_block(old_vol_tree_paddr, &mut tree_buf)?;
-        write_u64_le(&mut tree_buf, 8, new_vol_tree_paddr);
-        // Live-side: vol-tree is stamped at live_xid (two-xid model).
-        write_u64_le(&mut tree_buf, 16, live_xid);
-        // M7b-RT Subtask E continuation (TWO-XID empirical refinement):
-        // (1) find the current fsroot paddr (highest-xid root_oid entry),
-        // (2) COW the fsroot to a new paddr stamped with o_xid=live_xid,
-        // (3) APPEND `{root_oid, live_xid} -> new_fsroot_paddr` to the
-        //     volume omap b-tree's TOC + key/val arrays.
-        // The old fsroot paddr stays referenced via the existing omap
-        // entry at its original xid (snapshot's frozen view at snap_xid
-        // resolves to that older entry; fsck walks live via xid > snap).
-        let root_tree_oid = u64_from_le(vsb_raw, 0x88); // VSBI_ROOT_TREE_OID
-        let nkeys = u32_from_le(&tree_buf, 36) as usize;
-        let toc_len = {
-            let arr: [u8; 2] = tree_buf
-                .get(42..44)
-                .ok_or_else(|| TxnError::SpacemanParse("vol omap toc_len oob".into()))?
-                .try_into()
-                .map_err(|_| TxnError::SpacemanParse("vol omap toc_len cast".into()))?;
-            u16::from_le_bytes(arr) as usize
-        };
-        let key_area_start = 56 + toc_len;
-        let val_area_end = bsz - 40;
+        // Walk the WHOLE old omap. Decoding only the root reads an index node
+        // as if it were a leaf once the tree has split, which would rebuild the
+        // map as a single node and orphan every real leaf beneath it - and with
+        // the object map goes the catalog. The tree is rebuilt from the mappings
+        // themselves, which also keeps the new entry sorted and the node free
+        // lists valid (poking the old node in place corrupted macOS-formatted
+        // nodes: fsck "Object map is invalid" / "invalid btn_key_free_list").
+        let (mut triples, old_vol_tree_nodes) =
+            crate::file::collect_omap_tree(txn, &tree_buf, old_vol_tree_paddr, bsz)?;
+        // Two-xid snapshot model: find the live fsroot (highest-xid root_oid
+        // entry), COW it to a new paddr stamped at live_xid, and add the new
+        // {root_oid, live_xid} -> new_fsroot mapping.
+        let root_tree_oid = u64_from_le(vsb_raw, VSBI_ROOT_TREE_OID);
         let mut fsroot_paddr_at_max: u64 = 0;
         let mut have_live_xid_entry = false;
         let mut max_xid = 0u64;
-        for i in 0..nkeys {
-            let toc_off = 56 + i * 4;
-            let k_off_a: [u8; 2] = tree_buf
-                .get(toc_off..toc_off + 2)
-                .ok_or_else(|| TxnError::SpacemanParse("vol omap TOC k_off oob".into()))?
-                .try_into()
-                .map_err(|_| TxnError::SpacemanParse("vol omap TOC k_off cast".into()))?;
-            let v_off_a: [u8; 2] = tree_buf
-                .get(toc_off + 2..toc_off + 4)
-                .ok_or_else(|| TxnError::SpacemanParse("vol omap TOC v_off oob".into()))?
-                .try_into()
-                .map_err(|_| TxnError::SpacemanParse("vol omap TOC v_off cast".into()))?;
-            let k_off = u16::from_le_bytes(k_off_a) as usize;
-            let v_off = u16::from_le_bytes(v_off_a) as usize;
-            let k_abs = key_area_start + k_off;
-            let v_abs = val_area_end - v_off;
-            let oid = u64_from_le(&tree_buf, k_abs);
-            let xid = u64_from_le(&tree_buf, k_abs + 8);
-            if oid == root_tree_oid {
-                if xid == live_xid {
-                    have_live_xid_entry = true;
-                }
-                if xid >= max_xid {
-                    max_xid = xid;
-                    fsroot_paddr_at_max = u64_from_le(&tree_buf, v_abs + 8);
-                }
+        for &OmapRec {
+            oid, xid, paddr, ..
+        } in &triples
+        {
+            if oid != root_tree_oid {
+                continue;
+            }
+            if xid == live_xid {
+                have_live_xid_entry = true;
+            }
+            if xid >= max_xid {
+                max_xid = xid;
+                fsroot_paddr_at_max = paddr;
             }
         }
         if fsroot_paddr_at_max != 0 && !have_live_xid_entry {
-            // (2) COW the fsroot to a new paddr stamped at LIVE_xid (two-xid).
-            // fsroot is a VIRTUAL object - `o_oid` is its virtual oid
-            // (= apfs_root_tree_oid, e.g. 0x404), NOT its paddr. Only
-            // `o_xid` is bumped to live_xid; o_oid stays unchanged.
+            // The fsroot is a VIRTUAL object: o_oid stays the root-tree oid,
+            // only o_xid is bumped.
             let new_fsroot_paddr = txn.alloc_block()?;
             let mut fsroot_buf = vec![0u8; bsz];
             txn.read_block(fsroot_paddr_at_max, &mut fsroot_buf)?;
             write_u64_le(&mut fsroot_buf, 16, live_xid);
             update_checksum_in_place(&mut fsroot_buf);
             txn.stage_raw(new_fsroot_paddr, fsroot_buf);
-            // (3) APPEND `{root_oid, live_xid} -> new_fsroot_paddr` to tree_buf.
-            // fsck identifies this as the "live" fsroot via xid > om_most_recent_snap.
-            let new_idx = nkeys;
-            let toc_off = 56 + new_idx * 4;
-            let k_off_new = new_idx * 16;
-            let v_off_new = (new_idx + 1) * 16;
-            write_u16_le(&mut tree_buf, toc_off, k_off_new as u16);
-            write_u16_le(&mut tree_buf, toc_off + 2, v_off_new as u16);
-            let k_abs = key_area_start + k_off_new;
-            write_u64_le(&mut tree_buf, k_abs, root_tree_oid);
-            write_u64_le(&mut tree_buf, k_abs + 8, live_xid);
-            let v_abs = val_area_end - v_off_new;
-            write_u32_le(&mut tree_buf, v_abs, 0); // ov_flags
-            write_u32_le(&mut tree_buf, v_abs + 4, bsz as u32); // ov_size
-            write_u64_le(&mut tree_buf, v_abs + 8, new_fsroot_paddr);
-            let new_nkeys = (nkeys + 1) as u32;
-            write_u32_le(&mut tree_buf, 36, new_nkeys);
-            let used_key = new_nkeys as usize * 16;
-            let used_val = new_nkeys as usize * 16;
-            write_u16_le(&mut tree_buf, 44, used_key as u16);
-            let free_len = val_area_end - key_area_start - used_key - used_val;
-            write_u16_le(&mut tree_buf, 46, free_len as u16);
-            write_u64_le(&mut tree_buf, val_area_end + 24, new_nkeys as u64);
+            triples.push(OmapRec::live(
+                root_tree_oid,
+                live_xid,
+                new_fsroot_paddr,
+                bsz,
+            ));
+            live_fsroot_copied = true;
         }
-        update_checksum_in_place(&mut tree_buf);
-        txn.stage_raw(new_vol_tree_paddr, tree_buf);
+        let (new_vol_tree_paddr, new_vol_tree_nodes) =
+            crate::file::build_omap_tree(txn, &tree_buf, &triples, live_xid, bsz)?;
         // Allocate a new block for the COW'd volume omap.
         let new_vomap_paddr = txn.alloc_block()?;
         // Physical object: o_oid = paddr, o_xid = LIVE_xid (two-xid model).
@@ -416,10 +410,14 @@ pub fn create_snapshot<D: WritableBlockDevice>(
         // CLEAN for create+delete but mismatches the kernel; the canonical
         // 0 is required for fsck's "orphan extent" detector to recognize
         // shared-paddr extents correctly.
-        // Free old volume-omap header + b-tree node - orphaned after the patch.
+        // Free the old volume-omap header and every node of the old b-tree -
+        // all orphaned once the header points at the rebuilt tree.
         txn.free_block(old_vomap_paddr)?;
-        txn.free_block(old_vol_tree_paddr)?;
-    }
+        for p in &old_vol_tree_nodes {
+            txn.free_block(*p)?;
+        }
+        new_vol_tree_nodes as i64 - old_vol_tree_nodes.len() as i64
+    };
 
     // M7b-RT Subtask A: free the OLD snap-meta tree root if it existed. The
     // live VSB now points at `snap_node_paddr` (a freshly-built node with the
@@ -442,13 +440,22 @@ pub fn create_snapshot<D: WritableBlockDevice>(
     // must equal the volume's total block count - every alloc bumps it,
     // every free decrements. We tally the net delta mechanically here.
     //
-    // ALLOCs (+7): frozen VSB, EMPTY live extref tree (old paddr retained
-    //   by snap_metadata_val), snap-meta node, om_snapshot_tree, new vomap
-    //   header (COW pair), new vol-tree (COW pair), live fsroot COW.
-    // FREEs (-2 or -3): old vomap header, old vol-tree (always); old
-    //   snap-meta tree root (replaced when it existed).
-    // Net: +5 (no existing snap_meta), +4 (existing).
-    let mut net_delta: i64 = 7 - 2; // +5
+    // The frozen VSB is the snapshot's OWN superblock; the live volume's
+    // apfs_fs_alloc_count does not include it - fsck (the arbiter) counts +4, not
+    // +5, of net-new live references for a first snapshot, on both our-format and
+    // macOS-formatted volumes.
+    // ALLOCs counted (+6): EMPTY live extref tree (old paddr retained by
+    //   snap_metadata_val), snap-meta node, om_snapshot_tree, new vomap header
+    //   (COW pair), new vol-tree (COW pair), live fsroot COW.
+    // FREEs (-2 or -3): old vomap header, old vol-tree (always); old snap-meta
+    //   tree root (replaced when it existed).
+    // Net: +4 (no existing snap_meta), +3 (existing).
+    let mut net_delta: i64 = 6 - 2; // +4
+    if !live_fsroot_copied {
+        // The catalog root already carried this transaction's id, so no copy
+        // was taken here: one allocation fewer than the tally above assumes.
+        net_delta -= 1;
+    }
     if existing_snap_meta_paddr != 0 {
         net_delta -= 1;
     }
@@ -456,6 +463,9 @@ pub fn create_snapshot<D: WritableBlockDevice>(
     if old_snapshot_tree_paddr != 0 {
         net_delta -= 1;
     }
+    // The +6/-2 above counts the volume omap b-tree as one block replacing one;
+    // add whatever the rebuild actually changed on top of that.
+    net_delta += vol_tree_node_delta;
     let cur_fs_alloc = u64_from_le(&new_vsb, VSBI_FS_ALLOC_COUNT) as i64;
     let new_fs_alloc = (cur_fs_alloc + net_delta).max(0) as u64;
     write_u64_le(&mut new_vsb, VSBI_FS_ALLOC_COUNT, new_fs_alloc);
@@ -516,6 +526,12 @@ fn read_snap_metadata_oids<D: WritableBlockDevice>(
     let bsz = txn.nx.block_size as usize;
     let mut buf = vec![0u8; bsz];
     txn.read_block(snap_meta_tree_paddr, &mut buf).ok()?;
+    // This reads the tree as one leaf; a root at any other level holds
+    // child pointers where the records are expected, and the guarded reader
+    // that follows refuses it with its reason.
+    if u32_from_le(&buf, 32) >> 16 != 0 {
+        return None;
+    }
 
     let toc_len = (u32_from_le(&buf, 40) >> 16) as usize;
     let nkeys = u32_from_le(&buf, 36) as usize;
@@ -594,6 +610,43 @@ struct SnapEntry {
     inum: u64,
     /// Snapshot name INCLUDING the trailing NUL byte (on-disk form).
     name: Vec<u8>,
+}
+
+/// Longest snapshot name in bytes, the trailing NUL not counted.
+/// [linux-apfs-rw apfs_raw.h: 255; the name is a NUL-terminated string whose
+/// stored length counts the NUL, apfsprogs snapshot.c "wrong name length"]
+const SNAP_MAX_NAME_LEN: usize = 255;
+
+/// Refuse a name the snapshot tree cannot carry: empty, longer than
+/// [`SNAP_MAX_NAME_LEN`] bytes, holding a NUL (the stored length would then
+/// disagree with the string), or already taken by another snapshot (two
+/// SNAP_NAME records with one key break the tree's ordering).
+fn check_snapshot_name(name: &str, existing: &[SnapEntry]) -> Result<(), TxnError> {
+    if name.is_empty() {
+        return Err(TxnError::InvalidArgument(
+            "a snapshot name cannot be empty".to_string(),
+        ));
+    }
+    if name.len() > SNAP_MAX_NAME_LEN {
+        return Err(TxnError::InvalidArgument(format!(
+            "a snapshot name is at most {SNAP_MAX_NAME_LEN} bytes; {} were given",
+            name.len()
+        )));
+    }
+    if name.as_bytes().contains(&0) {
+        return Err(TxnError::InvalidArgument(
+            "a snapshot name cannot contain a NUL byte".to_string(),
+        ));
+    }
+    let taken = existing
+        .iter()
+        .any(|e| e.name.strip_suffix(&[0u8]).unwrap_or(&e.name) == name.as_bytes());
+    if taken {
+        return Err(TxnError::AlreadyExists(format!(
+            "a snapshot named {name:?} already exists"
+        )));
+    }
+    Ok(())
 }
 
 /// Parse every SNAP_METADATA record from a single-node snap_meta tree into a
@@ -676,6 +729,45 @@ fn read_all_snap_entries<D: WritableBlockDevice>(
     Ok(out)
 }
 
+/// One snapshot as [`list_snapshots`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotInfo {
+    /// Transaction the snapshot froze: the id [`delete_snapshot`] and
+    /// [`revert_to_snapshot`] take.
+    pub xid: u64,
+    /// Snapshot name, without the trailing NUL.
+    pub name: String,
+    /// Creation time, nanoseconds since 1970-01-01 UTC.
+    pub create_time: u64,
+}
+
+/// Every snapshot of the volume, oldest first. `vsb_raw` and `omap_raw` are
+/// the volume superblock and volume omap header as read from the device; a
+/// copy this transaction has already staged takes their place.
+pub fn list_snapshots<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    vsb_raw: &[u8],
+    omap_raw: &[u8],
+) -> Result<Vec<SnapshotInfo>, TxnError> {
+    let (vsb_now, _) = txn.current_volume(vsb_raw, omap_raw)?;
+    let snap_meta_paddr = u64_from_le(&vsb_now, VSBI_SNAP_META_TREE_OID);
+    if snap_meta_paddr == 0 {
+        return Ok(Vec::new());
+    }
+    let entries = read_all_snap_entries(txn, snap_meta_paddr)?;
+    Ok(entries
+        .into_iter()
+        .map(|e| {
+            let name = e.name.strip_suffix(&[0u8]).unwrap_or(&e.name);
+            SnapshotInfo {
+                xid: e.xid,
+                name: String::from_utf8_lossy(name).into_owned(),
+                create_time: e.create_time,
+            }
+        })
+        .collect())
+}
+
 /// Encode the `apfs_snap_metadata_val` body for one entry (see
 /// `build_snap_meta_node` for field provenance).
 fn encode_snap_metadata_val(e: &SnapEntry) -> Vec<u8> {
@@ -734,9 +826,10 @@ fn build_snap_meta_node_multi(
     }
 
     let nkeys = recs.len();
-    // Pre-reserve table space: kernel keeps a minimum of 64 bytes (8 kvloc
-    // slots) even for a 2-record node ( empirical); grow to fit nkeys.
-    let toc_len = core::cmp::max(64usize, nkeys * 8);
+    // Table space in whole steps of 8 kvloc slots (64 bytes), at least one
+    // even for a 2-record node (empirical): macOS grows a table by such
+    // steps and counts on it when it rebalances a node.
+    let toc_len = nkeys.max(1).div_ceil(8) * 64;
     let key_area_start = DATA_BASE + toc_len;
 
     // Total key / value bytes (keys grow forward, values backward from end).
@@ -813,9 +906,6 @@ fn build_snap_meta_node_multi(
     Ok(buf)
 }
 
-/// Build a single-node om_snapshot tree (fixed-kv) holding one
-/// `omap_snapshot_t` per xid in `xids`, sorted ascending. Generalizes
-/// `build_omap_snapshot_tree_single`.
 fn build_omap_snapshot_tree(
     xids: &[u64],
     paddr: u64,
@@ -890,6 +980,9 @@ pub fn delete_snapshot<D: WritableBlockDevice>(
     omap_raw: &[u8],
     snap_xid: u64,
 ) -> Result<(), TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, omap_raw)?;
+    let (vsb_raw, omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
+    crate::file::ensure_volume_mutable(vsb_raw)?;
     let bsz = txn.nx.block_size as usize;
     let del_xid = txn.xid;
     let now_ns = apple_epoch_now_ns();
@@ -920,6 +1013,8 @@ pub fn delete_snapshot<D: WritableBlockDevice>(
     // (frozen VSB paddr) AND the extentref_tree_oid (snapshot's pinned extref).
     // The frozen VSB itself has apfs_extentref_tree_oid = 0; the OID lives in
     // the snap metadata record. Read both in one pass.
+    // A snapshot that is not there is not deleted: going on would rewrite
+    // the trees and drain the free queue up to an xid nothing was pinned at.
     let (frozen_vsb_paddr, snapshot_extref_paddr): (Option<u64>, Option<u64>) =
         if snap_meta_paddr != 0 {
             match read_snap_metadata_oids(txn, snap_meta_paddr, snap_xid) {
@@ -927,42 +1022,99 @@ pub fn delete_snapshot<D: WritableBlockDevice>(
                     if sb != 0 { Some(sb) } else { None },
                     if er != 0 { Some(er) } else { None },
                 ),
-                None => (None, None),
+                None => return Err(TxnError::SnapshotNotFound(snap_xid)),
             }
         } else {
-            (None, None)
+            return Err(TxnError::SnapshotNotFound(snap_xid));
         };
 
     // #139: retain SURVIVING snapshots. Rebuild both trees WITHOUT the deleted
     // entry rather than clearing the whole tree (which only matched the old
     // single-snapshot model and left count/tree inconsistent once create began
     // retaining N snapshots).
-    let remaining: Vec<SnapEntry> = if snap_meta_paddr != 0 {
+    let all_snaps: Vec<SnapEntry> = if snap_meta_paddr != 0 {
         read_all_snap_entries(txn, snap_meta_paddr)?
-            .into_iter()
-            .filter(|e| e.xid != snap_xid)
-            .collect()
     } else {
         Vec::new()
     };
+    // Oldest snapshot the volume still holds. A free-queue entry stamped older
+    // than this predates every snapshot on the volume, so its blocks were left
+    // by the formatter rather than handed over by our copy-on-write path, and
+    // they were never part of apfs_fs_alloc_count.
+    let oldest_snap_xid = all_snaps
+        .iter()
+        .map(|e| e.xid)
+        .min()
+        .unwrap_or(snap_xid)
+        .min(snap_xid);
+    let mut remaining: Vec<SnapEntry> = all_snaps
+        .into_iter()
+        .filter(|e| e.xid != snap_xid)
+        .collect();
     let remaining_count = remaining.len() as u32;
     let remaining_most_recent = remaining.iter().map(|e| e.xid).max().unwrap_or(0);
+
+    // The dying snapshot's extentref records are the only thing covering the
+    // extents its view holds, and every block of its tree has to be released,
+    // not just the root: once the tree is multi-node, freeing the root alone
+    // strands the rest (fsck: "overallocation detected").
+    let mut src_recs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut snapshot_extref_nodes: Vec<u64> = Vec::new();
+    if let Some(src_root) = snapshot_extref_paddr {
+        let (recs, nodes) = crate::file::collect_extref_records(txn, src_root, bsz)?;
+        src_recs = recs;
+        snapshot_extref_nodes = nodes;
+    }
+    // When a NEWER snapshot survives, its view is the one that still needs
+    // those records, so they go to its tree rather than to the live volume.
+    // Done here, before the snapshot metadata is rebuilt below, so the record
+    // that node writes for the survivor already names its new tree.
+    let mut survivor_merge_delta: i64 = 0;
+    let mut survivor_merge_freed: u64 = 0;
+    let handed_to_survivor = !src_recs.is_empty() && remaining_most_recent > snap_xid;
+    if handed_to_survivor {
+        let target = remaining
+            .iter_mut()
+            .filter(|e| e.xid > snap_xid)
+            .min_by_key(|e| e.xid)
+            .ok_or_else(|| {
+                TxnError::SpacemanParse("no newer snapshot to hand extent references to".into())
+            })?;
+        if target.extentref_tree_oid == 0 {
+            return Err(TxnError::Unsupported(format!(
+                "snapshot xid {:#x} has no extentref tree to receive the references \
+                 held by xid {snap_xid:#x}",
+                target.xid
+            )));
+        }
+        let (new_root, node_delta, freed) =
+            merge_extref_records_into(txn, target.extentref_tree_oid, &src_recs, del_xid, bsz)?;
+        target.extentref_tree_oid = new_root;
+        survivor_merge_delta = node_delta;
+        survivor_merge_freed = freed;
+    }
     let del_bt_flags = if snap_meta_paddr != 0 {
         read_btn_info_flags(txn, snap_meta_paddr).unwrap_or(DEFAULT_SNAP_META_BT_FLAGS)
     } else {
         DEFAULT_SNAP_META_BT_FLAGS
     };
-    let (new_snap_meta_paddr, new_snapshot_tree_paddr) = if remaining.is_empty() {
-        (0u64, 0u64)
+    // The snapshot-metadata tree is always there, even with nothing in it: a
+    // macOS-formatted volume that has never been snapshotted still points at a
+    // real empty tree, and zero is not what "no snapshots" looks like. The
+    // om_snapshot tree is the other way round - a kernel-formatted volume with
+    // no snapshots has om_snapshot_tree_oid = 0.
+    let sm_paddr = txn.alloc_block()?;
+    let sm = build_snap_meta_node_multi(&remaining, sm_paddr, del_xid, bsz, del_bt_flags)?;
+    txn.stage_raw(sm_paddr, sm);
+    let new_snap_meta_paddr = sm_paddr;
+    let new_snapshot_tree_paddr = if remaining.is_empty() {
+        0u64
     } else {
-        let sm_paddr = txn.alloc_block()?;
-        let sm = build_snap_meta_node_multi(&remaining, sm_paddr, del_xid, bsz, del_bt_flags)?;
-        txn.stage_raw(sm_paddr, sm);
         let st_paddr = txn.alloc_block()?;
         let xids: Vec<u64> = remaining.iter().map(|e| e.xid).collect();
         let st = build_omap_snapshot_tree(&xids, st_paddr, del_xid, bsz)?;
         txn.stage_raw(st_paddr, st);
-        (sm_paddr, st_paddr)
+        st_paddr
     };
 
     // --- (c) Decrement apfs_num_snapshots ---
@@ -1005,11 +1157,33 @@ pub fn delete_snapshot<D: WritableBlockDevice>(
         // old side). Symmetric to old_vol_tree_paddr / old_vomap_paddr.
         txn.free_block(old_extref_paddr)?;
     }
+
+    // --- Hand the dying snapshot's extent references back to the live tree. ---
+    // create_snapshot gives the live volume a NEW EMPTY extentref tree and
+    // leaves the populated one pinned by the snapshot. Those records are the
+    // only thing covering extents that are still live, so releasing that tree
+    // without merging leaves every such extent unreferenced: fsck reports the
+    // blocks as overallocated and the volume's block accounting drifts.
+    let mut merged_node_delta: i64 = survivor_merge_delta;
+    // Data blocks the merge released: extents the snapshot alone was keeping,
+    // whose files were replaced or removed under it. They counted as reachable
+    // while pinned and stop counting now.
+    let mut merged_freed_blocks: u64 = survivor_merge_freed;
+    if !src_recs.is_empty() && !handed_to_survivor {
+        let live_root = u64_from_le(&new_vsb, VSBI_EXTENTREF_TREE_OID);
+        let (new_live_root, node_delta, freed) =
+            merge_extref_records_into(txn, live_root, &src_recs, del_xid, bsz)?;
+        write_u64_le(&mut new_vsb, VSBI_EXTENTREF_TREE_OID, new_live_root);
+        merged_node_delta += node_delta;
+        merged_freed_blocks += freed;
+    }
     // NOTE: apfs_omap_oid will be patched after COW'ing the volume omap below.
 
     // --- (d) Update volume omap (PHYSICAL object, COW to new block) ---
     // [CERTAIN: COW required - in-place overwrite invalidates previous checkpoint;
     //  same as create_snapshot; the APFS specification]
+    // How many blocks the object map gained or lost in the rebuild.
+    let vol_tree_node_delta: i64;
     {
         let mut new_omap = omap_raw.to_vec();
         if new_omap.len() < bsz {
@@ -1024,13 +1198,84 @@ pub fn delete_snapshot<D: WritableBlockDevice>(
         // time), so the old vol-tree block has no remaining referrer once
         // the new omap header is staged.
         let old_vol_tree_paddr = u64_from_le(&new_omap, 48);
-        let new_vol_tree_paddr = txn.alloc_block()?;
         let mut tree_buf = vec![0u8; bsz];
         txn.read_block(old_vol_tree_paddr, &mut tree_buf)?;
-        write_u64_le(&mut tree_buf, 8, new_vol_tree_paddr);
-        write_u64_le(&mut tree_buf, 16, del_xid);
-        update_checksum_in_place(&mut tree_buf);
-        txn.stage_raw(new_vol_tree_paddr, tree_buf);
+        let new_vol_tree_paddr = {
+            // The map holds a mapping per version of each object. A view - the
+            // volume, or a snapshot - resolves an oid to its newest version not
+            // past the view's xid, so a version is reachable only while some
+            // view falls between it and the next one. With the snapshot gone
+            // the map is rebuilt without the versions no view resolves any
+            // more and their blocks released: an older version no remaining
+            // snapshot falls on, and an oid's newest version that the volume's
+            // catalog no longer names and no remaining snapshot reaches.
+            // fsck: "Remove orphan/invalid omap mapping objects?" with the last
+            // snapshot; apfsck: "oid-xid combination is never used" with any.
+            let (triples, old_nodes) =
+                crate::file::collect_omap_tree(txn, &tree_buf, old_vol_tree_paddr, bsz)?;
+            let mut versions: std::collections::HashMap<u64, Vec<u64>> =
+                std::collections::HashMap::new();
+            for &OmapRec { oid, xid, .. } in &triples {
+                versions.entry(oid).or_default().push(xid);
+            }
+            for xids in versions.values_mut() {
+                xids.sort_unstable();
+            }
+            // Which catalog nodes the volume still names. A mapping for an oid
+            // absent from this set was kept for a snapshot's view of the
+            // catalog and describes a node the live tree replaced.
+            let live_root_oid = u64_from_le(&new_vsb, VSBI_ROOT_TREE_OID);
+            let mut reachable = std::collections::HashSet::new();
+            crate::file::collect_fstree_oids(
+                txn,
+                &tree_buf,
+                live_root_oid,
+                bsz,
+                &mut reachable,
+                0,
+            )?;
+            let remaining_xids: Vec<u64> = remaining.iter().map(|e| e.xid).collect();
+            // A remaining snapshot resolves the version at `xid` when it lies at
+            // or past it and before the next version, if there is one.
+            let resolved_by_remaining = |xid: u64, next: Option<u64>| {
+                remaining_xids
+                    .iter()
+                    .any(|&r| r >= xid && next.is_none_or(|n| r < n))
+            };
+            let (kept, superseded): (Vec<OmapTriple>, Vec<OmapTriple>) =
+                triples.into_iter().partition(|&OmapRec { oid, xid, .. }| {
+                    let next = versions
+                        .get(&oid)
+                        .and_then(|xids| xids.iter().find(|&&x| x > xid).copied());
+                    if resolved_by_remaining(xid, next) {
+                        return true;
+                    }
+                    let Some(_) = next else {
+                        // The newest version: the volume's, if its catalog names
+                        // the object. Only a mapping the deleted snapshot itself
+                        // pinned may be dropped for being unreachable; anything
+                        // newer going missing from the catalog would be a
+                        // different fault, and guessing at it here would take
+                        // the volume with it.
+                        return reachable.contains(&oid) || xid > snap_xid;
+                    };
+                    false
+                });
+            let (root, new_nodes) =
+                crate::file::build_omap_tree(txn, &tree_buf, &kept, del_xid, bsz)?;
+            let mut released = 0i64;
+            for r in &superseded {
+                if r.paddr != 0 && !kept.iter().any(|k| k.paddr == r.paddr) {
+                    txn.free_block(r.paddr)?;
+                    released += 1;
+                }
+            }
+            vol_tree_node_delta = new_nodes as i64 - old_nodes.len() as i64 - released;
+            for p in &old_nodes {
+                txn.free_block(*p)?;
+            }
+            root
+        };
         let new_vomap_paddr = txn.alloc_block()?;
         write_u64_le(&mut new_omap, 8, new_vomap_paddr); // o_oid = paddr
         write_u64_le(&mut new_omap, 16, del_xid); // o_xid
@@ -1054,9 +1299,6 @@ pub fn delete_snapshot<D: WritableBlockDevice>(
         txn.stage_raw(new_vomap_paddr, new_omap);
         // Update the live VSB's apfs_omap_oid to point to the new volume omap block.
         write_u64_le(&mut new_vsb, VSBI_OMAP_OID, new_vomap_paddr);
-        // M7b-RT Subtask A: free the OLD vol-tree block now that new_omap is
-        // staged (its om_tree_oid = new_vol_tree_paddr, NOT the old).
-        txn.free_block(old_vol_tree_paddr)?;
     }
 
     // M7b-RT Subtask A: fs_alloc_count net delta for snapshot deletion.
@@ -1066,18 +1308,19 @@ pub fn delete_snapshot<D: WritableBlockDevice>(
     //   om_snapshot_tree, snapshot's pinned extentref tree (EXT0).
     let mut net_delta: i64 = 0;
     let old_snapshot_tree_paddr = u64_from_le(omap_raw, OMAP_SNAPSHOT_TREE_OID_OFF);
-    if frozen_vsb_paddr.is_some() {
-        net_delta -= 1;
-    }
+    // The frozen VSB is the snapshot's OWN superblock and create_snapshot
+    // deliberately keeps it out of the live volume's fs_alloc_count, so
+    // releasing it here must not decrement that count either.
     if snap_meta_paddr != 0 {
         net_delta -= 1;
     }
     if old_snapshot_tree_paddr != 0 {
         net_delta -= 1;
     }
-    if snapshot_extref_paddr.is_some() {
-        net_delta -= 1;
-    }
+    // The whole pinned extentref tree leaves the volume, so every one of its
+    // nodes counts against fs_alloc_count - a root-only decrement leaves the
+    // field high by the number of stranded nodes.
+    net_delta -= snapshot_extref_nodes.len() as i64;
     // #139: when snapshots survive we ALSO allocate rebuilt snap_meta +
     // om_snapshot trees (COW pairs with the old ones freed above).
     if new_snap_meta_paddr != 0 {
@@ -1086,6 +1329,47 @@ pub fn delete_snapshot<D: WritableBlockDevice>(
     if new_snapshot_tree_paddr != 0 {
         net_delta += 1;
     }
+    // M9 #7: safe sm_fq drain - drain only when this is the LAST snapshot.
+    //
+    // Each sm_fq entry is stamped with "newest snap xid at COW time", so
+    // entries with xid <= deleted_snap_xid were created while the deleted
+    // snap was the newest one. With ONLY the deleted snap to consider,
+    // those blocks have no surviving referrer and are safe to free.
+    //
+    // When other snapshots survive after the delete, some of those entries
+    // may still be referenced by older or newer frozen extref trees (the
+    // out-of-order-delete safety hole). Detecting which blocks are still
+    // referenced requires reading every surviving snapshot's frozen extref
+    // tree - expensive and not required for the dominant Windows
+    // single-snapshot workflow. We conservatively SKIP the drain in that
+    // case; the entries accumulate in sm_fq until a future delete drains
+    // them down to empty. Apple's kernel reaper takes the same conservative
+    // path on a multi-snap workflow.
+    //
+    // [Apple cross-check: apfs_snap_vnop_remove → move_snapshot_to_purgatory
+    //  → apfs_cleanup_purgatory_continuation handles per-block survivor
+    //  check; ours defers to the final-snap-delete path.]
+    //
+    // The drain runs BEFORE the superblock is staged: the blocks it reclaims
+    // leave the volume, so fs_alloc_count has to account for them. Draining
+    // afterwards and discarding the count left the field permanently high.
+    let _ = old_num_snaps;
+    if remaining_count == 0 {
+        // Reclaiming a queued block is the moment it stops being reachable, so
+        // this is where it leaves fs_alloc_count. Only the entries this volume
+        // enqueued count: the formatter's stale run was never part of the
+        // figure, and subtracting it too left the field low by its length.
+        let drained = txn.drain_sm_fq_main(snap_xid, oldest_snap_xid)?;
+        net_delta -= drained.owned_blocks as i64;
+    }
+
+    // Nodes the extent-reference merge added to (or removed from) the live tree.
+    net_delta += merged_node_delta;
+    net_delta -= merged_freed_blocks as i64;
+    // Whatever the object-map rebuild changed, on top of the 1:1 COW pair the
+    // tally above assumes.
+    net_delta += vol_tree_node_delta;
+
     let cur_fs_alloc = u64_from_le(&new_vsb, VSBI_FS_ALLOC_COUNT) as i64;
     let new_fs_alloc = (cur_fs_alloc + net_delta).max(0) as u64;
     write_u64_le(&mut new_vsb, VSBI_FS_ALLOC_COUNT, new_fs_alloc);
@@ -1128,34 +1412,11 @@ pub fn delete_snapshot<D: WritableBlockDevice>(
     }
     // M7b-RT Subtask A: free the snapshot's pinned extentref tree (EXT0).
     // The snapshot's frozen VSB owned it; with the frozen VSB now freed,
-    // EXT0 has no remaining referrer.
-    if let Some(p) = snapshot_extref_paddr {
-        txn.free_block(p)?;
-    }
-
-    // M9 #7: safe sm_fq drain - drain only when this is the LAST snapshot.
-    //
-    // Each sm_fq entry is stamped with "newest snap xid at COW time", so
-    // entries with xid <= deleted_snap_xid were created while the deleted
-    // snap was the newest one. With ONLY the deleted snap to consider,
-    // those blocks have no surviving referrer and are safe to free.
-    //
-    // When other snapshots survive after the delete, some of those entries
-    // may still be referenced by older or newer frozen extref trees (the
-    // out-of-order-delete safety hole). Detecting which blocks are still
-    // referenced requires reading every surviving snapshot's frozen extref
-    // tree - expensive and not required for the dominant Windows
-    // single-snapshot workflow. We conservatively SKIP the drain in that
-    // case; the entries accumulate in sm_fq until a future delete drains
-    // them down to empty. Apple's kernel reaper takes the same conservative
-    // path on a multi-snap workflow.
-    //
-    // [Apple cross-check: apfs_snap_vnop_remove → move_snapshot_to_purgatory
-    //  → apfs_cleanup_purgatory_continuation handles per-block survivor
-    //  check; ours defers to the final-snap-delete path.]
-    let _ = old_num_snaps;
-    if remaining_count == 0 {
-        let _ = txn.drain_sm_fq_main(snap_xid)?;
+    // EXT0 has no remaining referrer. Its records were merged into the live
+    // tree above, which was rebuilt into freshly allocated nodes, so no block
+    // listed here is reachable from the post-delete volume.
+    for p in &snapshot_extref_nodes {
+        txn.free_block(*p)?;
     }
 
     Ok(())
@@ -1164,6 +1425,185 @@ pub fn delete_snapshot<D: WritableBlockDevice>(
 // ---------------------------------------------------------------------------
 // revert_to_snapshot
 // ---------------------------------------------------------------------------
+
+/// Fold a snapshot's extent-reference record into the live one for the same
+/// physical extent.
+///
+/// A KIND_NEW record states an absolute reference count; a KIND_UPDATE record
+/// states a signed delta against the count its snapshot holds. Merging the two
+/// therefore means applying the live delta to the snapshot's count, or summing
+/// two counts when both are absolute. The block count and owner are taken from
+/// whichever record is authoritative (the KIND_NEW one).
+fn merge_phys_ext_records(snap_val: &[u8], live_val: &[u8]) -> Vec<u8> {
+    use crate::file::{
+        build_phys_ext_update_val, build_phys_ext_val, phys_ext_kind, phys_ext_refcnt,
+        phys_ext_update_delta, APFS_KIND_UPDATE,
+    };
+    let block_count = u64_from_le(snap_val, 0) & 0x0FFF_FFFF_FFFF_FFFF;
+    let snap_is_update = phys_ext_kind(snap_val) == APFS_KIND_UPDATE;
+    let live_is_update = phys_ext_kind(live_val) == APFS_KIND_UPDATE;
+    match (snap_is_update, live_is_update) {
+        // Both absolute: the extent is referenced by both sides.
+        (false, false) => {
+            let owner = u64_from_le(snap_val, 8);
+            let total = phys_ext_refcnt(snap_val).saturating_add(phys_ext_refcnt(live_val));
+            build_phys_ext_val(block_count, owner, total)
+        }
+        // The snapshot owns the count; the live side only recorded a delta.
+        (false, true) => {
+            let owner = u64_from_le(snap_val, 8);
+            let base = phys_ext_refcnt(snap_val) as i64 + phys_ext_update_delta(live_val) as i64;
+            build_phys_ext_val(block_count, owner, base.max(0) as u32)
+        }
+        // The live side owns the count; the snapshot only recorded a delta.
+        (true, false) => {
+            let owner = u64_from_le(live_val, 8);
+            let base = phys_ext_refcnt(live_val) as i64 + phys_ext_update_delta(snap_val) as i64;
+            let block_count = u64_from_le(live_val, 0) & 0x0FFF_FFFF_FFFF_FFFF;
+            build_phys_ext_val(block_count, owner, base.max(0) as u32)
+        }
+        // Neither owns a count: the deltas add up and stay a delta.
+        (true, true) => build_phys_ext_update_val(
+            block_count,
+            phys_ext_update_delta(snap_val).saturating_add(phys_ext_update_delta(live_val)),
+        ),
+    }
+}
+
+/// Fold `src_recs` into the extentref tree at `dst_root`, rebuild it, and
+/// release the nodes the old tree occupied.
+///
+/// Returns the new root, how many blocks the tree gained or lost, and how many
+/// data blocks were released. A record the destination already carries is
+/// combined rather than replaced: an UPDATE on either side is a signed delta
+/// against the other's count, so applying it yields the count that survives.
+/// A count that reaches zero is an extent nothing references any more - the
+/// file was replaced or removed while the snapshot pinned its blocks - so the
+/// record goes and the blocks are released, instead of a record claiming zero
+/// references over blocks that stay allocated.
+///
+/// The two sides need not cut their extents at the same blocks: a write into
+/// the middle of a file under a snapshot leaves the live tree a one-block
+/// UPDATE inside the snapshot's longer record. Records are therefore split
+/// wherever either side starts or ends one, and each piece is combined on
+/// its own.
+fn merge_extref_records_into<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    dst_root: u64,
+    src_recs: &[(Vec<u8>, Vec<u8>)],
+    new_xid: u64,
+    bsz: usize,
+) -> Result<(u64, i64, u64), TxnError> {
+    use crate::file::{
+        build_phys_ext_key, phys_ext_kind, phys_ext_refcnt, phys_ext_update_delta,
+        phys_ext_with_blocks, APFS_KIND_UPDATE,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+    const LEN_MASK: u64 = 0x0FFF_FFFF_FFFF_FFFF;
+    // start block -> (block count, key, value)
+    type ByStart = BTreeMap<u64, (u64, Vec<u8>, Vec<u8>)>;
+    let by_start = |recs: &[(Vec<u8>, Vec<u8>)]| -> ByStart {
+        recs.iter()
+            .map(|(k, v)| {
+                let start = u64_from_le(k, 0) & LEN_MASK;
+                (start, (u64_from_le(v, 0) & LEN_MASK, k.clone(), v.clone()))
+            })
+            .collect()
+    };
+    let covering = |m: &ByStart, at: u64| -> Option<(u64, Vec<u8>)> {
+        m.range(..=at)
+            .next_back()
+            .filter(|(s, (n, _, _))| s.saturating_add(*n) > at)
+            .map(|(s, (_, _, v))| (*s, v.clone()))
+    };
+    let (dst_recs, _) = crate::file::collect_extref_records(txn, dst_root, bsz)?;
+    let src = by_start(src_recs);
+    let dst = by_start(&dst_recs);
+
+    let mut cuts: BTreeSet<u64> = BTreeSet::new();
+    for (s, (n, _, _)) in src.iter().chain(dst.iter()) {
+        cuts.insert(*s);
+        cuts.insert(s.saturating_add(*n));
+    }
+    let cuts: Vec<u64> = cuts.into_iter().collect();
+    // (start, blocks, value, the src and dst records it lies in). Neighbouring
+    // pieces of the same pair of records join back into one.
+    type Piece = (u64, u64, Vec<u8>, (Option<u64>, Option<u64>));
+    let mut pieces: Vec<Piece> = Vec::new();
+    for w in cuts.windows(2) {
+        let &[a, b] = w else { continue };
+        let (val, from) = match (covering(&src, a), covering(&dst, a)) {
+            (None, None) => continue,
+            (Some((s, sv)), None) => (sv, (Some(s), None)),
+            (None, Some((d, dv))) => (dv, (None, Some(d))),
+            (Some((s, sv)), Some((d, dv))) => {
+                (merge_phys_ext_records(&sv, &dv), (Some(s), Some(d)))
+            }
+        };
+        match pieces.last_mut() {
+            Some((ps, pn, pv, pfrom))
+                if *pfrom == from
+                    && ps.saturating_add(*pn) == a
+                    && phys_ext_with_blocks(pv, 0) == phys_ext_with_blocks(&val, 0) =>
+            {
+                *pn += b - a;
+            }
+            _ => pieces.push((a, b - a, val, from)),
+        }
+    }
+
+    let mut merged: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let mut freed_blocks: u64 = 0;
+    for (start, count, val, _) in pieces {
+        let val = phys_ext_with_blocks(&val, count);
+        if phys_ext_kind(&val) == APFS_KIND_UPDATE {
+            // A delta the two sides cancel out records nothing.
+            if phys_ext_update_delta(&val) != 0 {
+                merged.insert(start, val);
+            }
+        } else if phys_ext_refcnt(&val) == 0 {
+            if count > txn.nx.block_count {
+                return Err(TxnError::SpacemanParse(format!(
+                    "extent at {start} claims {count} blocks, more than the container"
+                )));
+            }
+            for i in 0..count {
+                txn.free_block(start.saturating_add(i))?;
+            }
+            freed_blocks += count;
+        } else {
+            merged.insert(start, val);
+        }
+    }
+
+    let mut upserts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut removes: Vec<Vec<u8>> = Vec::new();
+    for (start, (_, key, val)) in &dst {
+        match merged.get(start) {
+            None => removes.push(key.clone()),
+            Some(now) if now != val => upserts.push((key.clone(), now.clone())),
+            Some(_) => {}
+        }
+    }
+    for (start, val) in &merged {
+        if !dst.contains_key(start) {
+            upserts.push((build_phys_ext_key(*start), val.clone()));
+        }
+    }
+    let (new_root, old_padrs, node_delta) = crate::file::rewrite_extref_tree(
+        txn,
+        dst_root,
+        new_xid,
+        Vec::new(),
+        &removes,
+        &upserts,
+        bsz,
+    )?;
+    for p in old_padrs {
+        txn.free_block(p)?;
+    }
+    Ok((new_root, node_delta, freed_blocks))
+}
 
 /// Roll the live volume back to a previously created snapshot.
 ///
@@ -1198,6 +1638,9 @@ pub fn revert_to_snapshot<D: WritableBlockDevice>(
     omap_raw: &[u8],
     snap_xid: u64,
 ) -> Result<(), TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, omap_raw)?;
+    let (vsb_raw, omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
+    crate::file::ensure_volume_mutable(vsb_raw)?;
     let bsz = txn.nx.block_size as usize;
     let revert_xid = txn.xid;
     let now_ns = apple_epoch_now_ns();
@@ -1237,17 +1680,21 @@ pub fn revert_to_snapshot<D: WritableBlockDevice>(
     let remaining_count = remaining.len() as u32;
     let remaining_most_recent = remaining.iter().map(|e| e.xid).max().unwrap_or(0);
     let bt_flags = read_btn_info_flags(txn, snap_meta_paddr).unwrap_or(DEFAULT_SNAP_META_BT_FLAGS);
-    let (new_snap_meta_paddr, new_snapshot_tree_paddr) = if remaining.is_empty() {
-        (0u64, 0u64)
+    // As in delete_snapshot: the snapshot-metadata tree stays, empty, because
+    // that is the shape a volume with no snapshots has on a macOS-formatted
+    // disk. The om_snapshot tree goes to zero, which is that shape too.
+    let sm_paddr = txn.alloc_block()?;
+    let sm = build_snap_meta_node_multi(&remaining, sm_paddr, revert_xid, bsz, bt_flags)?;
+    txn.stage_raw(sm_paddr, sm);
+    let new_snap_meta_paddr = sm_paddr;
+    let new_snapshot_tree_paddr = if remaining.is_empty() {
+        0u64
     } else {
-        let sm_paddr = txn.alloc_block()?;
-        let sm = build_snap_meta_node_multi(&remaining, sm_paddr, revert_xid, bsz, bt_flags)?;
-        txn.stage_raw(sm_paddr, sm);
         let st_paddr = txn.alloc_block()?;
         let xids: Vec<u64> = remaining.iter().map(|e| e.xid).collect();
         let st = build_omap_snapshot_tree(&xids, st_paddr, revert_xid, bsz)?;
         txn.stage_raw(st_paddr, st);
-        (sm_paddr, st_paddr)
+        st_paddr
     };
 
     // --- Read frozen VSB to extract snapshot's tree OIDs ---
@@ -1276,7 +1723,6 @@ pub fn revert_to_snapshot<D: WritableBlockDevice>(
     // omap-header's most_recent_snap to 0, relying on the snap_xid entry
     // being the highest xid visible for root_tree_oid after the live_xid
     // entry is removed via COW.)
-    let root_tree_oid = u64_from_le(vsb_raw, 0x88); // VSBI_ROOT_TREE_OID
 
     // --- Build updated live VSB ---
     let vsb_oid = u64_from_le(vsb_raw, 8);
@@ -1285,6 +1731,22 @@ pub fn revert_to_snapshot<D: WritableBlockDevice>(
         new_vsb.resize(bsz, 0);
     } else {
         new_vsb.truncate(bsz);
+    }
+
+    // The reverted state IS the snapshot's state, so the object counts are the
+    // ones the snapshot froze - carrying the live ones forward left them
+    // counting files the revert just removed ("apfs_num_files is not valid").
+    // num_snapshots is deliberately not among them: it describes the volume
+    // after the delete, and is written from the surviving set below.
+    if frozen_vsb_paddr != 0 {
+        for off in [
+            VSBI_NUM_FILES,
+            VSBI_NUM_DIRECTORIES,
+            VSBI_NUM_SYMLINKS,
+            VSBI_NUM_OTHER_FSOBJECTS,
+        ] {
+            write_u64_le(&mut new_vsb, off, u64_from_le(&frozen_buf, off));
+        }
     }
 
     // Restore extentref tree to the snapshot's pinned extref.
@@ -1299,9 +1761,39 @@ pub fn revert_to_snapshot<D: WritableBlockDevice>(
         update_checksum_in_place(&mut eb);
         txn.stage_raw(new_extref_paddr, eb);
         write_u64_le(&mut new_vsb, VSBI_EXTENTREF_TREE_OID, new_extref_paddr);
-        // Free the old live extentref tree (orphaned).
+        // Free the old live extentref tree (orphaned) - every node of it, not
+        // just the root, which past a single node would strand the rest.
+        // The new live root is a root-only copy of the snapshot's root, so it
+        // still points at the snapshot tree's children by physical address;
+        // those blocks stay referenced and must be kept out of the free list.
         if old_live_extref_paddr != 0 && old_live_extref_paddr != snap_extref_oid {
-            txn.free_block(old_live_extref_paddr)?;
+            let (snap_recs, snap_nodes) =
+                crate::file::collect_extref_records(txn, snap_extref_oid, bsz)?;
+            let (live_recs, live_nodes) =
+                crate::file::collect_extref_records(txn, old_live_extref_paddr, bsz)?;
+            // An extent the live tree records and the snapshot's does not came
+            // into being after the snapshot was taken. Nothing in the reverted
+            // state can reach it, so leaving it allocated leaks it for good.
+            // Only absolute records are acted on: a delta record describes an
+            // extent that already existed, which the snapshot still holds.
+            for (k, v) in &live_recs {
+                if crate::file::phys_ext_kind(v) != crate::file::APFS_KIND_NEW {
+                    continue;
+                }
+                if snap_recs.iter().any(|(sk, _)| sk == k) {
+                    continue;
+                }
+                let paddr = u64_from_le(k, 0) & OBJ_ID_MASK;
+                let blocks = u64_from_le(v, 0) & PHYS_EXT_LEN_MASK;
+                for i in 0..blocks {
+                    txn.free_block(paddr.saturating_add(i))?;
+                }
+            }
+            for p in live_nodes {
+                if !snap_nodes.contains(&p) {
+                    txn.free_block(p)?;
+                }
+            }
         }
         // #139: the reverted snapshot's pinned extref tree was just COW'd to
         // become the live extref; the original block is now orphaned (the
@@ -1333,79 +1825,39 @@ pub fn revert_to_snapshot<D: WritableBlockDevice>(
         }
         let old_vol_tree_paddr = u64_from_le(&new_omap, 48);
         let old_vomap_paddr = u64_from_le(vsb_raw, VSBI_OMAP_OID);
-        let new_vol_tree_paddr = txn.alloc_block()?;
         let mut tree_buf = vec![0u8; bsz];
         txn.read_block(old_vol_tree_paddr, &mut tree_buf)?;
 
-        // COW-7: REMOVE the live_xid mapping for root_tree_oid from the volume
-        // omap b-tree (fixed-kv: key {oid,xid} 16B, val {flags,size,paddr} 16B)
-        // so the snap_xid entry becomes the highest visible xid for
-        // root_tree_oid. The previous approach zeroed ov_paddr, but
-        // Omap::resolve picks the highest xid <= query and skips ONLY
-        // OMAP_VAL_DELETED - never a paddr == 0 - so resolving root_tree_oid
-        // returned block 0 (the NX superblock) as the fsroot, making the volume
-        // unmountable after a revert. Reuse the canonical fixed-kv node builder
-        // so the rebuilt node matches the layout fsck expects (no hand-rolled
-        // TOC/key/val surgery).
+        // COW-7: drop the live_xid mapping for root_tree_oid from the volume
+        // omap so the snap_xid entry becomes the highest visible xid for it.
+        // Zeroing ov_paddr instead does not work: Omap::resolve takes the
+        // highest xid <= the query and skips only OMAP_VAL_DELETED, never a
+        // paddr of 0, so resolving root_tree_oid returned block 0 (the NX
+        // superblock) as the fsroot and the volume would not mount.
+        //
+        // The tree is walked whole and rebuilt from its mappings. Decoding only
+        // the root reads an index node as a leaf once the omap has split, which
+        // would replace the entire map with one node and orphan every leaf.
         // [linux-apfs-rw btree.c apfs_btree_remove + node.c nkeys/space recompute;
         //  docs/refs/di-tier-verification-2026-05.md]
-        //
-        // Defensive: rebuild_omap_node_without (like the rest of revert) assumes
-        // a single-node omap (root = leaf). A multi-level omap (btn_level != 0)
-        // would be mis-parsed as a flat leaf and silently corrupted, so refuse
-        // rather than risk the volume. Volumes this engine writes keep a
-        // single-node omap; a macOS volume with many snapshots could exceed it.
-        // Mirrors the incremental omap path's level guard.
-        if u16_from_le(&tree_buf, 34) != 0 {
-            return Err(TxnError::InvalidArgument(
-                "revert_to_snapshot: multi-level volume omap not supported".into(),
-            ));
-        }
-        let live_xid = revert_xid.saturating_sub(1);
-        // #139: locate the physical block backing the {root_tree_oid, live_xid}
-        // omap entry BEFORE it is dropped from the rebuilt node. That block is
-        // the post-snapshot live fsroot COW created by create_snapshot; once the
-        // entry is removed it has no referrer and must be freed, or fsck reports
-        // "overallocation". (fixed-kv omap node: key{oid,xid} 16B forward,
-        // val{flags,size,paddr} 16B backward from bsz-40.)
-        let orphan_fsroot_paddr: u64 = {
-            let nkeys = u32_from_le(&tree_buf, 36) as usize;
-            let toc_len = u16_from_le(&tree_buf, 42) as usize;
-            let key_area_start = 56 + toc_len;
-            let val_area_end = bsz - 40;
-            let mut found = 0u64;
-            for i in 0..nkeys {
-                let toc_off = 56 + i * 4;
-                let k_off = u16_from_le(&tree_buf, toc_off) as usize;
-                let v_off = u16_from_le(&tree_buf, toc_off + 2) as usize;
-                let k_abs = key_area_start + k_off;
-                if k_abs + 16 > bsz {
-                    continue;
-                }
-                let oid = u64_from_le(&tree_buf, k_abs);
-                let xid = u64_from_le(&tree_buf, k_abs + 8);
-                if oid == root_tree_oid && xid == live_xid {
-                    let v_abs = val_area_end - v_off;
-                    found = u64_from_le(&tree_buf, v_abs + 8);
-                    break;
-                }
+        let (triples, old_vol_tree_nodes) =
+            crate::file::collect_omap_tree(txn, &tree_buf, old_vol_tree_paddr, bsz)?;
+        // Every mapping stamped after the snapshot describes a version of an
+        // object that the reverted state does not contain - the fsroot copy
+        // create_snapshot made, and each catalog node a later write copied
+        // aside. Keeping them left the map pointing at objects nothing reaches
+        // ("Remove orphan/invalid omap mapping objects?"); dropping only the
+        // fsroot one was enough on a volume small enough that it was the only
+        // one. Their blocks lose their last referrer with the mapping, so they
+        // are released unless a surviving mapping names the same address.
+        let (dropped, kept): (Vec<OmapTriple>, Vec<OmapTriple>) =
+            triples.into_iter().partition(|r| r.xid > snap_xid);
+        let (new_vol_tree_paddr, _new_vol_tree_nodes) =
+            crate::file::build_omap_tree(txn, &tree_buf, &kept, revert_xid, bsz)?;
+        for r in &dropped {
+            if r.paddr != 0 && !kept.iter().any(|k| k.paddr == r.paddr) {
+                txn.free_block(r.paddr)?;
             }
-            found
-        };
-        let new_tree = crate::file::rebuild_omap_node_without(
-            &tree_buf,
-            root_tree_oid,
-            live_xid,
-            new_vol_tree_paddr,
-            revert_xid,
-            bsz,
-        );
-        txn.stage_raw(new_vol_tree_paddr, new_tree);
-        // Free the orphaned post-snapshot live fsroot block (if found). The
-        // reverted snapshot's frozen fsroot (at snap_xid) remains referenced by
-        // its surviving omap entry, so only the dropped live_xid block is freed.
-        if orphan_fsroot_paddr != 0 {
-            txn.free_block(orphan_fsroot_paddr)?;
         }
 
         let new_vomap_paddr = txn.alloc_block()?;
@@ -1431,32 +1883,48 @@ pub fn revert_to_snapshot<D: WritableBlockDevice>(
         write_u64_le(&mut new_vsb, VSBI_OMAP_OID, new_vomap_paddr);
 
         // Free orphaned physical blocks.
-        txn.free_block(old_vol_tree_paddr)?;
+        for p in &old_vol_tree_nodes {
+            txn.free_block(*p)?;
+        }
         txn.free_block(old_vomap_paddr)?;
         if old_snapshot_tree_paddr != 0 {
             txn.free_block(old_snapshot_tree_paddr)?;
         }
     }
 
-    // --- fs_alloc_count delta ---
-    // COW pairs (net 0): old vol-tree, old vomap, old live extref.
-    // True frees: frozen VSB, snap_meta node, snapshot tree (counted above).
-    // True allocs: new extref COW (+1 if snap_extref_oid != 0).
-    // Net: conservative 0 (COW pairs cancel; we don't free frozen VSB here
-    // to avoid corrupting the snapshot's historical record - conservative).
-    // We leave fs_alloc_count unchanged; fsck can correct it.
-    // [Deliberate: conservative lean-toward-overcount; no corruption risk]
+    // Free the snap_meta tree block - the new VSB no longer references it.
+    // Released before the superblock is staged so the tally below sees it; a
+    // freed block stays invisible to the allocator until commit either way, so
+    // moving the call earlier changes nothing else.
+    if snap_meta_paddr != 0 {
+        txn.free_block(snap_meta_paddr)?;
+    }
+
+    // --- fs_alloc_count ---
+    // Ask the transaction what it did rather than tallying by hand: fsck
+    // rebuilds this field by walking what the volume reaches, so what matters
+    // is exactly the blocks this revert took and released. The field used to be
+    // left alone entirely ("fsck can correct it"), which every revert reported
+    // as "apfs_fs_alloc_count is not valid". The volume superblock about to be
+    // staged is not counted - fsck excludes it by object type - and it is
+    // allocated after this point, so it stays out of the figure on its own.
+    let net_delta = txn.blocks_allocated() as i64 - txn.blocks_freed() as i64;
+    let cur_fs_alloc = u64_from_le(&new_vsb, VSBI_FS_ALLOC_COUNT) as i64;
+    write_u64_le(
+        &mut new_vsb,
+        VSBI_FS_ALLOC_COUNT,
+        (cur_fs_alloc + net_delta).max(0) as u64,
+    );
 
     // Stage the updated live VSB.
     let vsb_body: Vec<u8> = new_vsb.get(32..bsz).unwrap_or(&[]).to_vec();
     let padded_body = pad_to(vsb_body, bsz - 32);
     txn.stage_virtual(vsb_oid, OBJECT_TYPE_FS, 0, &padded_body)?;
 
-    // Free the snap_meta tree block (no longer referenced by new VSB).
-    if snap_meta_paddr != 0 {
-        txn.free_block(snap_meta_paddr)?;
-    }
-    // Free the frozen VSB (snapshot is now live; frozen copy is orphaned).
+    // The frozen VSB is the snapshot's own superblock, which create_snapshot
+    // deliberately kept out of the live volume's fs_alloc_count. Releasing it
+    // after the tally keeps it out on the way back too; counting it left the
+    // field one block low.
     if frozen_vsb_paddr != 0 {
         txn.free_block(frozen_vsb_paddr)?;
     }
@@ -1658,6 +2126,46 @@ mod tests {
             name: a.name_bytes.to_vec(),
         };
         build_snap_meta_node_multi(&[e], a.paddr, a.xid, a.bsz, a.bt_flags)
+    }
+
+    fn named(name: &[u8]) -> SnapEntry {
+        let mut stored = name.to_vec();
+        stored.push(0);
+        SnapEntry {
+            xid: 5,
+            extentref_tree_oid: 0,
+            extentref_tree_type: 0,
+            sblock_oid: 0,
+            create_time: 0,
+            change_time: 0,
+            inum: 20,
+            name: stored,
+        }
+    }
+
+    #[test]
+    fn a_snapshot_name_must_fit_the_tree() {
+        let existing = [named(b"daily")];
+        assert!(check_snapshot_name("weekly", &existing).is_ok());
+        assert!(check_snapshot_name(&"s".repeat(SNAP_MAX_NAME_LEN), &existing).is_ok());
+        assert!(matches!(
+            check_snapshot_name("", &existing),
+            Err(TxnError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            check_snapshot_name(&"s".repeat(SNAP_MAX_NAME_LEN + 1), &existing),
+            Err(TxnError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            check_snapshot_name("a\0b", &existing),
+            Err(TxnError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            check_snapshot_name("daily", &existing),
+            Err(TxnError::AlreadyExists(_))
+        ));
+        // A prefix of a taken name is another name.
+        assert!(check_snapshot_name("dail", &existing).is_ok());
     }
 
     #[test]

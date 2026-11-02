@@ -7,42 +7,9 @@
 //! Verification-first: every mutation is proven on a scratch image with
 //! fsck + mount-readback + an independent Python re-decode.
 
-/// CRC32C (Castagnoli) reflected polynomial.
-const CRC32C_POLY: u32 = 0x82F6_3B78;
-
-/// Compute one CRC32C table entry (reflected).
-const fn crc32c_byte(mut c: u32) -> u32 {
-    let mut i = 0;
-    while i < 8 {
-        c = if c & 1 != 0 {
-            (c >> 1) ^ CRC32C_POLY
-        } else {
-            c >> 1
-        };
-        i += 1;
-    }
-    c
-}
-
-/// CRC32C over a byte slice, reflected, init 0xFFFFFFFF, NO final xor.
-fn crc32c(buf: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in buf {
-        let idx = ((crc ^ b as u32) & 0xFF) as u8;
-        crc = (crc >> 8) ^ crc32c_byte(idx as u32);
-    }
-    crc
-}
-
-/// APFS directory-entry name hash (low 22 bits).
-///
-/// [the APFS spec LOCKED, empirical: matched baseline scratch values
-///  private-dir=0x2b29a3, root=0x2d9c79]
-///
-/// Algorithm: CRC32C (init 0xFFFFFFFF, no final xor) over the UTF-32-LE
-/// encoding of the case-folded name (lowercase on case-insensitive volumes),
-/// take the low 22 bits. The name is NOT NUL-terminated for hashing.
-/// Compute the APFS directory-entry name hash.
+/// APFS directory-entry name hash (low 22 bits). The reader computes it
+/// the same way to look a name up by key; both use
+/// [`apfs_core::case_fold::apfs_name_hash`].
 ///
 /// Canonical pipeline per Apple File System Reference (the APFS specification):
 ///   1. If the volume has APFS_INCOMPAT_NORMALIZATION_INSENSITIVE: NFD-decompose.
@@ -57,30 +24,12 @@ fn crc32c(buf: &[u8]) -> u32 {
 /// kernel-formatted "café.txt" hashes differently from our raw .chars(),
 /// making the DREC unfindable and fsck flagging the catalog corrupt.
 pub fn apfs_name_hash(name: &str, case_fold: bool, normalize: bool) -> u32 {
-    use unicode_normalization::UnicodeNormalization;
-    // Step 1: NFD decomposition when the volume requires it.
-    let normalized: String = if normalize {
-        name.nfd().collect()
-    } else {
-        name.to_string()
-    };
-    // Step 2: case-fold when the volume requires it. (Rust's to_lowercase is
-    // close to Unicode CaseFolding.txt for most scripts; full-fidelity locale
-    // edge cases - Turkish dotted-I, German ß, Greek final-sigma - should use
-    // an icu_casemap-style fold for case-INsensitive volumes. apfs-spec
-    // Q12: noted as a hardening follow-up; case-sensitive volumes are the
-    // common default and unaffected.)
-    let folded = if case_fold {
-        normalized.to_lowercase()
-    } else {
-        normalized
-    };
-    // Step 3+4: UTF-32-LE per scalar, then CRC32C over those bytes (no NUL).
-    let mut buf = Vec::with_capacity(folded.chars().count() * 4);
-    for ch in folded.chars() {
-        buf.extend_from_slice(&(ch as u32).to_le_bytes());
-    }
-    crc32c(&buf) & 0x003F_FFFF
+    // A case-insensitive volume folds with the FULL Unicode case fold after
+    // NFD - the fold macOS applies and fsck_apfs checks the hash against:
+    // "straße" hashes as "strasse", a ligature as its letters, a final sigma
+    // as the ordinary one. Lowercasing instead stored hashes macOS never
+    // computes (measured: fsck_apfs "invalid hash ... of name (straße.txt)").
+    apfs_core::case_fold::apfs_name_hash(name, case_fold, normalize)
 }
 
 /// Pack `name_len_and_hash`: high 22 bits = hash of the normalized+folded name,
@@ -102,6 +51,8 @@ pub fn name_len_and_hash(name: &str, case_fold: bool, normalize: bool) -> u32 {
 pub const APFS_TYPE_INODE: u64 = 3;
 pub const APFS_TYPE_XATTR: u64 = 4;
 pub const APFS_TYPE_SIBLING_LINK: u64 = 5;
+/// `APFS_TYPE_SIBLING_MAP` - maps a sibling id back to the inode it names.
+pub const APFS_TYPE_SIBLING_MAP: u64 = 12;
 pub const APFS_TYPE_DIR_REC: u64 = 9;
 pub const APFS_TYPE_FILE_EXTENT: u64 = 8;
 pub const APFS_TYPE_EXTENT: u64 = 2; // physical extent record (extentref tree)
@@ -114,7 +65,9 @@ pub const DT_LNK: u16 = 10;
 
 /// Inode extended-field types.
 const INO_EXT_TYPE_NAME: u8 = 4;
-const XF_DATA_DEPENDENT: u8 = 0x02; // x_flags for the NAME xfield
+/// x_flags of the NAME xfield: the name does not follow the inode into a
+/// clone (`XF_DO_NOT_COPY`, 0x02); a clone gets a name of its own.
+const XF_DO_NOT_COPY: u8 = 0x02;
 
 /// File mode bits.
 pub const S_IFREG: u16 = 0o100000;
@@ -123,23 +76,57 @@ pub const S_IFLNK: u16 = 0o120000;
 
 /// j_xattr_flags bit for an inline (embedded) value.
 const XATTR_DATA_EMBEDDED: u16 = 0x0002;
+/// `XATTR_FILE_SYSTEM_OWNED`: the attribute belongs to the file system (a
+/// symlink's target), not to the user, and is hidden from listings.
+const XATTR_FILE_SYSTEM_OWNED: u16 = 0x0004;
 
 /// j_xattr_flags bit for a stream (extent-backed) value.
 const XATTR_DATA_STREAM: u16 = 0x0001;
 
-/// Threshold above which xattr data is stored as a stream instead of inline.
-/// Conservative choice: Apple uses ~3804 but we use 2048 to leave B-tree node
-/// headroom. Values ≤ this limit use the embedded (inline) encoding;
-/// values above use the dstream + FILE_EXTENT encoding.
-/// [Derived from APFS spec j_xattr_val layout + linux-apfs-rw xattr.c]
-pub const XATTR_EMBEDDED_THRESHOLD: usize = 2048;
+/// Largest attribute value stored in its record; a larger one gets a stream.
+/// Measured on macOS (`tests/xattr_embed_limit.rs`): 3800 bytes are embedded
+/// and 3801 become a stream, which is the checker's 3804-byte limit on the
+/// whole value less the record's four-byte header (length and flags).
+/// [measured on macOS 15; apfsprogs raw.h APFS_XATTR_MAX_EMBEDDED_SIZE]
+pub const XATTR_EMBEDDED_THRESHOLD: usize = apfs_core::xattr::XATTR_MAX_EMBEDDED_SIZE - 4;
+
+/// Largest attribute record (key plus value) macOS stores with its value
+/// embedded. A long name lowers the value limit below
+/// [`XATTR_EMBEDDED_THRESHOLD`]: with a 127-byte name 3794 bytes are embedded
+/// and 3795 become a stream, with a 124-byte name the cut is at 3797/3798,
+/// both exactly key + 4-byte value header + value = 3936.
+/// [measured on macOS 15, `tests/xattr_embed_limit.rs`]
+const XATTR_EMBEDDED_RECORD_MAX: usize = 3936;
+
+/// Whether a value of `value_len` bytes under an attribute key of `key_len`
+/// bytes is stored in its record (otherwise it gets a stream).
+fn xattr_value_embeds(key_len: usize, value_len: usize) -> bool {
+    value_len <= XATTR_EMBEDDED_THRESHOLD
+        && key_len.saturating_add(4).saturating_add(value_len) <= XATTR_EMBEDDED_RECORD_MAX
+}
 
 /// Reserved extended-attribute name used by APFS to store a symlink target.
 pub const XATTR_NAME_SYMLINK: &str = "com.apple.fs.symlink";
+/// The resource fork, stored as an attribute; the inode records whether it
+/// has one (`INODE_HAS_RSRC_FORK` / `INODE_NO_RSRC_FORK`).
+pub const XATTR_NAME_RESOURCE_FORK: &str = "com.apple.ResourceFork";
+/// Finder info is a fixed 32-byte record; macOS refuses any other size
+/// (measured: setxattr with 5 or 33 bytes fails with ERANGE).
+pub const XATTR_NAME_FINDER_INFO: &str = "com.apple.FinderInfo";
+pub const FINDER_INFO_LEN: usize = 32;
+/// The longest attribute name macOS accepts (XATTR_MAXNAMELEN; measured: 127
+/// bytes taken, 128 refused with ENAMETOOLONG).
+pub const XATTR_NAME_MAX: usize = 127;
+/// Names macOS reserves for itself and refuses from user space (EPERM).
+pub const XATTR_SYSTEM_PREFIX: &str = "com.apple.system.";
 
 /// Default inode `internal_flags` the kernel stamps on a freshly created
 /// object (empirical: 0x8000 on both dir and regular-file inodes).
 const INODE_DEFAULT_INTERNAL_FLAGS: u64 = 0x8000;
+/// The longest symlink target macOS accepts: PATH_MAX (1024) less the
+/// terminator; `ln -s` with 1024 bytes fails with ENAMETOOLONG. Anything
+/// longer would also overflow the embedded attribute that stores it.
+const SYMLINK_TARGET_MAX: usize = 1023;
 
 /// `j_inode_val.internal_flags` bits set on cloned inodes (clonefile).
 /// [linux-apfs-rw apfs_raw.h:343/349; IDA apfs.kext clone_item - an audit pass.]
@@ -200,6 +187,88 @@ pub fn build_file_extent_val(byte_len: u64, phys_block: u64) -> Vec<u8> {
 }
 
 /// Build a DSTREAM_ID key: jkey(type=6, id=inode).
+/// Build a directory-entry value that also carries the sibling id binding this
+/// name to the file, which is what marks it as one of several.
+///
+/// The extended field sits directly after the 18-byte fixed part: a two-u16
+/// header (one field, eight bytes of payload), one 4-byte descriptor, then the
+/// id itself.
+pub fn build_drec_val_with_sibling(
+    file_id: u64,
+    date_added: u64,
+    dt_type: u16,
+    sibling_id: u64,
+) -> Vec<u8> {
+    const DREC_EXT_TYPE_SIBLING_ID: u8 = 1;
+    let mut v = build_drec_val(file_id, date_added, dt_type);
+    v.extend_from_slice(&1u16.to_le_bytes()); // xf_num_exts
+    v.extend_from_slice(&8u16.to_le_bytes()); // xf_used_data
+    v.extend_from_slice(&[DREC_EXT_TYPE_SIBLING_ID, 0]); // x_type, x_flags
+    v.extend_from_slice(&8u16.to_le_bytes()); // x_size
+    v.extend_from_slice(&sibling_id.to_le_bytes());
+    v
+}
+
+/// `j_sibling_link_val`: the directory holding this name, then the name itself
+/// with its NUL counted in the length.
+pub fn build_sibling_link_val(parent_id: u64, name: &str) -> Vec<u8> {
+    let name_len = name.len() + 1;
+    let mut v = Vec::with_capacity(10 + name_len);
+    v.extend_from_slice(&parent_id.to_le_bytes());
+    v.extend_from_slice(&(name_len as u16).to_le_bytes());
+    v.extend_from_slice(name.as_bytes());
+    v.push(0);
+    v
+}
+
+/// `j_sibling_map_val`: the inode the sibling id names.
+pub fn build_sibling_map_val(file_id: u64) -> Vec<u8> {
+    file_id.to_le_bytes().to_vec()
+}
+
+/// `j_sibling_link_key`: the inode's id under the sibling-link type, followed
+/// by the sibling id the name belongs to.
+pub fn build_sibling_link_key(ino: u64, sibling_id: u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(16);
+    v.extend_from_slice(&encode_jkey(ino, APFS_TYPE_SIBLING_LINK).to_le_bytes());
+    v.extend_from_slice(&sibling_id.to_le_bytes());
+    v
+}
+
+/// `j_sibling_map_key`: the sibling id is the whole key.
+pub fn build_sibling_map_key(sibling_id: u64) -> Vec<u8> {
+    encode_jkey(sibling_id, APFS_TYPE_SIBLING_MAP)
+        .to_le_bytes()
+        .to_vec()
+}
+
+/// The sibling id a directory entry carries when it is one of several names
+/// for the same file, or `None` when it is the only name.
+///
+/// The entry's extended fields start right after the 18-byte fixed part, in
+/// the same shape the inode uses: a two-u16 header, then one 4-byte descriptor
+/// per field, then the payloads padded to 8 bytes each.
+fn drec_sibling_id(drec_val: &[u8]) -> Option<u64> {
+    const DREC_XFIELDS_OFFSET: usize = 18;
+    const DREC_EXT_TYPE_SIBLING_ID: u8 = 1;
+    if drec_val.len() <= DREC_XFIELDS_OFFSET + 4 {
+        return None;
+    }
+    let count = rd_u16(drec_val, DREC_XFIELDS_OFFSET) as usize;
+    let mut entry = DREC_XFIELDS_OFFSET + 4;
+    let mut data = entry + count * 4;
+    for _ in 0..count {
+        let x_type = *drec_val.get(entry)?;
+        let x_size = rd_u16(drec_val, entry + 2) as usize;
+        if x_type == DREC_EXT_TYPE_SIBLING_ID && x_size >= 8 {
+            return Some(rd_u64(drec_val, data));
+        }
+        data += round_up8(x_size);
+        entry += 4;
+    }
+    None
+}
+
 pub fn build_dstream_id_key(ino: u64) -> Vec<u8> {
     encode_jkey(ino, APFS_TYPE_DSTREAM_ID)
         .to_le_bytes()
@@ -256,6 +325,37 @@ pub fn build_phys_ext_val(block_count: u64, owning_obj_id: u64, refcnt: u32) -> 
     v
 }
 
+/// Kind of a physical-extent record: bits\[63:60\] of len_and_kind.
+///
+/// The kind decides how the refcnt field is read: a KIND_NEW record carries an
+/// absolute reference count, a KIND_UPDATE record carries a SIGNED delta that
+/// applies on top of the count a snapshot's own KIND_NEW record holds.
+/// [apfsprogs apfsck/extents.c parse_phys_ext_record]
+pub fn phys_ext_kind(val: &[u8]) -> u64 {
+    rd_u64(val, 0) >> 60
+}
+
+/// Absolute reference count of a KIND_NEW physical-extent record.
+pub fn phys_ext_refcnt(val: &[u8]) -> u32 {
+    rd_u32(val, 16)
+}
+
+/// Signed reference delta of a KIND_UPDATE physical-extent record.
+pub fn phys_ext_update_delta(val: &[u8]) -> i32 {
+    rd_u32(val, 16) as i32
+}
+
+/// True when a file-extent's physical block number marks a sparse hole.
+///
+/// A hole owns no physical block, so it must never take part in reference
+/// counting or block freeing: keying an extentref record at block 0 both
+/// duplicates a key in the extentref tree and, once its count reaches zero,
+/// hands the container superblock back to the allocator.
+/// [linux-apfs-rw extents.c apfs_ext_is_hole]
+pub fn is_sparse_hole(phys_block: u64) -> bool {
+    phys_block == 0
+}
+
 /// Data-stream sizes for a file inode's DSTREAM xfield.
 #[derive(Clone, Copy)]
 pub struct DstreamArgs {
@@ -287,7 +387,8 @@ const DSTREAM_SIZE: usize = 40;
 /// [the APFS spec LOCKED, empirical + the APFS specification] 92-byte fixed prefix +
 /// xfield blob: always a NAME xfield (type 4), plus a DSTREAM xfield (type 8)
 /// when `args.dstream` is set. Extended fields are emitted in ascending
-/// x_type order (NAME before DSTREAM) as fsck requires.
+/// x_type order (NAME before DSTREAM), the one order this writer keeps; the
+/// checker does not require one.
 pub fn build_inode_val(args: &InodeValArgs) -> Vec<u8> {
     let name_bytes_len = args.name.len() + 1; // incl NUL
     let name_area = round_up8(name_bytes_len);
@@ -321,7 +422,7 @@ pub fn build_inode_val(args: &InodeValArgs) -> Vec<u8> {
                                         // x_field_t entries @96 (4 bytes each), data area follows after all entries.
     let data_base = 96 + nxf * 4;
     // NAME (type 4) first.
-    wr_bytes(&mut v, 96, &[INO_EXT_TYPE_NAME, XF_DATA_DEPENDENT]);
+    wr_bytes(&mut v, 96, &[INO_EXT_TYPE_NAME, XF_DO_NOT_COPY]);
     wr_u16(&mut v, 98, name_bytes_len as u16);
     wr_bytes(&mut v, data_base, args.name.as_bytes());
     // DSTREAM (type 8) second.
@@ -338,12 +439,21 @@ pub fn build_inode_val(args: &InodeValArgs) -> Vec<u8> {
     v
 }
 
-use crate::txn::{update_checksum_in_place, Transaction, TxnError, OBJECT_TYPE_FS};
+use crate::txn::{
+    update_checksum_in_place, Transaction, TxnError, OBJECT_TYPE_FS, OBJECT_TYPE_OMAP,
+};
 use apfs_core::block_device::WritableBlockDevice;
+use std::collections::HashSet;
+
+mod cow_tree;
+use cow_tree::{remap_catalog_nodes, CowTree, EditBatch, EditOp, Shape};
 
 // Volume superblock field offsets.
 const VSBI_FS_ALLOC_COUNT: usize = 0x58;
 const VSBI_NUM_DIRECTORIES: usize = 0xC0;
+const VSBI_NUM_OTHER_FSOBJECTS: usize = 0xD0;
+/// `apfs_num_symlinks` - symbolic links are counted here, not with the files.
+const VSBI_NUM_SYMLINKS: usize = 0xC8;
 const VSBI_OMAP_OID: usize = 0x80;
 const VSBI_ROOT_TREE_OID: usize = 0x88;
 const VSBI_EXTENTREF_TREE_OID: usize = 0x90;
@@ -354,11 +464,377 @@ const VSBI_NUM_FILES: usize = 0xB8;
 const VSBI_NUM_SNAPSHOTS: usize = 0xD8;
 const APFS_INCOMPAT_CASE_INSENSITIVE: u64 = 0x1;
 const APFS_INCOMPAT_NORMALIZATION_INSENSITIVE: u64 = 0x8;
+/// Sealed (signed system) volume: file extents live in a separate fext tree
+/// and the seal has to be broken before any mutation.
+const APFS_INCOMPAT_SEALED_VOLUME: u64 = 0x20;
+/// The incompatible feature bits whose on-disk consequences this writer
+/// implements: the name hashing and comparison rules. Any other bit means the
+/// volume relies on a format feature the writer knows nothing about (dataless
+/// snapshots, a rolled encryption key, an incomplete restore, per-file keys,
+/// preallocated extent records, a secondary root tree), and Apple's own
+/// implementation refuses to mount a volume with a bit it does not know.
+const APFS_INCOMPAT_WRITABLE_MASK: u64 =
+    APFS_INCOMPAT_CASE_INSENSITIVE | APFS_INCOMPAT_NORMALIZATION_INSENSITIVE;
+/// `apfs_fs_flags` offset in the volume superblock, and its "data is in the
+/// clear" bit. A FileVault volume leaves the bit clear.
+const VSBI_FS_FLAGS: usize = 0x108;
+const APFS_FS_UNENCRYPTED: u64 = 0x1;
+
+// j_inode_val prefix offsets used by the write guards.
+const INOI_NLINK_OR_NCHILDREN: usize = 56;
+const INOI_BSD_FLAGS: usize = 68;
+/// UF_COMPRESSED: the file's content lives in the com.apple.decmpfs xattr and,
+/// when it does not fit inline, in the resource fork - not in the data stream.
+const UF_COMPRESSED: u32 = 0x20;
+
+/// Refuse to mutate a volume whose state we cannot maintain.
+///
+/// A sealed volume keeps its extents in a separate fext tree behind a hash
+/// seal we do not recompute; an encrypted volume stores ciphertext, so
+/// plaintext extents written into it are unreadable by macOS; any other
+/// incompatible feature bit the writer does not implement means a mutation
+/// would ignore an invariant the volume depends on. In every case a write
+/// would appear to succeed and corrupt the volume, so refuse it up front.
+pub fn ensure_volume_mutable(vsb_raw: &[u8]) -> Result<(), TxnError> {
+    let incompat = vsb_raw
+        .get(VSBI_INCOMPAT_FEATURES..VSBI_INCOMPAT_FEATURES + 8)
+        .ok_or_else(|| {
+            TxnError::VolumeParse("volume superblock too short for incompat features".into())
+        })?;
+    let incompat = u64::from_le_bytes(incompat.try_into().unwrap_or([0u8; 8]));
+    if incompat & APFS_INCOMPAT_SEALED_VOLUME != 0 {
+        return Err(TxnError::Unsupported(
+            "volume is sealed; breaking the seal is not implemented".into(),
+        ));
+    }
+    let unknown = incompat & !APFS_INCOMPAT_WRITABLE_MASK;
+    if unknown != 0 {
+        return Err(TxnError::Unsupported(format!(
+            "volume has incompatible feature bits {unknown:#x} this writer does not implement"
+        )));
+    }
+    // Directory records are keyed by a name hash only on a case-insensitive or
+    // normalization-insensitive volume; a volume with neither bit uses the
+    // plain-name key layout, which this writer does not produce. Every volume
+    // macOS formats sets one of the two.
+    if incompat & (APFS_INCOMPAT_CASE_INSENSITIVE | APFS_INCOMPAT_NORMALIZATION_INSENSITIVE) == 0 {
+        return Err(TxnError::Unsupported(
+            "volume keys its directory records by name rather than by hash (neither the \
+             case-insensitive nor the normalization-insensitive feature is set); writing \
+             such records is not implemented"
+                .into(),
+        ));
+    }
+    let fs_flags = vsb_raw
+        .get(VSBI_FS_FLAGS..VSBI_FS_FLAGS + 8)
+        .ok_or_else(|| TxnError::VolumeParse("volume superblock too short for fs_flags".into()))?;
+    let fs_flags = u64::from_le_bytes(fs_flags.try_into().unwrap_or([0u8; 8]));
+    if fs_flags & APFS_FS_UNENCRYPTED == 0 {
+        return Err(TxnError::Unsupported(
+            "volume is encrypted (FileVault); writing plaintext extents would corrupt it".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Read the `nlink`/`nchildren` u32 and the mode from a j_inode_val prefix.
+fn inode_links_and_mode(inode_val: &[u8]) -> Result<(u32, u16), TxnError> {
+    let nlink = inode_val
+        .get(INOI_NLINK_OR_NCHILDREN..INOI_NLINK_OR_NCHILDREN + 4)
+        .ok_or_else(|| TxnError::VolumeParse("inode value too short for nlink".into()))?;
+    let mode = inode_val
+        .get(INOI_MODE..INOI_MODE + 2)
+        .ok_or_else(|| TxnError::VolumeParse("inode value too short for mode".into()))?;
+    Ok((
+        u32::from_le_bytes(nlink.try_into().unwrap_or([0u8; 4])),
+        u16::from_le_bytes(mode.try_into().unwrap_or([0u8; 2])),
+    ))
+}
+
+/// What taking one name off an inode removes from the volume, and what it
+/// leaves changed. Shared by every path that drops a name: `unlink`, and the
+/// rename, move and symlink paths that replace an existing entry.
+struct RemovalPlan {
+    /// Records to remove. The directory entry itself is not among them.
+    remove_keys: Vec<Vec<u8>>,
+    /// Blocks to release once the extentref counts allow.
+    data_blocks: Vec<(u64, u64)>,
+    /// Records whose value changes: a shared stream's count, a hard-linked
+    /// inode re-pointed at its next name.
+    updates: Vec<(Vec<u8>, Vec<u8>)>,
+    is_dir: bool,
+    dir_nchildren: u32,
+    /// Whether the inode itself goes with this name.
+    last_name: bool,
+    /// The inode's mode, for the volume's per-kind counters.
+    mode: u16,
+}
+
+/// Work out what removing the name `drec_val` describes for `file_id` means.
+///
+/// A file's content is not keyed by its inode but by its data-stream id
+/// (`private_id`). Usually the two are equal; a clone macOS made shares the
+/// original's stream, so the clone's inode names a stream keyed by another id,
+/// and the stream's own record counts how many inodes name it. A last-name
+/// removal therefore comes in parts: the records that are the inode's own, the
+/// streams of its attributes (never shared), and the content stream - which
+/// goes only with its last reference. A name that is one of several takes only
+/// itself, its sibling records and one from the link count, re-pointing the
+/// inode when it was the name the inode recorded for itself.
+fn plan_removal(
+    all: &[(Vec<u8>, Vec<u8>)],
+    file_id: u64,
+    drec_val: &[u8],
+    now: u64,
+    bsz: usize,
+) -> Result<RemovalPlan, TxnError> {
+    let inode_val = all
+        .iter()
+        .find(|(k, _)| {
+            rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF == file_id && rd_u64(k, 0) >> 60 == APFS_TYPE_INODE
+        })
+        .map(|(_, v)| v.clone());
+    let mode = inode_val.as_ref().map_or(0, |v| rd_u16(v, 80));
+    let is_dir = (mode & 0o170000) == S_IFDIR;
+    // For a directory inode, nchildren lives at INODE_NCHILDREN.
+    let dir_nchildren = inode_val.as_ref().map_or(0, |v| rd_u32(v, INODE_NCHILDREN));
+    let stream_id = match inode_val.as_ref().map(|v| rd_u64(v, INODE_PRIVATE_ID)) {
+        Some(id) if id != 0 && !is_dir => id,
+        _ => file_id,
+    };
+
+    let mut owned_keys: Vec<Vec<u8>> = Vec::new();
+    let mut stream_keys: Vec<Vec<u8>> = Vec::new();
+    // Each extent is (phys_start, block_count) - a FILE_EXTENT can span many
+    // blocks, so we must free the WHOLE run, not just its first block.
+    let mut data_blocks: Vec<(u64, u64)> = Vec::new();
+    let mut stream_refcnt: u32 = 1;
+    // An attribute value too large to sit inline has a stream of its own,
+    // keyed by an id that is neither the file's nor its content stream's.
+    let mut xattr_stream_ids: Vec<u64> = Vec::new();
+    for (k, v) in all {
+        let oid = rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF;
+        let ty = rd_u64(k, 0) >> 60;
+        let is_stream_record = ty == APFS_TYPE_DSTREAM_ID || ty == APFS_TYPE_FILE_EXTENT;
+        if oid == stream_id && is_stream_record {
+            stream_keys.push(k.clone());
+            if ty == APFS_TYPE_DSTREAM_ID {
+                stream_refcnt = rd_u32(v, 0);
+            } else {
+                // j_file_extent_val: len_and_flags (low 56 bits = byte length)
+                // @0, phys_block_num @8. Free every block of the extent.
+                let len_bytes = rd_u64(v, 0) & 0x00FF_FFFF_FFFF_FFFF;
+                let count = len_bytes / bsz as u64;
+                data_blocks.push((rd_u64(v, 8), count));
+            }
+        } else if oid == file_id && !is_stream_record {
+            owned_keys.push(k.clone());
+            if ty == APFS_TYPE_XATTR && rd_u16(v, 0) & XATTR_DATA_STREAM != 0 {
+                xattr_stream_ids.push(rd_u64(v, 4));
+            }
+        }
+    }
+    // A hard link's records come in pairs: the sibling link is keyed by the
+    // inode and is among its own records above; the sibling map is keyed by
+    // the sibling id and is not. When the inode goes, so must every map that
+    // still points at it - the one of the name being removed included, since
+    // the last name of a formerly linked file still carries its pair.
+    // [CERTAIN: apfsprogs/apfsck/inode.c pairs every sibling map with a link;
+    //  measured: macOS keeps the pair on the last surviving name]
+    let mut sibling_map_keys: Vec<Vec<u8>> = all
+        .iter()
+        .filter(|(k, _)| {
+            rd_u64(k, 0) >> 60 == APFS_TYPE_SIBLING_LINK
+                && rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF == file_id
+        })
+        .map(|(k, _)| build_sibling_map_key(rd_u64(k, 8)))
+        .collect();
+    if let Some(sid) = drec_sibling_id(drec_val) {
+        let key = build_sibling_map_key(sid);
+        if !sibling_map_keys.contains(&key) {
+            sibling_map_keys.push(key);
+        }
+    }
+    // An attribute's stream belongs to this inode alone (attributes are never
+    // cloned), so it goes whenever the inode does, whatever the content
+    // stream's count says.
+    // [CERTAIN: apfsprogs/apfsck/extents.c "xattrs can't be cloned"]
+    let mut xattr_stream_keys: Vec<Vec<u8>> = Vec::new();
+    let mut xattr_blocks: Vec<(u64, u64)> = Vec::new();
+    for sid in &xattr_stream_ids {
+        for (k, v) in all {
+            if rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF != *sid {
+                continue;
+            }
+            match rd_u64(k, 0) >> 60 {
+                APFS_TYPE_DSTREAM_ID => xattr_stream_keys.push(k.clone()),
+                APFS_TYPE_FILE_EXTENT => {
+                    xattr_stream_keys.push(k.clone());
+                    let len_bytes = rd_u64(v, 0) & 0x00FF_FFFF_FFFF_FFFF;
+                    xattr_blocks.push((rd_u64(v, 8), len_bytes.div_ceil(bsz as u64)));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // A file reached through several names loses one name, not the file. Its
+    // inode, data stream and blocks stay; the entry, the two records binding
+    // that entry to the inode, and one from the link count are what go.
+    let links = match (&inode_val, is_dir) {
+        (Some(iv), false) => inode_links_and_mode(iv)?.0,
+        _ => 1,
+    };
+    let last_name = links <= 1;
+    let mut remove_keys: Vec<Vec<u8>> = Vec::new();
+    let mut updates: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    if last_name && stream_refcnt > 1 {
+        // Another inode still names this stream. The inode goes; the stream
+        // and its blocks stay, and the stream's count drops by one.
+        // [CERTAIN: linux-apfs-rw/inode.c apfs_put_dstream_rec on delete;
+        //  apfsprogs/apfsck/extents.c requires the stream's count to equal the
+        //  number of inodes naming it]
+        remove_keys.extend(owned_keys);
+        remove_keys.extend(sibling_map_keys);
+        remove_keys.extend(xattr_stream_keys);
+        data_blocks = xattr_blocks;
+        updates.push((
+            build_dstream_id_key(stream_id),
+            build_dstream_id_val(stream_refcnt - 1),
+        ));
+    } else if last_name {
+        remove_keys.extend(owned_keys);
+        remove_keys.extend(sibling_map_keys);
+        remove_keys.extend(stream_keys);
+        remove_keys.extend(xattr_stream_keys);
+        data_blocks.extend(xattr_blocks);
+    } else {
+        data_blocks.clear();
+        let mut updated = inode_val.clone().unwrap_or_default();
+        if let Some(sibling_id) = drec_sibling_id(drec_val) {
+            remove_keys.push(build_sibling_link_key(file_id, sibling_id));
+            remove_keys.push(build_sibling_map_key(sibling_id));
+            // The inode records one of its names as its own - the primary
+            // link, the one with the lowest sibling id. When that is the name
+            // going, the inode has to describe the next lowest instead, or it
+            // goes on naming an entry that no longer exists. macOS does the
+            // same; the reader's `primary_link` is how a test sees it.
+            // [CERTAIN: apfsprogs/apfsck/inode.c free_inode_names - "wrong
+            //  name for primary link" / "bad parent for primary link" against
+            //  the first sibling in id order; measured on macOS 15.7]
+            let mut remaining: Vec<(u64, u64, String)> = all
+                .iter()
+                .filter(|(k, _)| {
+                    rd_u64(k, 0) >> 60 == APFS_TYPE_SIBLING_LINK
+                        && rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF == file_id
+                        && rd_u64(k, 8) != sibling_id
+                })
+                .filter_map(|(k, v)| {
+                    let name_len = rd_u16(v, 8) as usize;
+                    let raw = v.get(10..10 + name_len)?;
+                    let bytes = raw.split(|&b| b == 0).next().unwrap_or(raw);
+                    let name = std::str::from_utf8(bytes).ok()?.to_string();
+                    Some((rd_u64(k, 8), rd_u64(v, 0), name))
+                })
+                .collect();
+            remaining.sort_by_key(|(sid, _, _)| *sid);
+            let removed_was_primary = remaining.iter().all(|(sid, _, _)| *sid > sibling_id);
+            if removed_was_primary && !updated.is_empty() {
+                if let Some((_, next_parent, next_name)) = remaining.first() {
+                    updated = rebuild_inode_with_name(&updated, next_name, now);
+                    wr_u64(&mut updated, 0, *next_parent);
+                }
+            }
+        }
+        if !updated.is_empty() {
+            wr_u32(&mut updated, INODE_NCHILDREN, links.saturating_sub(1));
+            wr_u64(&mut updated, INODE_CHANGE_TIME, now);
+            updates.push((build_inode_key(file_id), updated));
+        }
+    }
+    Ok(RemovalPlan {
+        remove_keys,
+        data_blocks,
+        updates,
+        is_dir,
+        dir_nchildren,
+        last_name,
+        mode,
+    })
+}
+
+/// Take the replaced entry off the volume's per-kind counters - when its
+/// inode actually went. A name that was one of several leaves the inode and
+/// the counters alone.
+fn uncount_replaced(vsb: &mut [u8], replaced: &TargetReplace) {
+    if !replaced.last_name {
+        return;
+    }
+    let off = object_count_offset(replaced.mode);
+    let n = rd_u64(vsb, off);
+    wr_u64(vsb, off, n.saturating_sub(1));
+}
+
+/// The volume superblock counter an inode of `mode` is counted in:
+/// directories, symlinks and regular files each have their own, everything
+/// else (FIFOs, sockets, device nodes) shares the fourth.
+fn object_count_offset(mode: u16) -> usize {
+    match mode & 0o170000 {
+        m if m == S_IFDIR => VSBI_NUM_DIRECTORIES,
+        m if m == S_IFLNK => VSBI_NUM_SYMLINKS,
+        m if m == S_IFREG => VSBI_NUM_FILES,
+        _ => VSBI_NUM_OTHER_FSOBJECTS,
+    }
+}
 
 // Inode value field offsets (subset needed for parent-dir update).
+/// `j_inode_val.private_id`: the id the file's data stream is keyed by. Equal
+/// to the inode's own id unless the file shares a stream with a clone.
+const INODE_PRIVATE_ID: usize = 8;
+const INODE_CREATE_TIME: usize = 16;
 const INODE_MOD_TIME: usize = 24;
+const INODE_ACCESS_TIME: usize = 40;
+const INOI_MODE: usize = 80;
 const INODE_CHANGE_TIME: usize = 32;
 const INODE_NCHILDREN: usize = 56;
+/// `j_inode_val.write_generation_counter`: stepped by one whenever an
+/// inode's content changes - a file's data (a write, a truncation) or a
+/// directory's entries (one added, removed or renamed). A new inode starts
+/// at 1; a change to the mode, the attributes or the inode's own name leaves
+/// it alone. [measured on macOS: `tests/write_generation.rs`]
+const INODE_WRITE_GENERATION: usize = 64;
+
+/// Step `val`'s write-generation counter for a content change.
+fn step_write_generation(val: &mut [u8]) {
+    let next = rd_u32(val, INODE_WRITE_GENERATION).wrapping_add(1);
+    wr_u32(val, INODE_WRITE_GENERATION, next);
+}
+
+/// `val` with its write-generation counter stepped for a content change.
+fn with_write_generation_step(mut val: Vec<u8>) -> Vec<u8> {
+    step_write_generation(&mut val);
+    val
+}
+/// `j_inode_val.internal_flags`.
+const INODE_INTERNAL_FLAGS: usize = 48;
+/// The data stream has holes; set exactly when the sparse-bytes xfield is
+/// present (fsck: "wrong setting for sparse flag").
+const INODE_IS_SPARSE: u64 = 0x0000_0200;
+/// Flags the sparse-bytes xfield carries: a system field the children inherit.
+/// [CERTAIN: linux-apfs-rw/inode.c apfs_inode_set_sparse_bytes]
+const XF_SPARSE_BYTES_FLAGS: u8 = 0x28;
+/// The file has a resource fork.
+const INODE_HAS_RSRC_FORK: u64 = 0x4000;
+/// `INODE_HAS_FINDER_INFO`: the inode carries a com.apple.FinderInfo attribute.
+const INODE_HAS_FINDER_INFO: u64 = 0x100;
+/// The file has no resource fork - the other half of the pair above; exactly
+/// one of them describes any file.
+const INODE_NO_RSRC_FORK: u64 = 0x8000;
+/// `uncompressed_size` holds a meaningful value.
+const INODE_HAS_UNCOMPRESSED_SIZE: u64 = 0x0004_0000;
+/// `j_inode_val.uncompressed_size` - the decompressed length a compressed file
+/// records alongside its decmpfs xattr.
+const INODE_UNCOMPRESSED_SIZE: usize = 84;
 
 fn rd_u64(b: &[u8], o: usize) -> u64 {
     b.get(o..o + 8)
@@ -453,8 +929,18 @@ pub fn build_xattr_key(ino: u64, name: &str) -> Vec<u8> {
 /// `XATTR_MAX_EMBEDDED_SIZE` (apfs-core::xattr) - well above any symlink
 /// target. Larger values would use the dstream encoding (XATTR_DATA_STREAM).
 pub fn build_xattr_val_embedded(xdata: &[u8]) -> Vec<u8> {
+    build_xattr_val_embedded_with_flags(xdata, XATTR_DATA_EMBEDDED)
+}
+
+/// An embedded attribute value that belongs to the file system rather than
+/// to the user - a symlink's target - and is listed to nobody.
+pub fn build_xattr_val_embedded_owned(xdata: &[u8]) -> Vec<u8> {
+    build_xattr_val_embedded_with_flags(xdata, XATTR_DATA_EMBEDDED | XATTR_FILE_SYSTEM_OWNED)
+}
+
+fn build_xattr_val_embedded_with_flags(xdata: &[u8], flags: u16) -> Vec<u8> {
     let mut v = Vec::with_capacity(4 + xdata.len());
-    v.extend_from_slice(&XATTR_DATA_EMBEDDED.to_le_bytes());
+    v.extend_from_slice(&flags.to_le_bytes());
     v.extend_from_slice(&(xdata.len() as u16).to_le_bytes());
     v.extend_from_slice(xdata);
     v
@@ -489,9 +975,11 @@ pub fn build_xattr_val_stream(xattr_obj_id: u64, byte_len: u64, alloced_size: u6
 
 /// Write an extended attribute `name` with `value` bytes on inode `inode_id`.
 ///
-/// - If `value.len() <= XATTR_EMBEDDED_THRESHOLD`: stores inline (embedded).
-/// - If `value.len() > XATTR_EMBEDDED_THRESHOLD`: allocates a private dstream,
-///   writes data blocks, and stores a stream xattr record.
+/// - If the value fits its record (`xattr_value_embeds`: at most
+///   `XATTR_EMBEDDED_THRESHOLD` bytes and a record of at most 3936 bytes):
+///   stores inline (embedded).
+/// - Otherwise: allocates a private dstream, writes data blocks, and stores a
+///   stream xattr record.
 ///
 /// If an xattr with the same name already exists on the inode it is replaced:
 /// - Embedded → new embedded: old record removed, new record inserted.
@@ -506,6 +994,119 @@ pub fn build_xattr_val_stream(xattr_obj_id: u64, byte_len: u64, alloced_size: u6
 /// require multiple allocation chunks; this is handled via the alloc_blocks_run
 /// loop (same as write_file). Multi-GB xattrs are out of scope (M10 deferred).
 /// [Derived from APFS spec - j_xattr_val + j_xattr_dstream layout]
+/// The longest name macOS accepts for a directory entry, in characters:
+/// 255 ASCII bytes are taken and 256 refused (ENAMETOOLONG), while 128
+/// two-byte characters (256 bytes of UTF-8) are taken (measured on macOS 15).
+pub const ENTRY_NAME_MAX_CHARS: usize = 255;
+/// The directory record stores the name's length, terminator included, in
+/// ten bits.
+const ENTRY_NAME_MAX_BYTES: usize = 0x3FF - 1;
+
+/// Refuse a directory-entry name macOS would refuse, before anything is
+/// staged: empty, a slash or a NUL inside, more than 255 characters, or more
+/// bytes than the record's length field can say.
+pub fn validate_entry_name(name: &str) -> Result<(), TxnError> {
+    if name.is_empty() {
+        return Err(TxnError::InvalidArgument("name must not be empty".into()));
+    }
+    if name.bytes().any(|b| b == b'/' || b == 0) {
+        return Err(TxnError::InvalidArgument(format!(
+            "name {name:?} contains a slash or a NUL byte"
+        )));
+    }
+    if name.chars().count() > ENTRY_NAME_MAX_CHARS {
+        return Err(TxnError::InvalidArgument(format!(
+            "name of {} characters exceeds the {ENTRY_NAME_MAX_CHARS}-character limit macOS \
+             enforces (ENAMETOOLONG)",
+            name.chars().count()
+        )));
+    }
+    if name.len() > ENTRY_NAME_MAX_BYTES {
+        return Err(TxnError::InvalidArgument(format!(
+            "name of {} bytes does not fit a directory record",
+            name.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse an attribute name macOS would refuse, before anything is staged.
+fn validate_xattr_name(name: &str) -> Result<(), TxnError> {
+    if name.is_empty() {
+        return Err(TxnError::InvalidArgument(
+            "attribute name must not be empty".into(),
+        ));
+    }
+    if name.len() > XATTR_NAME_MAX {
+        return Err(TxnError::InvalidArgument(format!(
+            "attribute name of {} bytes exceeds the {XATTR_NAME_MAX}-byte limit macOS enforces",
+            name.len()
+        )));
+    }
+    if name.starts_with(XATTR_SYSTEM_PREFIX) {
+        return Err(TxnError::InvalidArgument(format!(
+            "attribute {name:?} is reserved for the system; macOS refuses it from user space"
+        )));
+    }
+    // The symlink's target lives in an attribute the file system owns; a
+    // caller writing or removing it by name would turn a link into an inode
+    // with no target (or a file into a half-link).
+    if name == XATTR_NAME_SYMLINK {
+        return Err(TxnError::InvalidArgument(format!(
+            "attribute {name:?} holds a symlink's target and is owned by the file system"
+        )));
+    }
+    Ok(())
+}
+
+/// The internal-flag change an attribute's arrival (`present`) or removal
+/// implies on its inode: `(bits to set, bits to clear)`, or `None` when the
+/// attribute leaves the inode alone.
+///
+/// [CERTAIN: measured on macOS 15 - a file given com.apple.ResourceFork
+///  carries internal flags 0x4000 (HAS_RSRC_FORK), one without carries
+///  0x8000 (NO_RSRC_FORK); fsck_apfs on a file given com.apple.FinderInfo
+///  without the flag: "finder info internal flag is missing, need to set
+///  internal_flags 0x100"; apfsprogs/apfsck/inode.c cross-checks both]
+fn inode_flags_for_xattr(name: &str, present: bool) -> (u64, u64) {
+    match (name, present) {
+        (XATTR_NAME_RESOURCE_FORK, true) => (INODE_HAS_RSRC_FORK, INODE_NO_RSRC_FORK),
+        (XATTR_NAME_RESOURCE_FORK, false) => (INODE_NO_RSRC_FORK, INODE_HAS_RSRC_FORK),
+        (XATTR_NAME_FINDER_INFO, true) => (INODE_HAS_FINDER_INFO, 0),
+        (XATTR_NAME_FINDER_INFO, false) => (0, INODE_HAS_FINDER_INFO),
+        // Any other attribute leaves the flags alone; the inode is still
+        // rewritten for its change time, which macOS moves on every
+        // attribute set or removal (measured in `tests/operation_times.rs`).
+        _ => (0, 0),
+    }
+}
+
+/// The inode record of `inode_id` with `set` bits set and `clear` bits
+/// cleared in its internal flags and its change time bumped: `(key, value)`.
+fn inode_with_flags(
+    all: &[(Vec<u8>, Vec<u8>)],
+    inode_id: u64,
+    set: u64,
+    clear: u64,
+    now: u64,
+) -> Result<(Vec<u8>, Vec<u8>), TxnError> {
+    let key = build_inode_key(inode_id);
+    let mut val = all
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| TxnError::NotFound(format!("inode {inode_id}")))?;
+    if val.len() < INODE_INTERNAL_FLAGS + 8 {
+        return Err(TxnError::VolumeParse(format!(
+            "inode {inode_id} record too short"
+        )));
+    }
+    let flags = (rd_u64(&val, INODE_INTERNAL_FLAGS) & !clear) | set;
+    wr_u64(&mut val, INODE_INTERNAL_FLAGS, flags);
+    wr_u64(&mut val, INODE_CHANGE_TIME, now);
+    Ok((key, val))
+}
+
 pub fn set_xattr<D: WritableBlockDevice>(
     txn: &mut Transaction<D>,
     vsb_raw: &[u8],
@@ -514,17 +1115,28 @@ pub fn set_xattr<D: WritableBlockDevice>(
     name: &str,
     value: &[u8],
 ) -> Result<(), TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, vol_omap_raw)?;
+    let (vsb_raw, vol_omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
     let bsz = txn.nx.block_size as usize;
     let new_xid = txn.xid;
     let now = now_ns();
+    validate_xattr_name(name)?;
+    ensure_volume_mutable(vsb_raw)?;
+    if name == XATTR_NAME_FINDER_INFO && value.len() != FINDER_INFO_LEN {
+        return Err(TxnError::InvalidArgument(format!(
+            "Finder info is a {FINDER_INFO_LEN}-byte record; {} bytes were given",
+            value.len()
+        )));
+    }
 
     // Read the volume omap node.
     let omap_tree_paddr = rd_u64(vol_omap_raw, 48);
     let mut omap_node = vec![0u8; bsz];
     txn.read_block(omap_tree_paddr, &mut omap_node)?;
 
-    // Collect all fstree catalog records.
-    let all = collect_fstree(txn, &omap_node, rd_u64(vsb_raw, VSBI_ROOT_TREE_OID), bsz)?;
+    // Gather the inode's catalog records.
+    let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
+    let all = gather_object(txn, &omap_node, root_tree_oid, inode_id, bsz)?;
 
     // Scan for existing xattr record with matching name on inode_id.
     let target_xattr_key = build_xattr_key(inode_id, name);
@@ -574,26 +1186,22 @@ pub fn set_xattr<D: WritableBlockDevice>(
         }
     }
 
-    // Collect old phys blocks to free (for stream xattr replace/delete).
+    // Release the old stream's blocks (stream xattr replace/delete) the way
+    // unlink releases a file's: a clone may share them, a snapshot may own
+    // them, and a run may span several records.
     let old_extref_paddr = rd_u64(vsb_raw, VSBI_EXTENTREF_TREE_OID);
-    let mut freed_block_count = 0u64;
-    // Keys of old owned phys_ext records to remove from the extref tree.
-    let mut extref_remove_keys: Vec<Vec<u8>> = Vec::new();
-    let mut owned_runs_to_free: Vec<(u64, u64)> = Vec::new();
-
-    if !old_stream_extents.is_empty() {
-        // Collect live extref keys so we can distinguish owned vs. snapshot-pinned.
-        let (live_recs, _) = collect_extref_records(txn, old_extref_paddr, bsz)?;
-        let live_keys: Vec<Vec<u8>> = live_recs.into_iter().map(|(k, _)| k).collect();
-        for &(_, phys, count) in &old_stream_extents {
-            let key = build_phys_ext_key(phys);
-            if live_keys.contains(&key) {
-                extref_remove_keys.push(key);
-                owned_runs_to_free.push((phys, count));
-                freed_block_count += count;
-            }
-        }
-    }
+    let old_runs: Vec<(u64, u64)> = old_stream_extents
+        .iter()
+        .map(|&(_, phys, count)| (phys, count))
+        .collect();
+    let release = release_runs(txn, old_extref_paddr, &old_runs, bsz)?;
+    let freed_block_count: u64 = release.owned_runs.iter().map(|&(_, n)| n).sum();
+    let ExtrefRelease {
+        remove_keys: extref_remove_keys,
+        upserts: extref_upserts,
+        update_inserts: extref_update_inserts,
+        owned_runs: owned_runs_to_free,
+    } = release;
 
     // Build remove_keys: old xattr record + old dstream_id + old file_extents.
     let mut remove_keys: Vec<Vec<u8>> = Vec::new();
@@ -617,12 +1225,25 @@ pub fn set_xattr<D: WritableBlockDevice>(
     // New phys_ext records to insert into the extref tree.
     let mut extref_inserts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
-    if value.len() <= XATTR_EMBEDDED_THRESHOLD {
+    let mut allocated_stream_id: Option<u64> = None;
+    // A resource fork always lives in a stream, however short: fsck_apfs
+    // rejects an embedded one ("com.apple.ResourceFork is expected to be
+    // stream based").
+    let embed =
+        xattr_value_embeds(target_xattr_key.len(), value.len()) && name != XATTR_NAME_RESOURCE_FORK;
+    if embed {
         // Embedded path: inline data, no extents.
         new_records.push((target_xattr_key, build_xattr_val_embedded(value)));
     } else {
-        // Stream path: allocate a private dstream id, write data blocks, build extents.
-        let stream_id = txn.alloc_oid();
+        // Stream path: allocate a private dstream id, write data blocks, build
+        // extents. The id names a filesystem object - it ends up as a data
+        // stream id and as an extent record's owner - so it comes from the
+        // volume's own pool, not the container's object-id counter. Taking it
+        // from the container's left apfs_next_obj_id behind the ids in use and
+        // fsck called the volume "corrupt and cannot be repaired"
+        // ("apfs_next_obj_id is not valid (expected 1031, actual 17)").
+        let stream_id = rd_u64(vsb_raw, VSBI_NEXT_OBJ_ID);
+        allocated_stream_id = Some(stream_id);
         let num_blocks = value.len().div_ceil(bsz);
         let mut runs: Vec<(usize, u64, usize)> = Vec::new(); // (logical_blk, phys_start, count)
         let mut blocks_remaining = num_blocks;
@@ -651,8 +1272,10 @@ pub fn set_xattr<D: WritableBlockDevice>(
             target_xattr_key,
             build_xattr_val_stream(stream_id, value.len() as u64, alloced_size),
         ));
-        // DSTREAM_ID record for the stream's private id.
-        new_records.push((build_dstream_id_key(stream_id), build_dstream_id_val(1)));
+        // No data-stream-id record: an attribute's stream is never shared,
+        // so there is no count to keep. macOS writes none for one (measured:
+        // a 10000-byte attribute it set added no such record) and the
+        // checker reports one as an attribute that "can't be cloned".
         // FILE_EXTENT records (one per run).
         for &(lblk, pstart, cnt) in &runs {
             new_records.push((
@@ -671,7 +1294,9 @@ pub fn set_xattr<D: WritableBlockDevice>(
     }
 
     // Rewrite the extentref tree (multi-node capable). [#151]
-    let extref_changed = !extref_inserts.is_empty() || !extref_remove_keys.is_empty();
+    extref_inserts.extend(extref_update_inserts);
+    let extref_changed =
+        !extref_inserts.is_empty() || !extref_remove_keys.is_empty() || !extref_upserts.is_empty();
     let (new_extref_paddr, old_extref_padrs, extref_node_delta) = if extref_changed {
         rewrite_extref_tree(
             txn,
@@ -679,7 +1304,7 @@ pub fn set_xattr<D: WritableBlockDevice>(
             new_xid,
             extref_inserts,
             &extref_remove_keys,
-            &[],
+            &extref_upserts,
             bsz,
         )?
     } else {
@@ -693,8 +1318,21 @@ pub fn set_xattr<D: WritableBlockDevice>(
         }
     }
 
+    // The inode's change time moves with every attribute; a resource fork or
+    // Finder info is recorded in its flags as well.
+    {
+        let (set, clear) = inode_flags_for_xattr(name, true);
+        let (inode_key, inode_val) = inode_with_flags(&all, inode_id, set, clear, now)?;
+        remove_keys.push(inode_key.clone());
+        new_records.push((inode_key, inode_val));
+    }
+
     // Rewrite the fstree.
-    let (new_omap_tree_paddr, node_delta) = rewrite_fstree(
+    let FstreeRewrite {
+        omap_tree_paddr: new_omap_tree_paddr,
+        node_delta,
+        reclaim,
+    } = rewrite_fstree(
         txn,
         vsb_raw,
         &omap_node,
@@ -707,14 +1345,7 @@ pub fn set_xattr<D: WritableBlockDevice>(
     )?;
 
     // COW the volume omap header.
-    let new_vomap_paddr = txn.alloc_block()?;
-    let mut new_vomap = vol_omap_raw.to_vec();
-    new_vomap.resize(bsz, 0);
-    wr_u64(&mut new_vomap, 8, new_vomap_paddr);
-    wr_u64(&mut new_vomap, 16, new_xid);
-    wr_u64(&mut new_vomap, 48, new_omap_tree_paddr);
-    update_checksum_in_place(&mut new_vomap);
-    txn.stage_raw(new_vomap_paddr, new_vomap);
+    let new_vomap_paddr = stage_vomap_header(txn, vol_omap_raw, new_xid, new_omap_tree_paddr, bsz)?;
 
     // Free replaced metadata BEFORE writing fs_alloc_count so frm_correction
     // (sm_fq-pinned block count) can be folded into alloc_delta. [#149 fix]
@@ -724,7 +1355,7 @@ pub fn set_xattr<D: WritableBlockDevice>(
         vol_omap_raw,
         &omap_node,
         &old_extref_padrs,
-        false,
+        &reclaim,
         bsz,
     )?;
 
@@ -734,6 +1365,11 @@ pub fn set_xattr<D: WritableBlockDevice>(
     new_vsb.resize(bsz, 0);
     wr_u64(&mut new_vsb, VSBI_OMAP_OID, new_vomap_paddr);
     wr_u64(&mut new_vsb, VSBI_EXTENTREF_TREE_OID, new_extref_paddr);
+    // A stream value took an id out of the volume's pool; the counter has to
+    // move past it or the next allocation hands the same id out again.
+    if let Some(stream_id) = allocated_stream_id {
+        wr_u64(&mut new_vsb, VSBI_NEXT_OBJ_ID, stream_id + 1);
+    }
     let fs_alloc = rd_u64(&new_vsb, VSBI_FS_ALLOC_COUNT) as i64;
     let alloc_delta = new_block_count as i64 - freed_block_count as i64
         + node_delta
@@ -766,6 +1402,10 @@ pub fn delete_xattr<D: WritableBlockDevice>(
     inode_id: u64,
     name: &str,
 ) -> Result<(), TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, vol_omap_raw)?;
+    let (vsb_raw, vol_omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
+    validate_xattr_name(name)?;
+    ensure_volume_mutable(vsb_raw)?;
     let bsz = txn.nx.block_size as usize;
     let new_xid = txn.xid;
     let now = now_ns();
@@ -774,7 +1414,8 @@ pub fn delete_xattr<D: WritableBlockDevice>(
     let mut omap_node = vec![0u8; bsz];
     txn.read_block(omap_tree_paddr, &mut omap_node)?;
 
-    let all = collect_fstree(txn, &omap_node, rd_u64(vsb_raw, VSBI_ROOT_TREE_OID), bsz)?;
+    let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
+    let all = gather_object(txn, &omap_node, root_tree_oid, inode_id, bsz)?;
 
     let target_xattr_key = build_xattr_key(inode_id, name);
     // If no such xattr, return Ok (idempotent).
@@ -828,36 +1469,35 @@ pub fn delete_xattr<D: WritableBlockDevice>(
         }
     }
 
-    // Free old phys extents if stream.
+    // Release the stream's blocks (if a stream) the way unlink releases a
+    // file's: a clone may share them, a snapshot may own them, and a run may
+    // span several records.
     let old_extref_paddr = rd_u64(vsb_raw, VSBI_EXTENTREF_TREE_OID);
-    let mut freed_block_count = 0u64;
-
-    // Collect extref remove keys + data blocks to free (if stream xattr). [#151]
-    let mut extref_remove_keys: Vec<Vec<u8>> = Vec::new();
-    let mut owned_runs_to_free: Vec<(u64, u64)> = Vec::new();
-    if !old_stream_extents.is_empty() {
-        let (live_recs, _) = collect_extref_records(txn, old_extref_paddr, bsz)?;
-        let live_keys: Vec<Vec<u8>> = live_recs.into_iter().map(|(k, _)| k).collect();
-        for &(_, phys, count) in &old_stream_extents {
-            let key = build_phys_ext_key(phys);
-            if live_keys.contains(&key) {
-                extref_remove_keys.push(key);
-                owned_runs_to_free.push((phys, count));
-                freed_block_count += count;
-            }
-        }
-    }
+    let old_runs: Vec<(u64, u64)> = old_stream_extents
+        .iter()
+        .map(|&(_, phys, count)| (phys, count))
+        .collect();
+    let release = release_runs(txn, old_extref_paddr, &old_runs, bsz)?;
+    let freed_block_count: u64 = release.owned_runs.iter().map(|&(_, n)| n).sum();
+    let ExtrefRelease {
+        remove_keys: extref_remove_keys,
+        upserts: extref_upserts,
+        update_inserts: extref_update_inserts,
+        owned_runs: owned_runs_to_free,
+    } = release;
 
     // Rewrite extref tree (multi-node capable). [#151]
-    let (new_extref_paddr, old_extref_padrs, extref_node_delta) = if !extref_remove_keys.is_empty()
-    {
+    let extref_changed = !extref_remove_keys.is_empty()
+        || !extref_upserts.is_empty()
+        || !extref_update_inserts.is_empty();
+    let (new_extref_paddr, old_extref_padrs, extref_node_delta) = if extref_changed {
         rewrite_extref_tree(
             txn,
             old_extref_paddr,
             new_xid,
-            vec![],
+            extref_update_inserts,
             &extref_remove_keys,
-            &[],
+            &extref_upserts,
             bsz,
         )?
     } else {
@@ -871,26 +1511,33 @@ pub fn delete_xattr<D: WritableBlockDevice>(
         }
     }
 
-    let (new_omap_tree_paddr, node_delta) = rewrite_fstree(
+    // The inode's change time moves with every attribute; taking a resource
+    // fork or Finder info away is recorded in its flags as well.
+    let mut new_records: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    {
+        let (set, clear) = inode_flags_for_xattr(name, false);
+        let (inode_key, inode_val) = inode_with_flags(&all, inode_id, set, clear, now)?;
+        remove_keys.push(inode_key.clone());
+        new_records.push((inode_key, inode_val));
+    }
+
+    let FstreeRewrite {
+        omap_tree_paddr: new_omap_tree_paddr,
+        node_delta,
+        reclaim,
+    } = rewrite_fstree(
         txn,
         vsb_raw,
         &omap_node,
         new_xid,
-        vec![],
+        new_records,
         &remove_keys,
         None,
         now,
         bsz,
     )?;
 
-    let new_vomap_paddr = txn.alloc_block()?;
-    let mut new_vomap = vol_omap_raw.to_vec();
-    new_vomap.resize(bsz, 0);
-    wr_u64(&mut new_vomap, 8, new_vomap_paddr);
-    wr_u64(&mut new_vomap, 16, new_xid);
-    wr_u64(&mut new_vomap, 48, new_omap_tree_paddr);
-    update_checksum_in_place(&mut new_vomap);
-    txn.stage_raw(new_vomap_paddr, new_vomap);
+    let new_vomap_paddr = stage_vomap_header(txn, vol_omap_raw, new_xid, new_omap_tree_paddr, bsz)?;
 
     let frm_correction = free_replaced_metadata(
         txn,
@@ -898,7 +1545,7 @@ pub fn delete_xattr<D: WritableBlockDevice>(
         vol_omap_raw,
         &omap_node,
         &old_extref_padrs,
-        false,
+        &reclaim,
         bsz,
     )?;
 
@@ -925,8 +1572,13 @@ pub fn delete_xattr<D: WritableBlockDevice>(
 /// APFS represents symlinks as a `j_inode` with mode bits `S_IFLNK | 0o777`
 /// (Apple's default), `nlink = 1`, and no dstream, plus a separate `j_xattr`
 /// record named `com.apple.fs.symlink` whose embedded value is the target
-/// path bytes. (Cross-checked against linux-apfs-rw symlink.c.) The DREC
-/// uses `dt_type = DT_LNK (10)`.
+/// path bytes followed by a NUL terminator - readers take the value length
+/// minus that terminator. (Cross-checked against linux-apfs-rw symlink.c.)
+/// The DREC uses `dt_type = DT_LNK (10)`.
+///
+/// `target` must be non-empty and free of interior NUL bytes: an empty target
+/// yields a link no reader can resolve, and an interior NUL would truncate the
+/// stored path at that byte.
 ///
 /// Returns the new inode number.
 pub fn create_symlink<D: WritableBlockDevice>(
@@ -936,12 +1588,37 @@ pub fn create_symlink<D: WritableBlockDevice>(
     parent_ino: u64,
     name: &str,
     target: &[u8],
+    replace_existing: bool,
 ) -> Result<u64, TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, vol_omap_raw)?;
+    let (vsb_raw, vol_omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
     let bsz = txn.nx.block_size as usize;
     let new_xid = txn.xid;
     let now = now_ns();
 
+    if target.is_empty() {
+        return Err(TxnError::InvalidArgument(
+            "symlink target must not be empty".into(),
+        ));
+    }
+    if target.contains(&0) {
+        return Err(TxnError::InvalidArgument(
+            "symlink target must not contain a NUL byte; the stored path would be \
+             truncated there"
+                .into(),
+        ));
+    }
+    if target.len() > SYMLINK_TARGET_MAX {
+        return Err(TxnError::InvalidArgument(format!(
+            "symlink target of {} bytes exceeds the {SYMLINK_TARGET_MAX}-byte limit macOS \
+             enforces (ENAMETOOLONG)",
+            target.len()
+        )));
+    }
+
+    validate_entry_name(name)?;
     let new_ino = rd_u64(vsb_raw, VSBI_NEXT_OBJ_ID);
+    ensure_volume_mutable(vsb_raw)?;
     let incompat = rd_u64(vsb_raw, VSBI_INCOMPAT_FEATURES);
     let case_fold = incompat & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
     let _norm_flag_observed = incompat & APFS_INCOMPAT_NORMALIZATION_INSENSITIVE != 0;
@@ -951,10 +1628,26 @@ pub fn create_symlink<D: WritableBlockDevice>(
     let mut omap_node = vec![0u8; bsz];
     txn.read_block(omap_tree_paddr, &mut omap_node)?;
 
-    let drec = (
-        build_drec_key(parent_ino, name, case_fold, normalize),
-        build_drec_val(new_ino, now, DT_LNK),
-    );
+    let drec_key = build_drec_key(parent_ino, name, case_fold, normalize);
+    // Without the replace flag a name the directory already has, as the
+    // volume compares names, is a collision.
+    if !replace_existing {
+        let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
+        if drec_exists(
+            txn,
+            &omap_node,
+            root_tree_oid,
+            &drec_key,
+            bsz,
+            case_fold,
+            normalize,
+        )? {
+            return Err(TxnError::AlreadyExists(format!(
+                "'{name}' already exists in directory {parent_ino}"
+            )));
+        }
+    }
+    let drec = (drec_key, build_drec_val(new_ino, now, DT_LNK));
     let inode = (
         build_inode_key(new_ino),
         build_inode_val(&InodeValArgs {
@@ -969,47 +1662,100 @@ pub fn create_symlink<D: WritableBlockDevice>(
             dstream: None,
         }),
     );
+    // APFS stores the target as a NUL-terminated string and readers take the
+    // value length minus the terminator. Storing it bare made every consumer -
+    // macOS readlink included - see a target one byte short, so the link
+    // resolved to the wrong path.
+    let mut target_val = Vec::with_capacity(target.len() + 1);
+    target_val.extend_from_slice(target);
+    target_val.push(0);
     let xattr = (
         build_xattr_key(new_ino, XATTR_NAME_SYMLINK),
-        build_xattr_val_embedded(target),
+        build_xattr_val_embedded_owned(&target_val),
     );
 
-    let (new_omap_tree_paddr, node_delta) = rewrite_fstree(
+    // Replacing an entry that is already there - the empty placeholder Windows
+    // creates before turning it into a symlink - has to happen in the same
+    // rewrite. Doing it as a separate removal first cannot work: every catalog
+    // operation reads the superblock and object map it was handed, so a second
+    // one in the same transaction never sees what the first did, and splitting
+    // it across two transactions leaves the name deleted with nothing in its
+    // place if the second one does not land.
+    let replaced: Option<TargetReplace> = if replace_existing {
+        let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
+        let all = gather_entries(txn, &omap_node, root_tree_oid, &[&drec.0], bsz)?;
+        collect_replace_target(&all, &drec.0, new_ino, true, bsz, case_fold, normalize)?
+    } else {
+        None
+    };
+    let remove_keys: Vec<Vec<u8>> = replaced
+        .as_ref()
+        .map(|t| t.remove_keys.clone())
+        .unwrap_or_default();
+    let replaced_blocks: Vec<(u64, u64)> = replaced
+        .as_ref()
+        .map(|t| t.data_blocks.clone())
+        .unwrap_or_default();
+    let replaced_updates: Vec<(Vec<u8>, Vec<u8>)> = replaced
+        .as_ref()
+        .map(|t| t.updates.clone())
+        .unwrap_or_default();
+    let replaced_existing = replaced.is_some();
+    let (new_extref_paddr, extref_old_padrs, extref_node_delta, freed_count) =
+        free_blocks_owned_by_live_extref(txn, vsb_raw, new_xid, &replaced_blocks, bsz)?;
+
+    let FstreeRewrite {
+        omap_tree_paddr: new_omap_tree_paddr,
+        node_delta,
+        reclaim,
+    } = rewrite_fstree_impl(
         txn,
         vsb_raw,
         &omap_node,
         new_xid,
         vec![drec, inode, xattr],
-        &[],
-        Some((parent_ino, 1)),
+        &remove_keys,
+        // Replacing fills a slot that already counted; only a new name adds one.
+        Some((parent_ino, if replaced_existing { 0 } else { 1 })),
+        &replaced_updates,
         now,
         bsz,
     )?;
 
-    let new_vomap_paddr = txn.alloc_block()?;
-    let mut new_vomap = vol_omap_raw.to_vec();
-    new_vomap.resize(bsz, 0);
-    wr_u64(&mut new_vomap, 8, new_vomap_paddr);
-    wr_u64(&mut new_vomap, 16, new_xid);
-    wr_u64(&mut new_vomap, 48, new_omap_tree_paddr);
-    update_checksum_in_place(&mut new_vomap);
-    txn.stage_raw(new_vomap_paddr, new_vomap);
+    let new_vomap_paddr = stage_vomap_header(txn, vol_omap_raw, new_xid, new_omap_tree_paddr, bsz)?;
 
     let vsb_oid = rd_u64(vsb_raw, 8);
     let mut new_vsb = vsb_raw.to_vec();
     new_vsb.resize(bsz, 0);
-    let frm_correction =
-        free_replaced_metadata(txn, vsb_raw, vol_omap_raw, &omap_node, &[], false, bsz)?;
+    let frm_correction = free_replaced_metadata(
+        txn,
+        vsb_raw,
+        vol_omap_raw,
+        &omap_node,
+        &extref_old_padrs,
+        &reclaim,
+        bsz,
+    )?;
 
     wr_u64(&mut new_vsb, VSBI_OMAP_OID, new_vomap_paddr);
+    wr_u64(&mut new_vsb, VSBI_EXTENTREF_TREE_OID, new_extref_paddr);
     wr_u64(&mut new_vsb, VSBI_NEXT_OBJ_ID, new_ino + 1);
-    let num_files = rd_u64(&new_vsb, VSBI_NUM_FILES);
-    wr_u64(&mut new_vsb, VSBI_NUM_FILES, num_files + 1);
+    // A symlink counts as a symlink, not as a file: counting it with the files
+    // left fsck reporting both figures wrong ("apfs_num_files is not valid",
+    // "apfs_num_symlinks is not valid"). When it replaces something, whatever
+    // was there stops being counted - which for the placeholder Windows makes
+    // is a regular file.
+    let num_symlinks = rd_u64(&new_vsb, VSBI_NUM_SYMLINKS);
+    wr_u64(&mut new_vsb, VSBI_NUM_SYMLINKS, num_symlinks + 1);
+    if let Some(ref t) = replaced {
+        uncount_replaced(&mut new_vsb, t);
+    }
     let fs_alloc = rd_u64(&new_vsb, VSBI_FS_ALLOC_COUNT) as i64;
     wr_u64(
         &mut new_vsb,
         VSBI_FS_ALLOC_COUNT,
-        (fs_alloc + node_delta + frm_correction).max(0) as u64,
+        (fs_alloc - freed_count as i64 + node_delta + extref_node_delta + frm_correction).max(0)
+            as u64,
     );
     wr_u64(&mut new_vsb, VSBI_LAST_MOD_TIME, now);
     let body = new_vsb.get(32..bsz).unwrap_or(&[]).to_vec();
@@ -1040,6 +1786,166 @@ pub fn mkdir<D: WritableBlockDevice>(
     )
 }
 
+/// Give an existing file another name.
+///
+/// The new entry points at the same inode, so nothing is copied and the link
+/// count goes up by one. A file that had only one name has no sibling records
+/// yet, so this also gives the original name a sibling id and its own pair of
+/// records - which is why the original entry is rewritten, not just read.
+///
+/// Directories are refused: a second name for one would make the tree a graph,
+/// which is why POSIX does not allow it either.
+///
+/// [linux-apfs-rw dir.c apfs_link / apfs_prepare_dentry_for_link; sibling ids
+///  come from the same pool as inode numbers]
+pub fn link<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    vsb_raw: &[u8],
+    vol_omap_raw: &[u8],
+    src_parent_ino: u64,
+    src_name: &str,
+    dst_parent_ino: u64,
+    dst_name: &str,
+) -> Result<(), TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, vol_omap_raw)?;
+    let (vsb_raw, vol_omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
+    validate_entry_name(dst_name)?;
+    let bsz = txn.nx.block_size as usize;
+    let new_xid = txn.xid;
+    let now = now_ns();
+
+    ensure_volume_mutable(vsb_raw)?;
+    let incompat = rd_u64(vsb_raw, VSBI_INCOMPAT_FEATURES);
+    let case_fold = incompat & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
+    let normalize = true;
+    let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
+
+    let omap_tree_paddr = rd_u64(vol_omap_raw, 48);
+    let mut omap_node = vec![0u8; bsz];
+    txn.read_block(omap_tree_paddr, &mut omap_node)?;
+    let src_drec_key = build_drec_key(src_parent_ino, src_name, case_fold, normalize);
+    let dst_drec_key = build_drec_key(dst_parent_ino, dst_name, case_fold, normalize);
+    let all = gather_entries(
+        txn,
+        &omap_node,
+        root_tree_oid,
+        &[&src_drec_key, &dst_drec_key],
+        bsz,
+    )?;
+
+    let src_drec_val = all
+        .iter()
+        .find(|(k, _)| *k == src_drec_key)
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| TxnError::SpacemanParse("name not found in directory".into()))?;
+    let file_id = rd_u64(&src_drec_val, 0);
+
+    if find_drec_collision(&all, &dst_drec_key, case_fold, normalize).is_some() {
+        return Err(TxnError::AlreadyExists(dst_name.to_string()));
+    }
+
+    let inode_key = build_inode_key(file_id);
+    let inode_val = all
+        .iter()
+        .find(|(k, _)| *k == inode_key)
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| TxnError::SpacemanParse("inode record missing for the name".into()))?;
+    let (links, mode) = inode_links_and_mode(&inode_val)?;
+    if mode & 0xF000 == S_IFDIR {
+        return Err(TxnError::Unsupported(
+            "a directory cannot be given a second name".into(),
+        ));
+    }
+    let dt_type = (mode >> 12) & 0xF;
+
+    // Sibling ids come from the same pool as inode numbers.
+    let mut next_obj_id = rd_u64(vsb_raw, VSBI_NEXT_OBJ_ID);
+    let mut inserts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut removes: Vec<Vec<u8>> = Vec::new();
+
+    // The original name needs records of its own before it can be one of
+    // several. Its entry gains a sibling id, which means replacing it: the key
+    // stays the same, so it is removed and re-inserted rather than updated.
+    if drec_sibling_id(&src_drec_val).is_none() {
+        let sibling_id = next_obj_id;
+        next_obj_id += 1;
+        removes.push(src_drec_key.clone());
+        inserts.push((
+            src_drec_key,
+            build_drec_val_with_sibling(file_id, rd_u64(&src_drec_val, 8), dt_type, sibling_id),
+        ));
+        inserts.push((
+            build_sibling_link_key(file_id, sibling_id),
+            build_sibling_link_val(src_parent_ino, src_name),
+        ));
+        inserts.push((
+            build_sibling_map_key(sibling_id),
+            build_sibling_map_val(file_id),
+        ));
+    }
+
+    let sibling_id = next_obj_id;
+    next_obj_id += 1;
+    inserts.push((
+        dst_drec_key,
+        build_drec_val_with_sibling(file_id, now, dt_type, sibling_id),
+    ));
+    inserts.push((
+        build_sibling_link_key(file_id, sibling_id),
+        build_sibling_link_val(dst_parent_ino, dst_name),
+    ));
+    inserts.push((
+        build_sibling_map_key(sibling_id),
+        build_sibling_map_val(file_id),
+    ));
+
+    let mut updated_inode = inode_val.clone();
+    wr_u32(&mut updated_inode, INODE_NCHILDREN, links.saturating_add(1));
+    wr_u64(&mut updated_inode, INODE_CHANGE_TIME, now);
+    let inode_updates = vec![(inode_key, updated_inode)];
+
+    let FstreeRewrite {
+        omap_tree_paddr: new_omap_tree_paddr,
+        node_delta,
+        reclaim,
+    } = rewrite_fstree_impl(
+        txn,
+        vsb_raw,
+        &omap_node,
+        new_xid,
+        inserts,
+        &removes,
+        Some((dst_parent_ino, 1)),
+        &inode_updates,
+        now,
+        bsz,
+    )?;
+
+    // --- COW the volume omap header (om_tree_oid -> new b-tree paddr). ---
+    let new_vomap_paddr = stage_vomap_header(txn, vol_omap_raw, new_xid, new_omap_tree_paddr, bsz)?;
+
+    // --- Stage the updated (virtual) volume superblock. ---
+    // No new file exists, so apfs_num_files does not move; only the id pool and
+    // the block accounting do.
+    let vsb_oid = rd_u64(vsb_raw, 8);
+    let mut new_vsb = vsb_raw.to_vec();
+    new_vsb.resize(bsz, 0);
+    wr_u64(&mut new_vsb, VSBI_OMAP_OID, new_vomap_paddr);
+    wr_u64(&mut new_vsb, VSBI_NEXT_OBJ_ID, next_obj_id);
+    let frm_correction =
+        free_replaced_metadata(txn, vsb_raw, vol_omap_raw, &omap_node, &[], &reclaim, bsz)?;
+    let fs_alloc = rd_u64(&new_vsb, VSBI_FS_ALLOC_COUNT) as i64;
+    wr_u64(
+        &mut new_vsb,
+        VSBI_FS_ALLOC_COUNT,
+        (fs_alloc + node_delta + frm_correction).max(0) as u64,
+    );
+    wr_u64(&mut new_vsb, VSBI_LAST_MOD_TIME, now);
+    let body = new_vsb.get(32..bsz).unwrap_or(&[]).to_vec();
+    txn.stage_virtual(vsb_oid, OBJECT_TYPE_FS, 0, &body)?;
+    Ok(())
+}
+
 /// Shared orchestration for creating an empty file or directory (no data
 /// stream). Mirrors the M7a snapshot COW commit envelope: the catalog (fsroot)
 /// is a VIRTUAL object resolved through the volume omap, so we COW the catalog
@@ -1061,11 +1967,15 @@ fn create_entry<D: WritableBlockDevice>(
     nchildren: u32,
     bump_dirs: bool,
 ) -> Result<u64, TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, vol_omap_raw)?;
+    let (vsb_raw, vol_omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
     let bsz = txn.nx.block_size as usize;
     let new_xid = txn.xid;
     let now = now_ns();
 
+    validate_entry_name(name)?;
     let new_ino = rd_u64(vsb_raw, VSBI_NEXT_OBJ_ID);
+    ensure_volume_mutable(vsb_raw)?;
     let incompat = rd_u64(vsb_raw, VSBI_INCOMPAT_FEATURES);
     let case_fold = incompat & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
     // Apply NFD unconditionally: modern APFS hashes the normalized form
@@ -1079,12 +1989,27 @@ fn create_entry<D: WritableBlockDevice>(
     let omap_tree_paddr = rd_u64(vol_omap_raw, 48);
     let mut omap_node = vec![0u8; bsz];
     txn.read_block(omap_tree_paddr, &mut omap_node)?;
+    // Reject a name the directory already has - as the volume compares
+    // names, so `FOO` beside `foo` on a case-insensitive volume - before
+    // anything is allocated.
+    let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
+    let drec_key = build_drec_key(parent_ino, name, case_fold, normalize);
+    if drec_exists(
+        txn,
+        &omap_node,
+        root_tree_oid,
+        &drec_key,
+        bsz,
+        case_fold,
+        normalize,
+    )? {
+        return Err(TxnError::AlreadyExists(format!(
+            "'{name}' already exists in directory {parent_ino}"
+        )));
+    }
     // --- Build the new DREC + INODE records and rebuild the FSTREE (splits
     //     into a multi-node b-tree automatically when a leaf would overflow). ---
-    let drec = (
-        build_drec_key(parent_ino, name, case_fold, normalize),
-        build_drec_val(new_ino, now, dt_type),
-    );
+    let drec = (drec_key, build_drec_val(new_ino, now, dt_type));
     let inode = (
         build_inode_key(new_ino),
         build_inode_val(&InodeValArgs {
@@ -1099,7 +2024,11 @@ fn create_entry<D: WritableBlockDevice>(
             dstream: None,
         }),
     );
-    let (new_omap_tree_paddr, node_delta) = rewrite_fstree(
+    let FstreeRewrite {
+        omap_tree_paddr: new_omap_tree_paddr,
+        node_delta,
+        reclaim,
+    } = rewrite_fstree(
         txn,
         vsb_raw,
         &omap_node,
@@ -1112,14 +2041,7 @@ fn create_entry<D: WritableBlockDevice>(
     )?;
 
     // --- COW the volume omap header (om_tree_oid -> new b-tree paddr). ---
-    let new_vomap_paddr = txn.alloc_block()?;
-    let mut new_vomap = vol_omap_raw.to_vec();
-    new_vomap.resize(bsz, 0);
-    wr_u64(&mut new_vomap, 8, new_vomap_paddr);
-    wr_u64(&mut new_vomap, 16, new_xid);
-    wr_u64(&mut new_vomap, 48, new_omap_tree_paddr); // om_tree_oid
-    update_checksum_in_place(&mut new_vomap);
-    txn.stage_raw(new_vomap_paddr, new_vomap);
+    let new_vomap_paddr = stage_vomap_header(txn, vol_omap_raw, new_xid, new_omap_tree_paddr, bsz)?;
 
     // --- Stage the updated (virtual) volume superblock. ---
     let vsb_oid = rd_u64(vsb_raw, 8);
@@ -1136,7 +2058,7 @@ fn create_entry<D: WritableBlockDevice>(
     wr_u64(&mut new_vsb, counter_off, count + 1);
     // Reclaim COW-replaced metadata (create_entry never touches the extentref).
     let frm_correction =
-        free_replaced_metadata(txn, vsb_raw, vol_omap_raw, &omap_node, &[], false, bsz)?;
+        free_replaced_metadata(txn, vsb_raw, vol_omap_raw, &omap_node, &[], &reclaim, bsz)?;
 
     // fs_alloc_count: no data blocks, only the net catalog node delta from the
     // repack (e.g. baseline multi-node catalog collapsing to one node).
@@ -1169,6 +2091,8 @@ pub fn write_file<D: WritableBlockDevice>(
     name: &str,
     content: &[u8],
 ) -> Result<u64, TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, vol_omap_raw)?;
+    let (vsb_raw, vol_omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
     let bsz = txn.nx.block_size as usize;
     if content.is_empty() {
         return Err(TxnError::SpacemanParse(
@@ -1179,7 +2103,9 @@ pub fn write_file<D: WritableBlockDevice>(
     let new_xid = txn.xid;
     let now = now_ns();
 
+    validate_entry_name(name)?;
     let new_ino = rd_u64(vsb_raw, VSBI_NEXT_OBJ_ID);
+    ensure_volume_mutable(vsb_raw)?;
     let incompat = rd_u64(vsb_raw, VSBI_INCOMPAT_FEATURES);
     let case_fold = incompat & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
     // Apply NFD unconditionally: modern APFS hashes the normalized form
@@ -1197,7 +2123,15 @@ pub fn write_file<D: WritableBlockDevice>(
     // Reject a duplicate name BEFORE allocating anything (no leak, no corruption).
     let drec_key = build_drec_key(parent_ino, name, case_fold, normalize);
     let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
-    if drec_exists(txn, &omap_node, root_tree_oid, &drec_key, bsz)? {
+    if drec_exists(
+        txn,
+        &omap_node,
+        root_tree_oid,
+        &drec_key,
+        bsz,
+        case_fold,
+        normalize,
+    )? {
         return Err(TxnError::AlreadyExists(format!(
             "'{name}' already exists in directory {parent_ino}"
         )));
@@ -1239,7 +2173,8 @@ pub fn write_file<D: WritableBlockDevice>(
         ),
         (
             build_inode_key(new_ino),
-            build_inode_val(&InodeValArgs {
+            // Created, then written: two steps of the counter, as under macOS.
+            with_write_generation_step(build_inode_val(&InodeValArgs {
                 parent_id: parent_ino,
                 private_id: new_ino,
                 now_ns: now,
@@ -1252,7 +2187,7 @@ pub fn write_file<D: WritableBlockDevice>(
                     size: content.len() as u64,
                     alloced_size: alloced,
                 }),
-            }),
+            })),
         ),
         (build_dstream_id_key(new_ino), build_dstream_id_val(1)),
     ];
@@ -1263,7 +2198,11 @@ pub fn write_file<D: WritableBlockDevice>(
         ));
     }
     // --- Rebuild the FSTREE (splits automatically) + volume omap. ---
-    let (new_omap_tree_paddr, node_delta) = rewrite_fstree(
+    let FstreeRewrite {
+        omap_tree_paddr: new_omap_tree_paddr,
+        node_delta,
+        reclaim,
+    } = rewrite_fstree(
         txn,
         vsb_raw,
         &omap_node,
@@ -1290,14 +2229,7 @@ pub fn write_file<D: WritableBlockDevice>(
         rewrite_extref_tree(txn, extref_paddr, new_xid, phys_inserts, &[], &[], bsz)?;
 
     // --- COW the volume omap header (om_tree_oid -> rewritten b-tree). ---
-    let new_vomap_paddr = txn.alloc_block()?;
-    let mut new_vomap = vol_omap_raw.to_vec();
-    new_vomap.resize(bsz, 0);
-    wr_u64(&mut new_vomap, 8, new_vomap_paddr);
-    wr_u64(&mut new_vomap, 16, new_xid);
-    wr_u64(&mut new_vomap, 48, new_omap_tree_paddr);
-    update_checksum_in_place(&mut new_vomap);
-    txn.stage_raw(new_vomap_paddr, new_vomap);
+    let new_vomap_paddr = stage_vomap_header(txn, vol_omap_raw, new_xid, new_omap_tree_paddr, bsz)?;
 
     // --- Stage the updated (virtual) volume superblock. ---
     let vsb_oid = rd_u64(vsb_raw, 8);
@@ -1315,7 +2247,7 @@ pub fn write_file<D: WritableBlockDevice>(
         vol_omap_raw,
         &omap_node,
         &old_extref_padrs,
-        false,
+        &reclaim,
         bsz,
     )?;
 
@@ -1346,10 +2278,13 @@ pub fn unlink<D: WritableBlockDevice>(
     parent_ino: u64,
     name: &str,
 ) -> Result<(), TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, vol_omap_raw)?;
+    let (vsb_raw, vol_omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
     let bsz = txn.nx.block_size as usize;
     let new_xid = txn.xid;
     let now = now_ns();
     let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
+    ensure_volume_mutable(vsb_raw)?;
     let incompat = rd_u64(vsb_raw, VSBI_INCOMPAT_FEATURES);
     let case_fold = incompat & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
     // Apply NFD unconditionally: modern APFS hashes the normalized form
@@ -1363,41 +2298,28 @@ pub fn unlink<D: WritableBlockDevice>(
     let omap_tree_paddr = rd_u64(vol_omap_raw, 48);
     let mut omap_node = vec![0u8; bsz];
     txn.read_block(omap_tree_paddr, &mut omap_node)?;
-    let all = collect_fstree(txn, &omap_node, root_tree_oid, bsz)?;
-
     let drec_key = build_drec_key(parent_ino, name, case_fold, normalize);
-    let file_id = all
+    let all = gather_entries(txn, &omap_node, root_tree_oid, &[&drec_key], bsz)?;
+
+    let drec_val = all
         .iter()
         .find(|(k, _)| *k == drec_key)
-        .map(|(_, v)| rd_u64(v, 0))
+        .map(|(_, v)| v.clone())
         .ok_or_else(|| TxnError::SpacemanParse("name not found in directory".into()))?;
+    let file_id = rd_u64(&drec_val, 0);
 
+    let plan = plan_removal(&all, file_id, &drec_val, now, bsz)?;
+    let RemovalPlan {
+        remove_keys: mut plan_keys,
+        data_blocks,
+        updates: inode_updates,
+        is_dir,
+        dir_nchildren,
+        last_name,
+        mode: removed_mode,
+    } = plan;
     let mut remove_keys: Vec<Vec<u8>> = vec![drec_key];
-    // Each extent is (phys_start, block_count) - a FILE_EXTENT can span many
-    // blocks, so we must free the WHOLE run, not just its first block.
-    let mut data_blocks: Vec<(u64, u64)> = Vec::new();
-    let mut is_dir = false;
-    let mut dir_nchildren = 0u32;
-    for (k, v) in &all {
-        let oid = rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF;
-        let ty = rd_u64(k, 0) >> 60;
-        if oid != file_id {
-            continue;
-        }
-        remove_keys.push(k.clone());
-        if ty == APFS_TYPE_INODE {
-            is_dir = (rd_u16(v, 80) & 0o170000) == S_IFDIR;
-            // For a directory inode, nchildren lives at INODE_NCHILDREN.
-            dir_nchildren = rd_u32(v, INODE_NCHILDREN);
-        }
-        if ty == APFS_TYPE_FILE_EXTENT {
-            // j_file_extent_val: len_and_flags (low 56 bits = byte length) @0,
-            // phys_block_num @8. Free every block of the extent.
-            let len_bytes = rd_u64(v, 0) & 0x00FF_FFFF_FFFF_FFFF;
-            let count = len_bytes / bsz as u64;
-            data_blocks.push((rd_u64(v, 8), count));
-        }
-    }
+    remove_keys.append(&mut plan_keys);
 
     // Reject removing a NON-EMPTY directory (POSIX ENOTEMPTY): silently removing
     // it would orphan its children (their DRECs point at a now-gone parent
@@ -1410,7 +2332,11 @@ pub fn unlink<D: WritableBlockDevice>(
     }
 
     // --- Rebuild the FSTREE without the removed records (collapses nodes). ---
-    let (new_omap_tree_paddr, node_delta) = rewrite_fstree(
+    let FstreeRewrite {
+        omap_tree_paddr: new_omap_tree_paddr,
+        node_delta,
+        reclaim,
+    } = rewrite_fstree_impl(
         txn,
         vsb_raw,
         &omap_node,
@@ -1418,6 +2344,7 @@ pub fn unlink<D: WritableBlockDevice>(
         vec![],
         &remove_keys,
         Some((parent_ino, -1)),
+        &inode_updates,
         now,
         bsz,
     )?;
@@ -1445,59 +2372,19 @@ pub fn unlink<D: WritableBlockDevice>(
     let extref_node_delta: i64;
 
     if !data_blocks.is_empty() {
-        // Collect all live extref records for refcnt inspection. [#151: multi-node aware]
-        let (live_recs_pairs, _) = collect_extref_records(txn, old_extref_paddr, bsz)?;
-        let live_recs: Vec<CatRecord> = live_recs_pairs
-            .into_iter()
-            .map(|(k, v)| CatRecord { key: k, val: v })
-            .collect();
-        let live_keys: Vec<Vec<u8>> = live_recs.iter().map(|r| r.key.clone()).collect();
+        // The live extref records the runs cover, for refcnt inspection.
+        let live_recs = extref_records_for_runs(txn, old_extref_paddr, &data_blocks, bsz)?;
 
-        // Classify each extent: refcnt == 1 → remove+free; refcnt > 1 → decrement;
-        // not in live tree → snapshot-pinned, insert a KIND_UPDATE(-1) record.
-        let mut remove_keys_ext: Vec<Vec<u8>> = Vec::new();
-        let mut upsert_recs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // decrements
-        let mut update_inserts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // KIND_UPDATE(-1)
-        let mut owned_runs: Vec<(u64, u64)> = Vec::new();
-
-        for &(phys, count) in &data_blocks {
-            let key = build_phys_ext_key(phys);
-            if !live_keys.contains(&key) {
-                // #149: not in the live extref tree → snapshot-pinned. The live
-                // volume drops a reference: record a KIND_UPDATE(-1) phys_ext
-                // (apfs_create_update_pext); do NOT free (snapshot still owns it).
-                update_inserts.push((key, build_phys_ext_update_val(count, -1)));
-                continue;
-            }
-            // Read the extref val to get current refcnt (bytes 16..20).
-            let refcnt = live_recs
-                .iter()
-                .find(|r| r.key == key)
-                .and_then(|r| r.val.get(16..20))
-                .map(|b| u32::from_le_bytes(b.try_into().unwrap_or([0u8; 4])))
-                .unwrap_or(1);
-            if refcnt <= 1 {
-                // Last reference: remove record and free blocks.
-                remove_keys_ext.push(key);
-                owned_runs.push((phys, count));
-            } else {
-                // Shared block: decrement refcnt, keep blocks allocated.
-                // Rebuild val with refcnt - 1, preserving len_and_kind + owning_obj_id.
-                let new_val = live_recs
-                    .iter()
-                    .find(|r| r.key == key)
-                    .map(|r| {
-                        let mut v = r.val.clone();
-                        if v.len() >= 20 {
-                            let new_rc = (refcnt - 1).to_le_bytes();
-                            v[16..20].copy_from_slice(&new_rc);
-                        }
-                        v
-                    })
-                    .unwrap_or_default();
-                upsert_recs.push((key, new_val));
-            }
-        }
+        // Walk each extent over the records it covers: last reference →
+        // remove + free, shared → lower the count, snapshot-owned (no live
+        // record) → KIND_UPDATE(-1). A sparse hole owns no block and is
+        // skipped by the walk.
+        let ExtrefRelease {
+            remove_keys: remove_keys_ext,
+            upserts: upsert_recs,
+            update_inserts,
+            owned_runs,
+        } = plan_extref_release(&live_recs, &data_blocks)?;
 
         let extref_changed =
             !remove_keys_ext.is_empty() || !upsert_recs.is_empty() || !update_inserts.is_empty();
@@ -1536,14 +2423,7 @@ pub fn unlink<D: WritableBlockDevice>(
     }
 
     // --- COW the volume omap header (om_tree_oid -> rewritten b-tree). ---
-    let new_vomap_paddr = txn.alloc_block()?;
-    let mut new_vomap = vol_omap_raw.to_vec();
-    new_vomap.resize(bsz, 0);
-    wr_u64(&mut new_vomap, 8, new_vomap_paddr);
-    wr_u64(&mut new_vomap, 16, new_xid);
-    wr_u64(&mut new_vomap, 48, new_omap_tree_paddr);
-    update_checksum_in_place(&mut new_vomap);
-    txn.stage_raw(new_vomap_paddr, new_vomap);
+    let new_vomap_paddr = stage_vomap_header(txn, vol_omap_raw, new_xid, new_omap_tree_paddr, bsz)?;
 
     // --- Stage the updated (virtual) volume superblock. ---
     let vsb_oid = rd_u64(vsb_raw, 8);
@@ -1551,20 +2431,22 @@ pub fn unlink<D: WritableBlockDevice>(
     new_vsb.resize(bsz, 0);
     wr_u64(&mut new_vsb, VSBI_OMAP_OID, new_vomap_paddr);
     wr_u64(&mut new_vsb, VSBI_EXTENTREF_TREE_OID, new_extref_paddr);
-    let counter_off = if is_dir {
-        VSBI_NUM_DIRECTORIES
-    } else {
-        VSBI_NUM_FILES
-    };
-    let count = rd_u64(&new_vsb, counter_off);
-    wr_u64(&mut new_vsb, counter_off, count.saturating_sub(1));
+    // The object count only moves when the object itself goes; dropping one of
+    // several names leaves the file, and the volume's file count, in place.
+    // Which count depends on what the inode is: a symlink or a special file
+    // is not among the regular files.
+    if last_name {
+        let counter_off = object_count_offset(removed_mode);
+        let count = rd_u64(&new_vsb, counter_off);
+        wr_u64(&mut new_vsb, counter_off, count.saturating_sub(1));
+    }
     let frm_correction = free_replaced_metadata(
         txn,
         vsb_raw,
         vol_omap_raw,
         &omap_node,
         &old_extref_padrs,
-        false,
+        &reclaim,
         bsz,
     )?;
 
@@ -1622,10 +2504,14 @@ pub fn clone_file<D: WritableBlockDevice>(
     dst_parent_ino: u64,
     dst_name: &str,
 ) -> Result<u64, TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, vol_omap_raw)?;
+    let (vsb_raw, vol_omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
+    validate_entry_name(dst_name)?;
     let bsz = txn.nx.block_size as usize;
     let new_xid = txn.xid;
     let now = now_ns();
     let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
+    ensure_volume_mutable(vsb_raw)?;
     let incompat = rd_u64(vsb_raw, VSBI_INCOMPAT_FEATURES);
     let case_fold = incompat & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
     let normalize = true;
@@ -1636,7 +2522,15 @@ pub fn clone_file<D: WritableBlockDevice>(
 
     // --- Step 1: Reject duplicate destination BEFORE allocating anything. ---
     let dst_drec_key = build_drec_key(dst_parent_ino, dst_name, case_fold, normalize);
-    if drec_exists(txn, &omap_node, root_tree_oid, &dst_drec_key, bsz)? {
+    if drec_exists(
+        txn,
+        &omap_node,
+        root_tree_oid,
+        &dst_drec_key,
+        bsz,
+        case_fold,
+        normalize,
+    )? {
         return Err(TxnError::AlreadyExists(format!(
             "clone_file: destination '{dst_name}' already exists in inode {dst_parent_ino}"
         )));
@@ -1644,7 +2538,7 @@ pub fn clone_file<D: WritableBlockDevice>(
 
     // --- Step 2: Locate source DREC → file_id. ---
     let src_drec_key = build_drec_key(src_parent_ino, src_name, case_fold, normalize);
-    let all = collect_fstree(txn, &omap_node, root_tree_oid, bsz)?;
+    let all = gather_entries(txn, &omap_node, root_tree_oid, &[&src_drec_key], bsz)?;
 
     let src_file_id = all
         .iter()
@@ -1667,18 +2561,28 @@ pub fn clone_file<D: WritableBlockDevice>(
     // offsets 40/48/52 read create-time/internal_flags, so the clone inode got a
     // garbage mode (fsck "Update inode objects" / invalid file-type).]
     let src_mode = rd_u16(&src_inode_val, 80);
-    if src_mode & 0xF000 == S_IFDIR as u16 {
-        return Err(TxnError::InvalidArgument(
-            "clone_file: source is a directory; only regular files may be cloned".into(),
-        ));
+    if src_mode & 0xF000 != S_IFREG {
+        // A directory has no stream to share; a symlink, a FIFO or a device
+        // node would come out as a regular-file entry over a non-regular inode
+        // (a type mismatch fsck rejects) and would be counted as a file.
+        return Err(TxnError::InvalidArgument(format!(
+            "clone_file: source has mode {src_mode:#o}; only regular files may be cloned"
+        )));
     }
+
+    // The source's content is keyed by the stream id its inode names, which
+    // is another inode's id when macOS cloned the source from it.
+    let src_stream_id = match rd_u64(&src_inode_val, INODE_PRIVATE_ID) {
+        0 => src_file_id,
+        id => id,
+    };
 
     // Collect source j_file_extent records sorted by logical offset.
     let mut src_extents: Vec<(u64, u64, u64)> = Vec::new(); // (logical_addr, paddr, len_bytes)
     for (k, v) in &all {
         let oid = rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF;
         let ty = rd_u64(k, 0) >> 60;
-        if oid != src_file_id || ty != APFS_TYPE_FILE_EXTENT {
+        if oid != src_stream_id || ty != APFS_TYPE_FILE_EXTENT {
             continue;
         }
         let logical_addr = rd_u64(k, 8);
@@ -1727,16 +2631,18 @@ pub fn clone_file<D: WritableBlockDevice>(
     // 5a: DREC in destination directory.
     let dst_drec = (dst_drec_key, build_drec_val(new_ino, now, DT_REG));
 
-    // 5b: Clone inode - Apple's clonefile SHARES the source's data stream
-    // (IDA apfs.kext clone_item, an audit pass): the clone inode's private_id points at
-    // the SOURCE's data-stream id, both inodes are marked WAS_CLONED, and the
-    // source's dstream_id refcnt is bumped. The clone creates NO new dstream_id /
-    // file_extent records and does NOT touch the extentref tree. apfs-core
-    // read_file resolves content by inode.private_id, so the clone transparently
-    // reads the shared stream.
+    // 5b: Clone inode. The clone gets its OWN data-stream id (private_id =
+    // new_ino), its OWN DSTREAM_ID and FILE_EXTENT records pointing at the SAME
+    // physical blocks as the source, and the refcount of every shared physical
+    // extent is incremented by one in the extentref tree. Both inodes are marked
+    // WAS_CLONED. unlink / overwrite / truncate already gate every block free on
+    // the physical-extent refcount (free only when it reaches 1), so deleting or
+    // rewriting either side leaves the other intact. [Apple apfs.kext: the
+    // block-free gate is a per-extent refcount; this mirrors write_file's record
+    // layout so the produced image is fsck-clean.]
     let mut clone_inode_val = build_inode_val(&InodeValArgs {
         parent_id: dst_parent_ino,
-        private_id: src_file_id, // SHARE the source's data-stream id
+        private_id: new_ino, // OWN data-stream id
         now_ns: now,
         mode: src_mode,
         nlink_or_nchildren: 1,
@@ -1748,16 +2654,139 @@ pub fn clone_file<D: WritableBlockDevice>(
             alloced_size: src_alloced,
         }),
     });
+    // A clone keeps the source's birth, modification and access times and
+    // gets a change time of its own (measured on macOS with `cp -c` in
+    // `tests/link_clone_times.rs`).
+    for at in [INODE_CREATE_TIME, INODE_MOD_TIME, INODE_ACCESS_TIME] {
+        wr_u64(&mut clone_inode_val, at, rd_u64(&src_inode_val, at));
+    }
     let clone_flags =
         rd_u64(&clone_inode_val, 48) | APFS_INODE_WAS_CLONED | APFS_INODE_WAS_EVER_CLONED;
     wr_u64(&mut clone_inode_val, 48, clone_flags);
-    let new_inode = (build_inode_key(new_ino), clone_inode_val);
+    // The clone gets the same extended attributes, so it has to describe itself
+    // the same way: the BSD flags (UF_COMPRESSED among them), the recorded
+    // uncompressed length, and the pair of bits saying whether there is a
+    // resource fork. A default-built inode says there is none, which fsck
+    // catches the moment one is copied across. The Finder info attribute is
+    // copied too, and so is the bit announcing it ("finder info internal
+    // flag is missing" otherwise).
+    wr_u32(
+        &mut clone_inode_val,
+        INOI_BSD_FLAGS,
+        rd_u32(&src_inode_val, INOI_BSD_FLAGS),
+    );
+    wr_u64(
+        &mut clone_inode_val,
+        INODE_UNCOMPRESSED_SIZE,
+        rd_u64(&src_inode_val, INODE_UNCOMPRESSED_SIZE),
+    );
+    const DESCRIBED_BITS: u64 = INODE_HAS_RSRC_FORK
+        | INODE_NO_RSRC_FORK
+        | INODE_HAS_UNCOMPRESSED_SIZE
+        | INODE_HAS_FINDER_INFO;
+    let described = (rd_u64(&clone_inode_val, INODE_INTERNAL_FLAGS) & !DESCRIBED_BITS)
+        | (rd_u64(&src_inode_val, INODE_INTERNAL_FLAGS) & DESCRIBED_BITS);
+    wr_u64(&mut clone_inode_val, INODE_INTERNAL_FLAGS, described);
+    // A sparse source's clone shares its holes, so it is sparse the same way:
+    // the hole count and the sparse flag come across with the extents.
+    let src_sparse_bytes = apfs_core::inode::parse_unknown_xfields(&src_inode_val)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|x| x.x_type == apfs_core::inode::INO_EXT_TYPE_SPARSE_BYTES)
+        .and_then(|x| {
+            x.data
+                .get(..8)
+                .and_then(|b| b.try_into().ok())
+                .map(u64::from_le_bytes)
+        })
+        .unwrap_or(0);
+    if src_sparse_bytes > 0 {
+        clone_inode_val = rebuild_inode_with_sparse_bytes(
+            &clone_inode_val,
+            dst_name,
+            Some(DstreamArgs {
+                size: src_size,
+                alloced_size: src_alloced,
+            }),
+            src_sparse_bytes,
+            now,
+        );
+    }
 
-    // New records: the clone's DREC + inode only (NO dstream_id / file_extent).
-    let mut new_cat_records: Vec<(Vec<u8>, Vec<u8>)> = vec![dst_drec, new_inode];
+    // New records: clone DREC + inode + its own DSTREAM_ID (refcnt 1) + one
+    // FILE_EXTENT per source extent (same logical offset, length, physical block).
+    let mut new_cat_records: Vec<(Vec<u8>, Vec<u8>)> = vec![
+        dst_drec,
+        (build_inode_key(new_ino), clone_inode_val),
+        (build_dstream_id_key(new_ino), build_dstream_id_val(1)),
+    ];
+    for &(logical_addr, paddr, len_bytes) in &src_extents {
+        new_cat_records.push((
+            build_file_extent_key(new_ino, logical_addr),
+            build_file_extent_val(len_bytes, paddr),
+        ));
+    }
 
-    // Updates to EXISTING records: mark the source inode WAS_CLONED and bump the
-    // source dstream_id refcnt (the new sharer).
+    // The source's extended attributes come across too. A clone that drops them
+    // is not a clone: a compressed file keeps its whole content in one, and a
+    // resource fork is one. An attribute small enough to sit inside its own
+    // record is copied as it is; one that has spilled into a stream gets a
+    // stream id of its own, and its extents point at the same blocks the source
+    // uses, sharing them the same way the file's own extents do.
+    let mut next_obj_id = new_ino + 1;
+    let mut shared_extents = src_extents.clone();
+    {
+        let src_xattrs: Vec<(Vec<u8>, Vec<u8>)> = all
+            .iter()
+            .filter(|(k, _)| {
+                rd_u64(k, 0) >> 60 == APFS_TYPE_XATTR
+                    && rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF == src_file_id
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (src_key, src_val) in src_xattrs {
+            // The key is the header followed by the name; only the header
+            // changes.
+            let mut key = encode_jkey(new_ino, APFS_TYPE_XATTR).to_le_bytes().to_vec();
+            key.extend_from_slice(src_key.get(8..).unwrap_or(&[]));
+
+            if rd_u16(&src_val, 0) & XATTR_DATA_STREAM == 0 {
+                new_cat_records.push((key, src_val));
+                continue;
+            }
+            let src_stream_id = rd_u64(&src_val, 4);
+            let new_stream_id = next_obj_id;
+            next_obj_id += 1;
+            let mut val = src_val.clone();
+            wr_u64(&mut val, 4, new_stream_id);
+            new_cat_records.push((key, val));
+            for (k, v) in &all {
+                if rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF != src_stream_id {
+                    continue;
+                }
+                match rd_u64(k, 0) >> 60 {
+                    // An attribute stream carries no data-stream-id record
+                    // (it is never shared); one on the source is an older
+                    // writer's and is not copied.
+                    APFS_TYPE_DSTREAM_ID => {}
+                    APFS_TYPE_FILE_EXTENT => {
+                        let logical_addr = rd_u64(k, 8);
+                        let len_bytes = rd_u64(v, 0) & 0x00FF_FFFF_FFFF_FFFF;
+                        let paddr = rd_u64(v, 8);
+                        new_cat_records.push((
+                            build_file_extent_key(new_stream_id, logical_addr),
+                            build_file_extent_val(len_bytes, paddr),
+                        ));
+                        shared_extents.push((logical_addr, paddr, len_bytes));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Update the source inode: mark it WAS_CLONED (Apple marks both sides). The
+    // data stream is shared at the physical-extent level, not via dstream_id.
     let mut update_records: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut src_inode_updated = src_inode_val.clone();
     let src_flags =
@@ -1765,25 +2794,14 @@ pub fn clone_file<D: WritableBlockDevice>(
     wr_u64(&mut src_inode_updated, 48, src_flags);
     update_records.push((src_inode_key.clone(), src_inode_updated));
 
-    let src_dsid_key = build_dstream_id_key(src_file_id);
-    match all.iter().find(|(k, _)| *k == src_dsid_key) {
-        Some((_, v)) => {
-            let mut nv = v.clone();
-            let rc = rd_u32(&nv, 0).saturating_add(1);
-            wr_u32(&mut nv, 0, rc);
-            update_records.push((src_dsid_key, nv));
-        }
-        None => {
-            // Source has content but no dstream_id record - create one with
-            // refcnt = 2 (source + clone).
-            new_cat_records.push((src_dsid_key, build_dstream_id_val(2)));
-        }
-    }
-
-    // --- Step 6: Rewrite the fstree (insert clone DREC+inode, bump dst parent,
-    //     update source inode flags + source dstream_id refcnt). ---
+    // --- Step 6: Rewrite the fstree (insert clone records, mark source cloned,
+    //     bump dst parent nchildren). ---
     let parent_patch = Some((dst_parent_ino, 1i64));
-    let (new_omap_tree_paddr, node_delta) = rewrite_fstree_impl(
+    let FstreeRewrite {
+        omap_tree_paddr: new_omap_tree_paddr,
+        node_delta,
+        reclaim,
+    } = rewrite_fstree_impl(
         txn,
         vsb_raw,
         &omap_node,
@@ -1796,34 +2814,62 @@ pub fn clone_file<D: WritableBlockDevice>(
         bsz,
     )?;
 
-    // --- Step 7: COW the volume omap header. (No extentref change: the shared
-    //     physical extents are untouched; only the dstream_id refcnt moved.) ---
-    let new_vomap_paddr = txn.alloc_block()?;
-    let mut new_vomap = vol_omap_raw.to_vec();
-    new_vomap.resize(bsz, 0);
-    wr_u64(&mut new_vomap, 8, new_vomap_paddr);
-    wr_u64(&mut new_vomap, 16, new_xid);
-    wr_u64(&mut new_vomap, 48, new_omap_tree_paddr);
-    update_checksum_in_place(&mut new_vomap);
-    txn.stage_raw(new_vomap_paddr, new_vomap);
+    // --- Step 7: Take one more reference on every shared physical extent so
+    //     that unlink/overwrite/truncate free a block only when its last
+    //     reference is dropped. The release walk with the opposite sign: a run
+    //     can span several records (macOS splits a shared record when it
+    //     rewrites part of a clone), each gains a reference over the part
+    //     inside the run, and a range no live record covers (snapshot-pinned)
+    //     gets a KIND_UPDATE(+1). A sparse hole owns no block and shares
+    //     nothing. ---
+    let old_extref_paddr = rd_u64(vsb_raw, VSBI_EXTENTREF_TREE_OID);
+    let (new_extref_paddr, old_extref_padrs, extref_node_delta) = if shared_extents.is_empty() {
+        (old_extref_paddr, Vec::new(), 0i64)
+    } else {
+        let runs: Vec<(u64, u64)> = shared_extents
+            .iter()
+            .map(|&(_logical, paddr, len_bytes)| (paddr, len_bytes / bsz as u64))
+            .collect();
+        let live_recs = extref_records_for_runs(txn, old_extref_paddr, &runs, bsz)?;
+        let plan = plan_extref_take(&live_recs, &runs)?;
+        rewrite_extref_tree(
+            txn,
+            old_extref_paddr,
+            new_xid,
+            plan.update_inserts,
+            &plan.remove_keys,
+            &plan.upserts,
+            bsz,
+        )?
+    };
 
-    // --- Step 8: Stage the updated volume superblock. ---
+    // --- Step 8: COW the volume omap header. ---
+    let new_vomap_paddr = stage_vomap_header(txn, vol_omap_raw, new_xid, new_omap_tree_paddr, bsz)?;
+
+    // --- Step 9: Stage the updated volume superblock. ---
     let vsb_oid = rd_u64(vsb_raw, 8);
     let mut new_vsb = vsb_raw.to_vec();
     new_vsb.resize(bsz, 0);
     wr_u64(&mut new_vsb, VSBI_OMAP_OID, new_vomap_paddr);
-    wr_u64(&mut new_vsb, VSBI_NEXT_OBJ_ID, new_ino + 1);
+    wr_u64(&mut new_vsb, VSBI_EXTENTREF_TREE_OID, new_extref_paddr);
+    wr_u64(&mut new_vsb, VSBI_NEXT_OBJ_ID, next_obj_id);
     let num_files = rd_u64(&new_vsb, VSBI_NUM_FILES);
     wr_u64(&mut new_vsb, VSBI_NUM_FILES, num_files + 1);
-    // Reclaim old metadata blocks (omap, catalog). The extentref tree is NOT
-    // COW'd by a clone, so it must not be marked freed here.
-    let frm_correction =
-        free_replaced_metadata(txn, vsb_raw, vol_omap_raw, &omap_node, &[], false, bsz)?;
+    // Reclaim COW-replaced metadata (old omap/catalog + old extentref nodes).
+    let frm_correction = free_replaced_metadata(
+        txn,
+        vsb_raw,
+        vol_omap_raw,
+        &omap_node,
+        &old_extref_padrs,
+        &reclaim,
+        bsz,
+    )?;
 
-    // fs_alloc_count: clone adds no data blocks; only the catalog/omap node delta.
-    // frm_correction: sm_fq-pinned old nodes stay counted. [#149 fix]
+    // fs_alloc_count: a clone adds no data blocks; only catalog/omap + extentref
+    // node deltas. frm_correction: sm_fq-pinned old nodes stay counted. [#149]
     let fs_alloc = rd_u64(&new_vsb, VSBI_FS_ALLOC_COUNT) as i64;
-    let new_alloc = (fs_alloc + node_delta + frm_correction).max(0) as u64;
+    let new_alloc = (fs_alloc + node_delta + extref_node_delta + frm_correction).max(0) as u64;
     wr_u64(&mut new_vsb, VSBI_FS_ALLOC_COUNT, new_alloc);
     wr_u64(&mut new_vsb, VSBI_LAST_MOD_TIME, now);
     let body = new_vsb.get(32..bsz).unwrap_or(&[]).to_vec();
@@ -1856,10 +2902,13 @@ pub fn overwrite_existing_file<D: WritableBlockDevice>(
     name: &str,
     new_content: &[u8],
 ) -> Result<(), TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, omap_raw)?;
+    let (vsb_raw, omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
     let bsz = txn.nx.block_size as usize;
     let new_xid = txn.xid;
     let now = now_ns();
     let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
+    ensure_volume_mutable(vsb_raw)?;
     let incompat = rd_u64(vsb_raw, VSBI_INCOMPAT_FEATURES);
     let case_fold = incompat & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
     // Apply NFD unconditionally: modern APFS hashes the normalized form
@@ -1872,30 +2921,44 @@ pub fn overwrite_existing_file<D: WritableBlockDevice>(
     let mut omap_node = vec![0u8; bsz];
     txn.read_block(omap_tree_paddr, &mut omap_node)?;
 
-    // --- Step 3: Collect all fstree catalog records. ---
-    let all = collect_fstree(txn, &omap_node, root_tree_oid, bsz)?;
+    // --- Step 3: Gather the catalog records this write reads. ---
+    let drec_key = build_drec_key(parent_ino, name, case_fold, normalize);
+    let all = gather_entries(txn, &omap_node, root_tree_oid, &[&drec_key], bsz)?;
 
     // --- Step 4: Locate DREC for (parent_ino, name). ---
-    let drec_key = build_drec_key(parent_ino, name, case_fold, normalize);
     let file_id = all
         .iter()
         .find(|(k, _)| *k == drec_key)
         .map(|(_, v)| rd_u64(v, 0) & 0x0FFF_FFFF_FFFF_FFFF)
         .ok_or_else(|| TxnError::NotFound(format!("'{name}' not in parent {parent_ino}")))?;
 
-    // --- Step 6: Scan for inode + extent records for file_id. ---
-    let mut old_inode_val: Option<Vec<u8>> = None;
+    // --- Step 6: Scan for the inode, then for the stream it names. ---
+    // The stream is keyed by the inode's private_id, not by the inode's own
+    // id. The two differ when the file shares a stream with a clone macOS
+    // made, and the stream's own record then counts how many inodes name it.
+    let mut old_inode_val = all
+        .iter()
+        .find(|(k, _)| {
+            rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF == file_id && rd_u64(k, 0) >> 60 == APFS_TYPE_INODE
+        })
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| TxnError::NotFound(format!("inode {file_id} not found")))?;
+    let old_stream_id = match rd_u64(&old_inode_val, INODE_PRIVATE_ID) {
+        0 => file_id,
+        id => id,
+    };
+    let mut old_stream_refcnt: u32 = 1;
     let mut data_blocks: Vec<(u64, u64)> = Vec::new(); // (phys_start, block_count)
     let mut old_extent_logical_addrs: Vec<u64> = Vec::new();
 
     for (k, v) in &all {
         let oid = rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF;
         let ty = rd_u64(k, 0) >> 60;
-        if oid != file_id {
+        if oid != old_stream_id {
             continue;
         }
-        if ty == APFS_TYPE_INODE {
-            old_inode_val = Some(v.clone());
+        if ty == APFS_TYPE_DSTREAM_ID {
+            old_stream_refcnt = rd_u32(v, 0);
         }
         if ty == APFS_TYPE_FILE_EXTENT {
             // j_file_extent_key_t: the key encodes the logical offset in bits 0..63
@@ -1908,8 +2971,100 @@ pub fn overwrite_existing_file<D: WritableBlockDevice>(
         }
     }
 
-    let old_inode_val =
-        old_inode_val.ok_or_else(|| TxnError::NotFound(format!("inode {file_id} not found")))?;
+    // A shared stream is left exactly as it is - its extents, its blocks, its
+    // reference counts - and the file being written gets a stream of its own:
+    // the shared one loses this inode's reference, and the new content goes
+    // under a fresh id that the inode names from now on. Nothing the other
+    // file reads is touched.
+    // [CERTAIN: linux-apfs-rw/inode.c apfs_inode_create_dstream_rec on a
+    //  shared stream: put the shared record, clone the extents under a new
+    //  id, create the new record; apfsprogs/apfsck/extents.c requires the
+    //  stream's count to equal the number of inodes naming it]
+    let stream_shared = old_stream_refcnt > 1;
+    let mut stream_updates: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut fresh_stream_id: Option<u64> = None;
+    let new_stream_id = if !stream_shared {
+        old_stream_id
+    } else {
+        data_blocks.clear();
+        old_extent_logical_addrs.clear();
+        stream_updates.push((
+            build_dstream_id_key(old_stream_id),
+            build_dstream_id_val(old_stream_refcnt - 1),
+        ));
+        if new_content.is_empty() && file_id != old_stream_id {
+            // No content, no stream: the inode names itself, as a file created
+            // empty does.
+            file_id
+        } else {
+            // A fresh id, also for empty content when this inode's own number
+            // IS the shared stream's id: the file a clone was made from lends
+            // its number to the stream, so naming itself here would name the
+            // stream the other file keeps, and the next write into this file
+            // would take that stream for its own and free the other file's
+            // blocks.
+            let id = rd_u64(vsb_raw, VSBI_NEXT_OBJ_ID);
+            fresh_stream_id = Some(id);
+            id
+        }
+    };
+    wr_u64(&mut old_inode_val, INODE_PRIVATE_ID, new_stream_id);
+
+    // A compressed file keeps its content in the com.apple.decmpfs xattr and,
+    // when it does not fit inline, in the resource fork; the data stream holds
+    // none of it. Writing the stream and leaving those in place would leave
+    // every reader returning the old content, so the file stops being
+    // compressed instead: the two xattrs and anything the resource fork owns go
+    // with the old content, and the flag comes off. This is what macOS does on
+    // the first write to a compressed file, minus the decompression - the whole
+    // content is being replaced here, so there is nothing to carry over.
+    let compressed = rd_u32(&old_inode_val, INOI_BSD_FLAGS) & UF_COMPRESSED != 0;
+    let mut decmpfs_remove_keys: Vec<Vec<u8>> = Vec::new();
+    if compressed {
+        let cleared = rd_u32(&old_inode_val, INOI_BSD_FLAGS) & !UF_COMPRESSED;
+        wr_u32(&mut old_inode_val, INOI_BSD_FLAGS, cleared);
+        // The decompressed length the xattr recorded no longer describes
+        // anything once the xattr is gone, and the flags that said the file has
+        // a resource fork and a recorded uncompressed size stop being true.
+        // fsck names both: "need to clear internal_flags 0x4000" and "need to
+        // set flags (0x8000)".
+        wr_u64(&mut old_inode_val, INODE_UNCOMPRESSED_SIZE, 0);
+        let internal = (rd_u64(&old_inode_val, INODE_INTERNAL_FLAGS)
+            & !(INODE_HAS_RSRC_FORK | INODE_HAS_UNCOMPRESSED_SIZE))
+            | INODE_NO_RSRC_FORK;
+        wr_u64(&mut old_inode_val, INODE_INTERNAL_FLAGS, internal);
+
+        let mut stream_ids: Vec<u64> = Vec::new();
+        for name in ["com.apple.decmpfs", "com.apple.ResourceFork"] {
+            let key = build_xattr_key(file_id, name);
+            let Some((_, val)) = all.iter().find(|(k, _)| *k == key) else {
+                continue;
+            };
+            decmpfs_remove_keys.push(key);
+            // A value too big to sit inline lives in its own stream, whose
+            // records are keyed by that stream's id rather than the file's.
+            if rd_u16(val, 0) & XATTR_DATA_STREAM != 0 {
+                stream_ids.push(rd_u64(val, 4));
+            }
+        }
+        for sid in stream_ids {
+            for (k, v) in &all {
+                if rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF != sid {
+                    continue;
+                }
+                match rd_u64(k, 0) >> 60 {
+                    APFS_TYPE_DSTREAM_ID => decmpfs_remove_keys.push(k.clone()),
+                    APFS_TYPE_FILE_EXTENT => {
+                        decmpfs_remove_keys.push(k.clone());
+                        let len_bytes = rd_u64(v, 0) & 0x00FF_FFFF_FFFF_FFFF;
+                        data_blocks.push((rd_u64(v, 8), len_bytes.div_ceil(bsz as u64)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let old_inode_val = old_inode_val;
 
     // Preserve the NAME xfield from the old inode value (the full 92-byte
     // fixed prefix and all other xfields are forwarded via
@@ -1935,44 +3090,24 @@ pub fn overwrite_existing_file<D: WritableBlockDevice>(
     let mut owned_runs_to_free: Vec<(u64, u64)> = Vec::new();
 
     if !data_blocks.is_empty() {
-        let (live_recs_pairs, _) = collect_extref_records(txn, old_extref_paddr, bsz)?;
-        let live_recs: Vec<CatRecord> = live_recs_pairs
-            .into_iter()
-            .map(|(k, v)| CatRecord { key: k, val: v })
-            .collect();
-        for &(phys, count) in &data_blocks {
-            let key = build_phys_ext_key(phys);
-            let rec = match live_recs.iter().find(|r| r.key == key) {
-                Some(r) => r,
-                None => {
-                    extref_update_inserts.push((key, build_phys_ext_update_val(count, -1)));
-                    continue;
-                }
-            };
-            let refcnt = rec
-                .val
-                .get(16..20)
-                .map(|b| u32::from_le_bytes(b.try_into().unwrap_or([0u8; 4])))
-                .unwrap_or(1);
-            if refcnt <= 1 {
-                extref_remove_keys.push(key);
-                owned_runs_to_free.push((phys, count));
-            } else {
-                let mut v = rec.val.clone();
-                if v.len() >= 20 {
-                    v[16..20].copy_from_slice(&(refcnt - 1).to_le_bytes());
-                }
-                extref_upserts.push((key, v));
-            }
-        }
+        let live_recs = extref_records_for_runs(txn, old_extref_paddr, &data_blocks, bsz)?;
+        let release = plan_extref_release(&live_recs, &data_blocks)?;
+        extref_remove_keys = release.remove_keys;
+        extref_upserts = release.upserts;
+        extref_update_inserts = release.update_inserts;
+        owned_runs_to_free = release.owned_runs;
     }
 
-    // --- Step 8: Build remove_keys (inode + dstream_id + file_extents, NOT drec). ---
-    let mut remove_keys: Vec<Vec<u8>> =
-        vec![build_inode_key(file_id), build_dstream_id_key(file_id)];
-    for &logical_addr in &old_extent_logical_addrs {
-        remove_keys.push(build_file_extent_key(file_id, logical_addr));
+    // --- Step 8: Build remove_keys (inode, and the old stream's records when
+    // the stream was this file's alone; NOT the drec). ---
+    let mut remove_keys: Vec<Vec<u8>> = vec![build_inode_key(file_id)];
+    if !stream_shared {
+        remove_keys.push(build_dstream_id_key(old_stream_id));
+        for &logical_addr in &old_extent_logical_addrs {
+            remove_keys.push(build_file_extent_key(old_stream_id, logical_addr));
+        }
     }
+    remove_keys.extend(decmpfs_remove_keys);
 
     // --- Steps 9/10: Build new catalog records and allocate new data blocks. ---
     // Also collect new phys_ext inserts for extref tree.
@@ -1983,7 +3118,15 @@ pub fn overwrite_existing_file<D: WritableBlockDevice>(
         // from the original inode (e.g. DOCUMENT_ID, FINDER_INFO) survive
         // the content-replace operation. [W4-FRAG-1]
         let inode_key = build_inode_key(file_id);
-        let inode_val = rebuild_inode_preserving_unknown(&old_inode_val, old_name_str, None, now);
+        // The new content has no holes: whatever sparse bytes the old stream
+        // had go with it.
+        let inode_val = with_write_generation_step(rebuild_inode_with_sparse_bytes(
+            &old_inode_val,
+            old_name_str,
+            None,
+            0,
+            now,
+        ));
         (vec![(inode_key, inode_val)], 0u64)
     } else {
         // Step 10: allocate new blocks for content.
@@ -1993,16 +3136,24 @@ pub fn overwrite_existing_file<D: WritableBlockDevice>(
         let mut blocks_remaining = num_blocks;
         while blocks_remaining > 0 {
             let (run_start, run_count) = txn.alloc_blocks_run(blocks_remaining)?;
-            for j in 0..run_count {
-                let i = num_blocks - blocks_remaining + j;
-                let p = run_start + j as u64;
-                let mut data = vec![0u8; bsz];
-                let start = i * bsz;
-                let end = ((i + 1) * bsz).min(new_content.len());
-                wr_bytes(&mut data, 0, new_content.get(start..end).unwrap_or(&[]));
-                txn.stage_raw(p, data);
-                paddrs.push(p);
+            if run_count == 0 {
+                return Err(TxnError::NoFreeBlocks);
             }
+            // The run's whole blocks straight from the content, in one
+            // write; a last block the content only partly fills, padded
+            // with zeros.
+            let start = (num_blocks - blocks_remaining) * bsz;
+            let run_end = start + run_count * bsz;
+            let whole_end = (new_content.len() / bsz * bsz).clamp(start, run_end);
+            if whole_end > start {
+                txn.write_new_data(run_start, new_content.get(start..whole_end).unwrap_or(&[]))?;
+            }
+            if whole_end < run_end {
+                let mut tail = vec![0u8; bsz];
+                wr_bytes(&mut tail, 0, new_content.get(whole_end..).unwrap_or(&[]));
+                txn.write_new_data(run_start + ((whole_end - start) / bsz) as u64, &tail)?;
+            }
+            paddrs.extend((0..run_count as u64).map(|j| run_start + j));
             blocks_remaining -= run_count;
         }
         // Group into contiguous runs.
@@ -2018,7 +3169,7 @@ pub fn overwrite_existing_file<D: WritableBlockDevice>(
         for &(_, pstart, cnt) in &runs {
             extref_new_inserts.push((
                 build_phys_ext_key(pstart),
-                build_phys_ext_val(cnt, file_id, 1),
+                build_phys_ext_val(cnt, new_stream_id, 1),
             ));
         }
 
@@ -2026,22 +3177,25 @@ pub fn overwrite_existing_file<D: WritableBlockDevice>(
         let inode_key = build_inode_key(file_id);
         // Use rebuild_inode_preserving_unknown so that unrecognized xfields
         // from the original inode survive the content-replace operation. [W4-FRAG-1]
-        let inode_val = rebuild_inode_preserving_unknown(
+        // Every byte of the new content is backed by a block: no holes, so
+        // no sparse bytes, whatever the old stream had.
+        let inode_val = with_write_generation_step(rebuild_inode_with_sparse_bytes(
             &old_inode_val,
             old_name_str,
             Some(DstreamArgs {
                 size: new_content.len() as u64,
                 alloced_size: alloced,
             }),
+            0,
             now,
-        );
+        ));
         let mut recs = vec![
             (inode_key, inode_val),
-            (build_dstream_id_key(file_id), build_dstream_id_val(1)),
+            (build_dstream_id_key(new_stream_id), build_dstream_id_val(1)),
         ];
         for &(lblk, pstart, cnt) in &runs {
             recs.push((
-                build_file_extent_key(file_id, (lblk * bsz) as u64),
+                build_file_extent_key(new_stream_id, (lblk * bsz) as u64),
                 build_file_extent_val(cnt * bsz as u64, pstart),
             ));
         }
@@ -2076,9 +3230,14 @@ pub fn overwrite_existing_file<D: WritableBlockDevice>(
         (old_extref_paddr, vec![], 0i64)
     };
 
-    // --- Step 11: Rewrite the fstree - remove old records, insert new ones.
-    // Parent nchildren unchanged (file already existed). ---
-    let (new_omap_tree_paddr, node_delta) = rewrite_fstree(
+    // --- Step 11: Rewrite the fstree - remove old records, insert new ones,
+    // and lower a shared stream's count. Parent nchildren unchanged (file
+    // already existed). ---
+    let FstreeRewrite {
+        omap_tree_paddr: new_omap_tree_paddr,
+        node_delta,
+        reclaim,
+    } = rewrite_fstree_impl(
         txn,
         vsb_raw,
         &omap_node,
@@ -2086,19 +3245,13 @@ pub fn overwrite_existing_file<D: WritableBlockDevice>(
         new_records,
         &remove_keys,
         None,
+        &stream_updates,
         now,
         bsz,
     )?;
 
     // --- Step 12: COW the volume omap header. ---
-    let new_vomap_paddr = txn.alloc_block()?;
-    let mut new_vomap = omap_raw.to_vec();
-    new_vomap.resize(bsz, 0);
-    wr_u64(&mut new_vomap, 8, new_vomap_paddr);
-    wr_u64(&mut new_vomap, 16, new_xid);
-    wr_u64(&mut new_vomap, 48, new_omap_tree_paddr);
-    update_checksum_in_place(&mut new_vomap);
-    txn.stage_raw(new_vomap_paddr, new_vomap);
+    let new_vomap_paddr = stage_vomap_header(txn, omap_raw, new_xid, new_omap_tree_paddr, bsz)?;
 
     // --- Step 13+14: Update and stage the volume superblock. ---
     let vsb_oid = rd_u64(vsb_raw, 8);
@@ -2106,6 +3259,11 @@ pub fn overwrite_existing_file<D: WritableBlockDevice>(
     new_vsb.resize(bsz, 0);
     wr_u64(&mut new_vsb, VSBI_OMAP_OID, new_vomap_paddr);
     wr_u64(&mut new_vsb, VSBI_EXTENTREF_TREE_OID, new_extref_paddr);
+    // A stream of its own took an id out of the volume's pool; the counter has
+    // to move past it or the next allocation hands the same id out again.
+    if let Some(id) = fresh_stream_id {
+        wr_u64(&mut new_vsb, VSBI_NEXT_OBJ_ID, id + 1);
+    }
     // --- Step 15: Free COW-replaced metadata. ---
     let frm_correction = free_replaced_metadata(
         txn,
@@ -2113,7 +3271,7 @@ pub fn overwrite_existing_file<D: WritableBlockDevice>(
         omap_raw,
         &omap_node,
         &old_extref_padrs,
-        false,
+        &reclaim,
         bsz,
     )?;
 
@@ -2166,7 +3324,8 @@ fn extract_inode_name(inode_val: &[u8]) -> Option<&str> {
 ///   data area: each field's payload zero-padded to round_up(x_size, 8)
 ///
 /// Fields are emitted in ascending x_type order (NAME=4 first, then unknown
-/// types in their original x_type order, DSTREAM=8 last if present).
+/// types in their original x_type order, DSTREAM=8 last if present) - the
+/// one order this writer keeps; the checker does not require one.
 /// Unknown fields with x_type < 4 are emitted before NAME; those between
 /// NAME and DSTREAM or after DSTREAM are placed in natural sorted order.
 ///
@@ -2203,7 +3362,7 @@ fn build_inode_val_with_xfields(
     // Collect all entries: (x_type, x_flags, payload_slice).
     // name: x_type=4, dstream: x_type=8, unknowns: their x_type.
     let mut entries: Vec<(u8, u8, &[u8])> = Vec::with_capacity(nxf);
-    entries.push((INO_EXT_TYPE_NAME, XF_DATA_DEPENDENT, name_bytes));
+    entries.push((INO_EXT_TYPE_NAME, XF_DO_NOT_COPY, name_bytes));
     if let Some(d) = dstream {
         entries.push((INO_EXT_TYPE_DSTREAM, XF_SYSTEM_FIELD, d));
     }
@@ -2278,34 +3437,50 @@ fn rebuild_inode_with_name(old: &[u8], new_name: &str, now: u64) -> Vec<u8> {
 /// Used by `overwrite_existing_file` and `truncate_file_fast` so that unknown
 /// xfields (DOCUMENT_ID, FINDER_INFO, etc.) are not silently dropped on a
 /// content or size update. [APFS spec: xfield TLV is forward-compatible]
-fn rebuild_inode_preserving_unknown(
+///
+/// `sparse_bytes` is the hole count of the stream being described: the
+/// sparse-bytes xfield is set to it (or removed when it is zero) and the
+/// sparse flag follows, which is the pair fsck checks against each other and
+/// against the hole extents. A caller that just wrote every byte passes zero.
+fn rebuild_inode_with_sparse_bytes(
     old: &[u8],
     name: &str,
     dstream: Option<DstreamArgs>,
+    sparse_bytes: u64,
     now: u64,
 ) -> Vec<u8> {
-    // Parse unknown xfields; on error fall back to empty (no unknown preservation).
-    let unknowns = apfs_core::inode::parse_unknown_xfields(old).unwrap_or_default();
+    let mut unknowns = apfs_core::inode::parse_unknown_xfields(old).unwrap_or_default();
+    unknowns.retain(|x| x.x_type != apfs_core::inode::INO_EXT_TYPE_SPARSE_BYTES);
+    if sparse_bytes > 0 {
+        unknowns.push(apfs_core::inode::UnknownXfield {
+            x_type: apfs_core::inode::INO_EXT_TYPE_SPARSE_BYTES,
+            x_flags: XF_SPARSE_BYTES_FLAGS,
+            data: sparse_bytes.to_le_bytes().to_vec(),
+        });
+    }
 
     let ds_bytes: Option<Vec<u8>> = dstream.map(|ds| {
         let mut b = vec![0u8; DSTREAM_SIZE];
         wr_u64(&mut b, 0, ds.size);
         wr_u64(&mut b, 8, ds.alloced_size);
-        // default_crypto_id @16 = 0
-        wr_u64(&mut b, 24, ds.size); // total_bytes_written = size
-                                     // total_bytes_read @32 = 0
+        wr_u64(&mut b, 24, ds.size);
         b
     });
-
     let mut name_nul = Vec::with_capacity(name.len() + 1);
     name_nul.extend_from_slice(name.as_bytes());
     name_nul.push(0);
 
-    // Copy fixed 92-byte prefix, bump mod_time + change_time.
     let mut prefix = old.get(..92).unwrap_or(&[0u8; 92]).to_vec();
     prefix.resize(92, 0);
     wr_u64(&mut prefix, INODE_MOD_TIME, now);
     wr_u64(&mut prefix, INODE_CHANGE_TIME, now);
+    let flags = rd_u64(&prefix, INODE_INTERNAL_FLAGS);
+    let flags = if sparse_bytes > 0 {
+        flags | INODE_IS_SPARSE
+    } else {
+        flags & !INODE_IS_SPARSE
+    };
+    wr_u64(&mut prefix, INODE_INTERNAL_FLAGS, flags);
 
     build_inode_val_with_xfields(&prefix, &name_nul, ds_bytes.as_deref(), &unknowns)
 }
@@ -2315,22 +3490,9 @@ fn rebuild_inode_preserving_unknown(
 /// Replaces the DREC (new name in the key) and the INODE (NAME xfield updated,
 /// dstream + prefix preserved). The file's DSTREAM_ID / FILE_EXTENT records are
 /// keyed by the unchanged file id and stay untouched. [the APFS specification]
-/// #140: the incremental rename fast path (`incremental_rename_drec`) was
-/// reworked to be fsck-valid and re-enabled. It now (a) edits each touched leaf
-/// by parse + repack through the SAME proven packers as the full rebuild
-/// (`pack_cat_leaf` for the single-node root, `build_fstree_node` for non-root
-/// leaves) instead of fragile in-place byte surgery; (b) falls back to
-/// `rewrite_fstree` whenever a non-root leaf's minimum key (its parent's
-/// separator) would change, it would empty, or it would overflow - so internal
-/// nodes never go stale; and (c) grows the multi-node root's bt_longest_key /
-/// bt_longest_val footer high-water marks when a rename introduces a longer key
-/// or value (an audit pass root cause 1). All blocks are allocated before any are
-/// freed, closing the #138 in-transaction block-reuse window. Gated fsck
-/// regressions: `rename_corruption_138` (single-node) + `rename_multinode_140`
-/// (multi-node). The path still self-falls-back to the full rebuild for
-/// snapshots and multi-level omaps.
-const RENAME_INCREMENTAL_FAST_PATH: bool = true;
-
+/// Like every catalog change, it rewrites only the nodes on the paths to the
+/// records it changes (fsck regressions: `rename_corruption_138`,
+/// `rename_multinode_140`).
 pub fn rename<D: WritableBlockDevice>(
     txn: &mut Transaction<D>,
     vsb_raw: &[u8],
@@ -2340,10 +3502,14 @@ pub fn rename<D: WritableBlockDevice>(
     new_name: &str,
     replace_if_exists: bool,
 ) -> Result<(), TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, vol_omap_raw)?;
+    let (vsb_raw, vol_omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
+    validate_entry_name(new_name)?;
     let bsz = txn.nx.block_size as usize;
     let new_xid = txn.xid;
     let now = now_ns();
     let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
+    ensure_volume_mutable(vsb_raw)?;
     let incompat = rd_u64(vsb_raw, VSBI_INCOMPAT_FEATURES);
     let case_fold = incompat & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
     // Apply NFD unconditionally: modern APFS hashes the normalized form
@@ -2356,10 +3522,17 @@ pub fn rename<D: WritableBlockDevice>(
     let omap_tree_paddr = rd_u64(vol_omap_raw, 48);
     let mut omap_node = vec![0u8; bsz];
     txn.read_block(omap_tree_paddr, &mut omap_node)?;
-    let all = collect_fstree(txn, &omap_node, root_tree_oid, bsz)?;
+    let old_drec_key = build_drec_key(parent_ino, old_name, case_fold, normalize);
+    let new_drec_key = build_drec_key(parent_ino, new_name, case_fold, normalize);
+    let all = gather_entries(
+        txn,
+        &omap_node,
+        root_tree_oid,
+        &[&old_drec_key, &new_drec_key],
+        bsz,
+    )?;
 
     // Locate the old DREC -> file_id + dirent type + date_added.
-    let old_drec_key = build_drec_key(parent_ino, old_name, case_fold, normalize);
     let drec_val = all
         .iter()
         .find(|(k, _)| *k == old_drec_key)
@@ -2376,18 +3549,59 @@ pub fn rename<D: WritableBlockDevice>(
         .find(|(k, _)| *k == inode_key)
         .map(|(_, v)| v.clone())
         .ok_or_else(|| TxnError::SpacemanParse("inode not found".into()))?;
-    let new_inode_val = rebuild_inode_with_name(&old_inode_val, new_name, now);
-    let new_drec_key = build_drec_key(parent_ino, new_name, case_fold, normalize);
+    // A name that is one of several carries the sibling id binding it to the
+    // inode. The renamed entry has to keep it, and the record behind that id
+    // has to be rewritten with the new name - otherwise the entry stops being a
+    // link at all and the record goes on naming something that is gone.
+    let sibling_id = drec_sibling_id(&drec_val);
+    let sibling_updates: Vec<(Vec<u8>, Vec<u8>)> = match sibling_id {
+        Some(sid) => vec![(
+            build_sibling_link_key(file_id, sid),
+            build_sibling_link_val(parent_ino, new_name),
+        )],
+        None => Vec::new(),
+    };
+    // The inode's own name is the primary link's - the one with the lowest
+    // sibling id. Renaming any other name leaves it alone.
+    let renames_primary = match sibling_id {
+        None => true,
+        Some(sid) => {
+            let lowest = all
+                .iter()
+                .filter(|(k, _)| {
+                    rd_u64(k, 0) >> 60 == APFS_TYPE_SIBLING_LINK
+                        && rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF == file_id
+                })
+                .map(|(k, _)| rd_u64(k, 8))
+                .min();
+            lowest == Some(sid)
+        }
+    };
+    let new_inode_val = if renames_primary {
+        rebuild_inode_with_name(&old_inode_val, new_name, now)
+    } else {
+        old_inode_val.clone()
+    };
     let new_drec = (
         new_drec_key.clone(),
-        build_drec_val(file_id, date_added, dt_type),
+        match sibling_id {
+            Some(sid) => build_drec_val_with_sibling(file_id, date_added, dt_type, sid),
+            None => build_drec_val(file_id, date_added, dt_type),
+        },
     );
 
     // Detect an existing target with `new_name`. If found and
     // `replace_if_exists`, collect its records + owned data blocks for the
     // replacement transaction; otherwise return AlreadyExists.
-    let target_replace =
-        collect_replace_target(&all, &new_drec_key, file_id, replace_if_exists, bsz)?;
+    let target_replace = collect_replace_target(
+        &all,
+        &new_drec_key,
+        file_id,
+        replace_if_exists,
+        bsz,
+        case_fold,
+        normalize,
+    )?;
 
     // Build remove_keys including the target's records when replacing.
     let mut remove_keys: Vec<Vec<u8>> = vec![old_drec_key, inode_key.clone()];
@@ -2403,7 +3617,6 @@ pub fn rename<D: WritableBlockDevice>(
     } else {
         0i64
     };
-
     // Free the target's owned data blocks via the live-extref ownership
     // pattern before the catalog rewrite. Snapshot-pinned blocks stay
     // allocated (they remain in some snapshot's frozen extref tree).
@@ -2411,73 +3624,27 @@ pub fn rename<D: WritableBlockDevice>(
     let (new_extref_paddr, extref_old_padrs, extref_node_delta, freed_count) =
         free_blocks_owned_by_live_extref(txn, vsb_raw, new_xid, &data_blocks_to_free, bsz)?;
 
-    // Rebuild the FSTREE: remove old DREC + INODE (+ target records if
+    // Rewrite the FSTREE: remove old DREC + INODE (+ target records if
     // replacing), insert new DREC + INODE.
-    //
-    // M11 fast path: when this is a simple rename (no target replacement, no
-    // parent nchildren change) we try the incremental path first - only the
-    // touched leaf nodes are COW'd, making rename O(log N) instead of
-    // O(catalog).  Falls back to full rebuild when a leaf split is needed,
-    // when a snapshot is present (omap retention is complex), or when the
-    // omap is multi-level.
-    // Whether the incremental fast path actually ran (vs fell back). It governs
-    // whether free_replaced_metadata reclaims the old catalog nodes: the fast
-    // path keeps untouched leaves at their existing paddrs and frees only the
-    // ones it COW'd itself, so a blanket old-catalog reclaim would underallocate.
-    let mut fast_path_taken = false;
-    let (new_omap_tree_paddr, node_delta) =
-        if RENAME_INCREMENTAL_FAST_PATH && target_replace.is_none() && parent_delta == 0 {
-            match incremental_rename_drec(
-                txn,
-                vsb_raw,
-                &omap_node,
-                new_xid,
-                &remove_keys[0], // old_drec_key
-                &new_drec.0,     // new_drec_key
-                &new_drec.1,     // new_drec_val
-                &remove_keys[1], // inode_key
-                &new_inode_val,
-                bsz,
-            )? {
-                Some(result) => {
-                    fast_path_taken = true;
-                    result
-                }
-                None => rewrite_fstree(
-                    txn,
-                    vsb_raw,
-                    &omap_node,
-                    new_xid,
-                    vec![new_drec, (inode_key, new_inode_val)],
-                    &remove_keys,
-                    Some((parent_ino, parent_delta)),
-                    now,
-                    bsz,
-                )?,
-            }
-        } else {
-            rewrite_fstree(
-                txn,
-                vsb_raw,
-                &omap_node,
-                new_xid,
-                vec![new_drec, (inode_key, new_inode_val)],
-                &remove_keys,
-                Some((parent_ino, parent_delta)),
-                now,
-                bsz,
-            )?
-        };
+    let FstreeRewrite {
+        omap_tree_paddr: new_omap_tree_paddr,
+        node_delta,
+        reclaim,
+    } = rewrite_fstree_impl(
+        txn,
+        vsb_raw,
+        &omap_node,
+        new_xid,
+        vec![new_drec, (inode_key, new_inode_val)],
+        &remove_keys,
+        Some((parent_ino, parent_delta)),
+        &sibling_updates,
+        now,
+        bsz,
+    )?;
 
     // COW the volume omap header (om_tree_oid -> rewritten b-tree).
-    let new_vomap_paddr = txn.alloc_block()?;
-    let mut new_vomap = vol_omap_raw.to_vec();
-    new_vomap.resize(bsz, 0);
-    wr_u64(&mut new_vomap, 8, new_vomap_paddr);
-    wr_u64(&mut new_vomap, 16, new_xid);
-    wr_u64(&mut new_vomap, 48, new_omap_tree_paddr);
-    update_checksum_in_place(&mut new_vomap);
-    txn.stage_raw(new_vomap_paddr, new_vomap);
+    let new_vomap_paddr = stage_vomap_header(txn, vol_omap_raw, new_xid, new_omap_tree_paddr, bsz)?;
 
     // Stage the updated (virtual) volume superblock. When a target was
     // replaced we also update the extentref tree pointer and decrement
@@ -2487,22 +3654,18 @@ pub fn rename<D: WritableBlockDevice>(
     new_vsb.resize(bsz, 0);
     wr_u64(&mut new_vsb, VSBI_OMAP_OID, new_vomap_paddr);
     wr_u64(&mut new_vsb, VSBI_EXTENTREF_TREE_OID, new_extref_paddr);
-    if target_replace.is_some() {
-        let num_files = rd_u64(&new_vsb, VSBI_NUM_FILES);
-        wr_u64(&mut new_vsb, VSBI_NUM_FILES, num_files.saturating_sub(1));
+    if let Some(ref tr) = target_replace {
+        uncount_replaced(&mut new_vsb, tr);
     }
     // Reclaim COW-replaced metadata. extref_old_padrs is empty when no data
     // blocks were freed (rename without replace target). [#151]
-    // #140: when the incremental fast path ran it already freed exactly the
-    // catalog leaves it COW'd and kept the rest, so skip the full old-catalog
-    // reclaim (which would underallocate the retained leaves).
     let frm_correction = free_replaced_metadata(
         txn,
         vsb_raw,
         vol_omap_raw,
         &omap_node,
         &extref_old_padrs,
-        fast_path_taken,
+        &reclaim,
         bsz,
     )?;
 
@@ -2528,8 +3691,16 @@ pub fn rename<D: WritableBlockDevice>(
 /// FILE_EXTENT entries) are removed from the fstree; `data_blocks` are
 /// freed against the live-extref tree via [`free_blocks_owned_by_live_extref`].
 struct TargetReplace {
+    /// The target's directory entry and everything its removal takes.
     remove_keys: Vec<Vec<u8>>,
     data_blocks: Vec<(u64, u64)>,
+    /// Records the removal changes rather than removes (a shared stream's
+    /// count, a re-pointed hard-linked inode).
+    updates: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Whether the target's inode itself went, and what kind it was - for the
+    /// volume's per-kind counters.
+    last_name: bool,
+    mode: u16,
 }
 
 /// Look up a target DREC by exact key. If present and `replace_if_exists`,
@@ -2544,8 +3715,12 @@ fn collect_replace_target(
     src_file_id: u64,
     replace_if_exists: bool,
     bsz: usize,
+    case_fold: bool,
+    normalize: bool,
 ) -> Result<Option<TargetReplace>, TxnError> {
-    let target_drec = match all.iter().find(|(k, _)| k.as_slice() == target_drec_key) {
+    // The target is whatever entry the new name collides with as the volume
+    // compares names, not only an entry spelled the same way.
+    let target_drec = match find_drec_collision(all, target_drec_key, case_fold, normalize) {
         Some(x) => x,
         None => return Ok(None),
     };
@@ -2561,36 +3736,284 @@ fn collect_replace_target(
             "rename target exists (inode {target_id}) and REPLACE flag not set"
         )));
     }
-    let mut remove_keys: Vec<Vec<u8>> = vec![target_drec_key.to_vec()];
-    let mut data_blocks: Vec<(u64, u64)> = Vec::new();
-    let mut is_dir = false;
-    let mut nchildren = 0u32;
-    for (k, v) in all {
-        let oid = rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF;
-        let ty = rd_u64(k, 0) >> 60;
-        if oid != target_id {
-            continue;
-        }
-        remove_keys.push(k.clone());
-        if ty == APFS_TYPE_INODE {
-            is_dir = (rd_u16(v, 80) & 0o170000) == S_IFDIR;
-            nchildren = rd_u32(v, INODE_NCHILDREN);
-        }
-        if ty == APFS_TYPE_FILE_EXTENT {
-            let len_bytes = rd_u64(v, 0) & 0x00FF_FFFF_FFFF_FFFF;
-            let count = len_bytes / bsz as u64;
-            data_blocks.push((rd_u64(v, 8), count));
-        }
-    }
-    if is_dir && nchildren > 0 {
+    // Replacing an entry is removing that name, with everything that entails
+    // for a hard link, a clone's shared stream, or an attribute stream.
+    let plan = plan_removal(all, target_id, &target_drec.1, now_ns(), bsz)?;
+    if plan.is_dir && plan.dir_nchildren > 0 {
         return Err(TxnError::DirectoryNotEmpty(format!(
             "rename target inode {target_id} is a non-empty directory"
         )));
     }
+    // The entry to remove is the one found, under the spelling it is stored
+    // with - not the key built from the name being given.
+    let mut remove_keys: Vec<Vec<u8>> = vec![target_drec.0.clone()];
+    remove_keys.extend(plan.remove_keys);
     Ok(Some(TargetReplace {
         remove_keys,
-        data_blocks,
+        data_blocks: plan.data_blocks,
+        updates: plan.updates,
+        last_name: plan.last_name,
+        mode: plan.mode,
     }))
+}
+
+/// `internal_flags` bit: the directory keeps running size and count totals
+/// in a directory-statistics record (`INODE_MAINTAIN_DIR_STATS`), and every
+/// change under it has to update that record and its ancestors' records.
+const INODE_MAINTAIN_DIR_STATS: u64 = 0x0000_0002;
+
+/// Refuse to change the contents of a directory that maintains directory
+/// statistics. Its counts live in a separate record that macOS updates on
+/// every create, remove, clone and move, together with the records of its
+/// ancestors; patching the inode's child count alone would leave the
+/// statistics stale, which fsck reports. Such directories are rare (nothing
+/// a stock macOS makes on an external volume carries the flag), so refusing
+/// the change, with the reason, is the honest answer until the statistics
+/// are maintained too.
+fn refuse_dir_stats(parent_inode_val: &[u8], parent_ino: u64) -> Result<(), TxnError> {
+    if parent_inode_val.len() >= INODE_INTERNAL_FLAGS + 8
+        && rd_u64(parent_inode_val, INODE_INTERNAL_FLAGS) & INODE_MAINTAIN_DIR_STATS != 0
+    {
+        return Err(TxnError::Unsupported(format!(
+            "directory {parent_ino} maintains directory statistics, which this writer does \
+             not update yet; changing its contents would leave them stale"
+        )));
+    }
+    Ok(())
+}
+
+/// What releasing a file's data runs does to the live extentref tree.
+struct ExtrefRelease {
+    /// Records that vanish: their whole range was the last reference.
+    remove_keys: Vec<Vec<u8>>,
+    /// Records rewritten in place (a lowered count, a shortened range) and the
+    /// new records a split leaves beside them.
+    upserts: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Ranges no live record covers: the volume withdraws one reference from a
+    /// range a snapshot owns (a KIND_UPDATE record with delta -1).
+    update_inserts: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Block runs nothing references any more, to be freed.
+    owned_runs: Vec<(u64, u64)>,
+}
+
+/// Low 60 bits of `len_and_kind`: the record's block count.
+const PHYS_EXT_LEN_MASK: u64 = 0x0FFF_FFFF_FFFF_FFFF;
+
+/// The same record value over a different number of blocks.
+pub(crate) fn phys_ext_with_blocks(val: &[u8], blocks: u64) -> Vec<u8> {
+    let kind = rd_u64(val, 0) & !PHYS_EXT_LEN_MASK;
+    let mut v = val.to_vec();
+    if let Some(head) = v.get_mut(..8) {
+        head.copy_from_slice(&(kind | (blocks & PHYS_EXT_LEN_MASK)).to_le_bytes());
+    }
+    v
+}
+
+/// Plan the release of `runs` (physical block runs of one file) against the
+/// live extentref records, the way Apple and linux-apfs-rw do it: as a walk
+/// over the physical range, not a lookup of the run's first block.
+///
+/// A reference record covers a range of blocks, and a file's extent need not
+/// coincide with one record: when macOS rewrites part of a clone it splits the
+/// shared record at the rewritten range, so the original file's single extent
+/// then spans three records (shared, no longer shared, shared). For every
+/// piece of a run the covering record is split at the run's edges, the piece
+/// inside the run loses one reference (freed when it was the last, lowered
+/// otherwise, a KIND_UPDATE delta lowered likewise), and the pieces outside
+/// keep their record unchanged under new keys. A piece no record covers is a
+/// range a snapshot owns, and gets a KIND_UPDATE(-1) of exactly its length.
+fn plan_extref_release(
+    live_recs: &[CatRecord],
+    runs: &[(u64, u64)],
+) -> Result<ExtrefRelease, TxnError> {
+    plan_extref_change(live_recs, runs, -1)
+}
+
+/// [`plan_extref_release`] of `runs` against the live extentref tree at
+/// `extref_paddr`. No runs, nothing to read: an empty plan.
+/// The live extent-reference records [`plan_extref_change`] reads for `runs`:
+/// each run's covering record and every record starting inside it. A
+/// transaction asked to rebuild in full reads the whole tree instead, the
+/// reference this narrower read is checked against.
+fn extref_records_for_runs<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    root: u64,
+    runs: &[(u64, u64)],
+    bsz: usize,
+) -> Result<Vec<CatRecord>, TxnError> {
+    let pairs = if txn.full_rebuild() {
+        collect_extref_records(txn, root, bsz)?.0
+    } else {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for &(phys, count) in runs {
+            if is_sparse_hole(phys) || count == 0 {
+                continue;
+            }
+            let end = phys.saturating_add(count);
+            for (k, v) in cow_tree::extref_covering(txn, root, phys, end, bsz)? {
+                if seen.insert(k.clone()) {
+                    out.push((k, v));
+                }
+            }
+        }
+        out
+    };
+    Ok(pairs
+        .into_iter()
+        .map(|(key, val)| CatRecord { key, val })
+        .collect())
+}
+
+fn release_runs<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    extref_paddr: u64,
+    runs: &[(u64, u64)],
+    bsz: usize,
+) -> Result<ExtrefRelease, TxnError> {
+    if runs.is_empty() {
+        return Ok(ExtrefRelease {
+            remove_keys: Vec::new(),
+            upserts: Vec::new(),
+            update_inserts: Vec::new(),
+            owned_runs: Vec::new(),
+        });
+    }
+    let live_recs = extref_records_for_runs(txn, extref_paddr, runs, bsz)?;
+    plan_extref_release(&live_recs, runs)
+}
+
+/// Plan taking one more reference on `runs` (a clone sharing a file's
+/// blocks): the same walk as [`plan_extref_release`] with the opposite sign.
+/// Every record a run spans gains a reference over the part inside the run,
+/// split at the run's edges, and a piece no record covers (a range a
+/// snapshot owns) gets a KIND_UPDATE(+1) of exactly its length. Nothing is
+/// freed.
+fn plan_extref_take(
+    live_recs: &[CatRecord],
+    runs: &[(u64, u64)],
+) -> Result<ExtrefRelease, TxnError> {
+    plan_extref_change(live_recs, runs, 1)
+}
+
+/// The walk behind [`plan_extref_release`] (`diff` = -1) and
+/// [`plan_extref_take`] (`diff` = +1).
+fn plan_extref_change(
+    live_recs: &[CatRecord],
+    runs: &[(u64, u64)],
+    diff: i32,
+) -> Result<ExtrefRelease, TxnError> {
+    use std::collections::BTreeMap;
+    // start block -> (block count, record value)
+    let mut current: BTreeMap<u64, (u64, Vec<u8>)> = BTreeMap::new();
+    for r in live_recs {
+        if r.key.len() < 8 || (rd_u64(&r.key, 0) >> 60) != APFS_TYPE_EXTENT {
+            continue;
+        }
+        if r.val.len() < 20 {
+            return Err(TxnError::SpacemanParse(
+                "extentref record value shorter than 20 bytes".into(),
+            ));
+        }
+        let start = rd_u64(&r.key, 0) & PHYS_EXT_LEN_MASK;
+        let blocks = rd_u64(&r.val, 0) & PHYS_EXT_LEN_MASK;
+        current.insert(start, (blocks, r.val.clone()));
+    }
+    let original = current.clone();
+
+    let mut update_inserts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut owned_runs: Vec<(u64, u64)> = Vec::new();
+    for &(phys, count) in runs {
+        if is_sparse_hole(phys) || count == 0 {
+            continue;
+        }
+        let end = phys.saturating_add(count);
+        let mut cur = phys;
+        while cur < end {
+            let covering = current
+                .range(..=cur)
+                .next_back()
+                .filter(|(start, (blocks, _))| start.saturating_add(*blocks) > cur)
+                .map(|(start, _)| *start);
+            let Some(start) = covering else {
+                let next_start = current.range(cur + 1..).next().map(|(s, _)| *s);
+                let gap_end = next_start.map_or(end, |s| s.min(end));
+                update_inserts.push((
+                    build_phys_ext_key(cur),
+                    build_phys_ext_update_val(gap_end - cur, diff),
+                ));
+                cur = gap_end;
+                continue;
+            };
+            let (blocks, val) = match current.remove(&start) {
+                Some(rec) => rec,
+                None => break,
+            };
+            let rec_end = start.saturating_add(blocks);
+            let seg_end = end.min(rec_end);
+            if start < cur {
+                current.insert(
+                    start,
+                    (cur - start, phys_ext_with_blocks(&val, cur - start)),
+                );
+            }
+            let len = seg_end - cur;
+            if phys_ext_kind(&val) == APFS_KIND_UPDATE {
+                let delta = phys_ext_update_delta(&val).saturating_add(diff);
+                if delta != 0 {
+                    current.insert(cur, (len, build_phys_ext_update_val(len, delta)));
+                }
+            } else {
+                let refcnt = phys_ext_refcnt(&val);
+                let new_refcnt = i64::from(refcnt) + i64::from(diff);
+                if new_refcnt <= 0 {
+                    owned_runs.push((cur, len));
+                } else {
+                    let new_refcnt = u32::try_from(new_refcnt).map_err(|_| {
+                        TxnError::SpacemanParse(format!(
+                            "extent ({cur} + {len}) reference count overflows"
+                        ))
+                    })?;
+                    let mut v = phys_ext_with_blocks(&val, len);
+                    if let Some(rc) = v.get_mut(16..20) {
+                        rc.copy_from_slice(&new_refcnt.to_le_bytes());
+                    }
+                    current.insert(cur, (len, v));
+                }
+            }
+            if seg_end < rec_end {
+                current.insert(
+                    seg_end,
+                    (
+                        rec_end - seg_end,
+                        phys_ext_with_blocks(&val, rec_end - seg_end),
+                    ),
+                );
+            }
+            cur = seg_end;
+        }
+    }
+
+    let mut remove_keys: Vec<Vec<u8>> = Vec::new();
+    let mut upserts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for (start, (_, val)) in &original {
+        match current.get(start) {
+            None => remove_keys.push(build_phys_ext_key(*start)),
+            Some((_, now)) if now != val => upserts.push((build_phys_ext_key(*start), now.clone())),
+            Some(_) => {}
+        }
+    }
+    for (start, (_, val)) in &current {
+        if !original.contains_key(start) {
+            upserts.push((build_phys_ext_key(*start), val.clone()));
+        }
+    }
+    Ok(ExtrefRelease {
+        remove_keys,
+        upserts,
+        update_inserts,
+        owned_runs,
+    })
 }
 
 /// Free `data_blocks` against the live extref tree, COW'ing the extref node
@@ -2612,45 +4035,18 @@ fn free_blocks_owned_by_live_extref<D: WritableBlockDevice>(
     if data_blocks.is_empty() {
         return Ok((old_extref_paddr, vec![], 0, 0));
     }
-    // Collect live records (multi-node aware). [#151]
-    let (live_recs_pairs, _) = collect_extref_records(txn, old_extref_paddr, bsz)?;
-    let live_recs: Vec<CatRecord> = live_recs_pairs
-        .into_iter()
-        .map(|(k, v)| CatRecord { key: k, val: v })
-        .collect();
+    // The live records the runs cover (multi-node aware). [#151]
+    let live_recs = extref_records_for_runs(txn, old_extref_paddr, data_blocks, bsz)?;
 
-    // Classify: refcnt==1 → remove+free; refcnt>1 → decrement; absent → KIND_UPDATE(-1).
-    let mut remove_keys: Vec<Vec<u8>> = Vec::new();
-    let mut owned_runs: Vec<(u64, u64)> = Vec::new();
-    let mut upsert_recs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut update_inserts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-
-    for &(phys, count) in data_blocks {
-        let key = build_phys_ext_key(phys);
-        let rec = match live_recs.iter().find(|r| r.key == key) {
-            Some(r) => r,
-            None => {
-                // #149: snapshot-pinned (absent from live tree) → KIND_UPDATE(-1).
-                update_inserts.push((key, build_phys_ext_update_val(count, -1)));
-                continue;
-            }
-        };
-        let refcnt = rec
-            .val
-            .get(16..20)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap_or([0u8; 4])))
-            .unwrap_or(1);
-        if refcnt <= 1 {
-            remove_keys.push(key);
-            owned_runs.push((phys, count));
-        } else {
-            let mut v = rec.val.clone();
-            if v.len() >= 20 {
-                v[16..20].copy_from_slice(&(refcnt - 1).to_le_bytes());
-            }
-            upsert_recs.push((key, v));
-        }
-    }
+    // Walk the runs over the records they cover (a run may span several,
+    // or sit inside one): last reference → remove + free, shared → lower,
+    // snapshot-owned → KIND_UPDATE(-1).
+    let ExtrefRelease {
+        remove_keys,
+        upserts: upsert_recs,
+        update_inserts,
+        owned_runs,
+    } = plan_extref_release(&live_recs, data_blocks)?;
 
     if remove_keys.is_empty() && upsert_recs.is_empty() && update_inserts.is_empty() {
         return Ok((old_extref_paddr, vec![], 0, 0));
@@ -2676,33 +4072,138 @@ fn free_blocks_owned_by_live_extref<D: WritableBlockDevice>(
     Ok((new_extref_paddr, old_extref_padrs, node_delta, total))
 }
 
+/// Sizes inside a fixed-kv object-map node: a 4-byte `kvoff_t` per record in
+/// the table of contents, 16-byte keys, 16-byte leaf values and 8-byte index
+/// values (a child's physical block address).
+const OMAP_TOC_ENTRY: usize = 4;
+const OMAP_KEY_SIZE: usize = 16;
+const OMAP_LEAF_VAL_SIZE: usize = 16;
+const OMAP_INDEX_VAL_SIZE: usize = 8;
+/// Deeper than any object map macOS writes; a longer chain is a cycle or a
+/// corrupt image, and with every child one level below its parent the level
+/// of the root already bounds the descent.
+const MAX_OMAP_TREE_DEPTH: u32 = 32;
+
+/// The bounds a fixed-kv object-map node's records are read within.
+struct OmapNodeLayout {
+    nkeys: usize,
+    toc_base: usize,
+    key_area: usize,
+    val_area_end: usize,
+}
+
+/// Validate the table-of-contents geometry of a fixed-kv object-map node.
+///
+/// The record count, the table position and the flags all come from disk.
+/// The count is capped by what the table can hold, so it never sizes an
+/// allocation or drives an offset on its own; the key area has to end before
+/// the value area starts; and the accessors check every key and value offset
+/// against those bounds, so a crafted node yields an error instead of an
+/// arithmetic panic or bytes read from the wrong place.
+fn omap_node_layout(node: &[u8], bsz: usize) -> Result<OmapNodeLayout, TxnError> {
+    if node.len() < bsz || bsz < DATA_BASE + BTREE_INFO_SIZE {
+        return Err(TxnError::OmapParse(format!(
+            "omap node of {} bytes is shorter than a {bsz}-byte block",
+            node.len()
+        )));
+    }
+    let is_root = rd_u16(node, 32) & BTNODE_ROOT != 0;
+    let nkeys = rd_u32(node, 36) as usize;
+    let toc_base = DATA_BASE + rd_u16(node, 40) as usize;
+    let toc_len = rd_u16(node, 42) as usize;
+    let key_area = toc_base + toc_len;
+    let val_area_end = bsz - if is_root { BTREE_INFO_SIZE } else { 0 };
+    if key_area > val_area_end {
+        return Err(TxnError::OmapParse(
+            "omap node table of contents runs past the node".into(),
+        ));
+    }
+    let capacity = toc_len / OMAP_TOC_ENTRY;
+    if nkeys > capacity {
+        return Err(TxnError::OmapParse(format!(
+            "omap node claims {nkeys} records but its table holds {capacity}"
+        )));
+    }
+    Ok(OmapNodeLayout {
+        nkeys,
+        toc_base,
+        key_area,
+        val_area_end,
+    })
+}
+
+impl OmapNodeLayout {
+    /// Start of record `i`'s 16-byte key, which lies inside the key area.
+    fn key_at(&self, node: &[u8], i: usize) -> Result<usize, TxnError> {
+        let k = self.key_area + rd_u16(node, self.toc_base + i * OMAP_TOC_ENTRY) as usize;
+        if k + OMAP_KEY_SIZE > self.val_area_end {
+            return Err(TxnError::OmapParse(format!(
+                "omap record {i}: key lies outside the key area"
+            )));
+        }
+        Ok(k)
+    }
+
+    /// Start of record `i`'s `vsz`-byte value, stored `v_off` bytes back from
+    /// the value area end; a value lies between the key area and that end.
+    fn val_at(&self, node: &[u8], i: usize, vsz: usize) -> Result<usize, TxnError> {
+        let v_off = rd_u16(node, self.toc_base + i * OMAP_TOC_ENTRY + 2) as usize;
+        self.val_area_end
+            .checked_sub(v_off)
+            .filter(|&v| v >= self.key_area && v + vsz <= self.val_area_end)
+            .ok_or_else(|| {
+                TxnError::OmapParse(format!(
+                    "omap record {i}: value lies outside the value area"
+                ))
+            })
+    }
+}
+
+/// Check that the block at `paddr`, named as a child by an omap node at
+/// `parent_level`, is an object-map B-tree node one level below it, and
+/// return its level. apfsprogs checks the same three things (type, subtype,
+/// level) on every node it descends into.
+fn omap_child_level(child: &[u8], paddr: u64, parent_level: u16) -> Result<u16, TxnError> {
+    let o_type = rd_u32(child, 24) & 0x0000_FFFF;
+    if o_type != OBJECT_TYPE_BTREE_NODE {
+        return Err(TxnError::OmapParse(format!(
+            "block {paddr} named as an omap child is not a B-tree node (type {o_type:#x})"
+        )));
+    }
+    let subtype = rd_u32(child, 28);
+    if subtype != OBJECT_TYPE_OMAP {
+        return Err(TxnError::OmapParse(format!(
+            "block {paddr} named as an omap child belongs to another tree (subtype {subtype:#x})"
+        )));
+    }
+    let level = rd_u16(child, 34);
+    if level.checked_add(1) != Some(parent_level) {
+        return Err(TxnError::OmapParse(format!(
+            "omap node {paddr} is at level {level} under a level-{parent_level} parent"
+        )));
+    }
+    Ok(level)
+}
+
 /// Find the physical paddr mapped to `oid` (latest xid) in a fixed-kv volume
 /// omap b-tree leaf node.
-fn omap_lookup(node: &[u8], oid: u64, bsz: usize) -> Option<u64> {
-    let nkeys = rd_u32(node, 36) as usize;
-    let toc_off = rd_u16(node, 40) as usize;
-    let toc_len = rd_u16(node, 42) as usize;
-    let is_root = rd_u16(node, 32) & 0x1 != 0;
-    let key_area = DATA_BASE + toc_off + toc_len;
-    let val_area_end = bsz - if is_root { BTREE_INFO_SIZE } else { 0 };
+#[cfg(test)]
+fn omap_lookup(node: &[u8], oid: u64, bsz: usize) -> Result<Option<u64>, TxnError> {
+    let layout = omap_node_layout(node, bsz)?;
     let mut best: Option<(u64, u64)> = None; // (xid, paddr)
-    for i in 0..nkeys {
-        let te = DATA_BASE + toc_off + i * 4;
-        let k_off = rd_u16(node, te) as usize;
-        let v_off = rd_u16(node, te + 2) as usize;
-        let k = key_area + k_off;
-        let k_oid = rd_u64(node, k);
-        let k_xid = rd_u64(node, k + 8);
-        if k_oid != oid {
+    for i in 0..layout.nkeys {
+        let k = layout.key_at(node, i)?;
+        if rd_u64(node, k) != oid {
             continue;
         }
-        let v = val_area_end - v_off;
+        let k_xid = rd_u64(node, k + 8);
+        let v = layout.val_at(node, i, OMAP_LEAF_VAL_SIZE)?;
         let paddr = rd_u64(node, v + 8);
         if best.map(|(x, _)| k_xid > x).unwrap_or(true) {
             best = Some((k_xid, paddr));
         }
     }
-    best.map(|(_, p)| p)
+    Ok(best.map(|(_, p)| p))
 }
 
 /// omap_val.ov_flags bit: this {oid,xid} mapping is a tombstone (deleted).
@@ -2732,22 +4233,24 @@ fn omap_resolve<D: WritableBlockDevice>(
     bsz: usize,
 ) -> Result<Option<u64>, TxnError> {
     let mut node = root_node.to_vec();
-    for _ in 0..32 {
-        let is_leaf = rd_u16(&node, 34) == 0;
-        let nkeys = rd_u32(&node, 36) as usize;
-        let toc_off = rd_u16(&node, 40) as usize;
-        let toc_len = rd_u16(&node, 42) as usize;
-        let is_root = rd_u16(&node, 32) & BTNODE_ROOT != 0;
-        let key_area = DATA_BASE + toc_off + toc_len;
-        let val_area_end = bsz - if is_root { BTREE_INFO_SIZE } else { 0 };
+    let mut level = rd_u16(&node, 34);
+    // Every child is one level below its parent and no block is visited
+    // twice, so a pointer loop is reported instead of followed.
+    let mut visited: HashSet<u64> = HashSet::new();
+    for _ in 0..MAX_OMAP_TREE_DEPTH {
+        let is_leaf = level == 0;
+        let layout = omap_node_layout(&node, bsz)?;
+        let vsz = if is_leaf {
+            OMAP_LEAF_VAL_SIZE
+        } else {
+            OMAP_INDEX_VAL_SIZE
+        };
 
         // Find the best entry. Index: largest (oid,xid) <= (target). Leaf: the
         // matching oid with the largest xid <= target_xid.
         let mut best: Option<(u64, u64, usize)> = None; // (k_oid, k_xid, idx)
-        for i in 0..nkeys {
-            let te = DATA_BASE + toc_off + i * 4; // kvoff_t (4-byte TOC)
-            let k_off = rd_u16(&node, te) as usize;
-            let k = key_area + k_off;
+        for i in 0..layout.nkeys {
+            let k = layout.key_at(&node, i)?;
             let k_oid = rd_u64(&node, k);
             let k_xid = rd_u64(&node, k + 8);
             if is_leaf {
@@ -2770,9 +4273,7 @@ fn omap_resolve<D: WritableBlockDevice>(
         let Some((_, _, idx)) = best else {
             return Ok(None);
         };
-        let te = DATA_BASE + toc_off + idx * 4;
-        let v_off = rd_u16(&node, te + 2) as usize;
-        let v = val_area_end - v_off;
+        let v = layout.val_at(&node, idx, vsz)?;
         if is_leaf {
             // omap_val: ov_flags@v (u32), ov_size@v+4, ov_paddr@v+8.
             if rd_u32(&node, v) & OMAP_VAL_DELETED != 0 {
@@ -2782,11 +4283,19 @@ fn omap_resolve<D: WritableBlockDevice>(
         }
         // Index value is an 8-byte PHYSICAL child paddr.
         let child = rd_u64(&node, v);
+        if !visited.insert(child) {
+            return Err(TxnError::OmapParse(format!(
+                "omap node {child} is reached twice: the tree has a cycle"
+            )));
+        }
         let mut buf = vec![0u8; bsz];
         txn.read_block(child, &mut buf)?;
+        level = omap_child_level(&buf, child, level)?;
         node = buf;
     }
-    Ok(None)
+    Err(TxnError::OmapParse(format!(
+        "omap tree is deeper than {MAX_OMAP_TREE_DEPTH} levels"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -2807,16 +4316,9 @@ fn omap_resolve<D: WritableBlockDevice>(
 //     construction). They are RETAINED as `#[cfg(test)]` reference primitives -
 //     their unit tests document the exact variable-kv leaf byte layout - but no
 //     production path calls them.
-//   • find_leaf_with_key: walk the fstree from root to the leaf that owns
-//     a given key.  Returns (leaf_oid, leaf_node_bytes, leaf_paddr).
-//   • patch_omap_entry: replace a single {oid → paddr} mapping in the
-//     volume-omap node bytes (no full rebuild needed when only one node
-//     changed and the omap is a single-node root).
-//   • incremental_rename_drec: orchestrates remove-old-drec + insert-new-
-//     drec + update-inode-name across the minimal set of touched leaves,
-//     COWs each touched leaf, updates the omap, returns new omap paddr.
-//     Falls back to None when a leaf split would be needed (rare) so the
-//     caller can use rewrite_fstree instead.
+//   • patch_omap_entry: a test helper that patches one mapping of a
+//     single-node object map.
+//   Production edits go through the path-local writer in `cow_tree`.
 // ---------------------------------------------------------------------------
 
 /// Remove the record whose key bytes exactly equal `key` from a variable-kv
@@ -3131,73 +4633,39 @@ fn leaf_insert_record(node: &mut Vec<u8>, key: &[u8], val: &[u8]) -> bool {
     true
 }
 
-/// Result of a leaf-search: the leaf node's virtual oid, physical address, and
-/// raw bytes.
-struct LeafLocation {
-    oid: u64,
-    paddr: u64,
-    node: Vec<u8>,
+/// The level of catalog-shaped node `oid` (a catalog or extentref node),
+/// checked to be a B-tree node one level below `parent_level` when it was
+/// reached through a parent. Every walk over such a tree applies this rule,
+/// so a pointer that leads sideways or back up is reported, not followed.
+fn fstree_child_level(node: &[u8], oid: u64, parent_level: Option<u16>) -> Result<u16, TxnError> {
+    let level = rd_u16(node, 34);
+    let Some(parent) = parent_level else {
+        return Ok(level);
+    };
+    let o_type = rd_u32(node, 24) & 0x0000_FFFF;
+    if o_type != OBJECT_TYPE_BTREE_NODE {
+        return Err(TxnError::VolumeParse(format!(
+            "tree node {oid:#x} named as a child is not a B-tree node (type {o_type:#x})"
+        )));
+    }
+    if level.checked_add(1) != Some(parent) {
+        return Err(TxnError::VolumeParse(format!(
+            "tree node {oid:#x} is at level {level} under a level-{parent} parent"
+        )));
+    }
+    Ok(level)
 }
 
-/// Walk the fstree from its virtual root (resolving through the omap) down to
-/// the leaf that would contain `key`.  For a single-level root|leaf the root
-/// itself is returned.  Returns `None` if the tree has no level where the key
-/// could live (empty tree or parse error).
-///
-/// Only reads the path from root to the target leaf - O(log N) disk reads.
-fn find_leaf_with_key<D: WritableBlockDevice>(
-    txn: &mut Transaction<D>,
-    omap_node: &[u8],
-    root_oid: u64,
-    key: &[u8],
-    bsz: usize,
-) -> Result<Option<LeafLocation>, TxnError> {
-    let mut oid = root_oid;
-    loop {
-        let paddr = match omap_lookup(omap_node, oid, bsz) {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-        let mut node = vec![0u8; bsz];
-        txn.read_block(paddr, &mut node)?;
-        let level = rd_u16(&node, 34);
-        if level == 0 {
-            // Leaf node - this is where key lives (or should live).
-            return Ok(Some(LeafLocation { oid, paddr, node }));
-        }
-        // Internal node: find the child whose pivot key is <= target key.
-        let nkeys = rd_u32(&node, 36) as usize;
-        let toc_off = rd_u16(&node, 40) as usize;
-        let toc_len = rd_u16(&node, 42) as usize;
-        let key_area = DATA_BASE + toc_off + toc_len;
-        let is_root = rd_u16(&node, 32) & BTNODE_ROOT != 0;
-        let val_area_end = bsz - if is_root { BTREE_INFO_SIZE } else { 0 };
+fn fstree_cycle(oid: u64) -> TxnError {
+    TxnError::VolumeParse(format!(
+        "tree node {oid:#x} is reached twice: the tree has a cycle"
+    ))
+}
 
-        // Internal vals are 8-byte child oids.  Walk entries finding the last
-        // pivot <= key (rightmost entry whose key <= target).
-        let mut chosen_oid = 0u64;
-        for i in 0..nkeys {
-            let te = DATA_BASE + toc_off + i * 8;
-            let k_off = rd_u16(&node, te) as usize;
-            let k_len = rd_u16(&node, te + 2) as usize;
-            let v_off = rd_u16(&node, te + 4) as usize;
-            let ks = key_area + k_off;
-            let pivot = match node.get(ks..ks + k_len) {
-                Some(s) => s,
-                None => break,
-            };
-            let child_oid = rd_u64(&node, val_area_end - v_off);
-            if cat_key_cmp(pivot, key) != core::cmp::Ordering::Greater {
-                chosen_oid = child_oid;
-            } else {
-                break;
-            }
-        }
-        if chosen_oid == 0 {
-            return Ok(None);
-        }
-        oid = chosen_oid;
-    }
+fn fstree_too_deep() -> TxnError {
+    TxnError::VolumeParse(format!(
+        "tree is deeper than {MAX_TREE_DEPTH} levels (possible cycle or corruption)"
+    ))
 }
 
 /// Patch a single `{oid → paddr}` entry in the volume-omap node bytes
@@ -3207,339 +4675,27 @@ fn find_leaf_with_key<D: WritableBlockDevice>(
 ///
 /// NOTE: only safe when the omap is a single fixed-kv root node.  Multi-node
 /// omaps (very large volumes) are not handled here.
+#[cfg(test)]
 fn patch_omap_entry(
     omap_node: &mut Vec<u8>,
     oid: u64,
     new_paddr: u64,
     new_xid: u64,
     bsz: usize,
-) -> bool {
-    let nkeys = rd_u32(omap_node, 36) as usize;
-    let toc_off = rd_u16(omap_node, 40) as usize;
-    let toc_len = rd_u16(omap_node, 42) as usize;
-    let is_root = rd_u16(omap_node, 32) & BTNODE_ROOT != 0;
-    let key_area = DATA_BASE + toc_off + toc_len;
-    let val_area_end = bsz - if is_root { BTREE_INFO_SIZE } else { 0 };
-
-    for i in 0..nkeys {
-        let te = DATA_BASE + toc_off + i * 4; // omap uses kvoff_t (4-byte TOC entries)
-        let k_off = rd_u16(omap_node, te) as usize;
-        let v_off = rd_u16(omap_node, te + 2) as usize;
-        let k = key_area + k_off;
-        let entry_oid = rd_u64(omap_node, k);
-        if entry_oid != oid {
+) -> Result<bool, TxnError> {
+    let layout = omap_node_layout(omap_node, bsz)?;
+    for i in 0..layout.nkeys {
+        let k = layout.key_at(omap_node, i)?;
+        if rd_u64(omap_node, k) != oid {
             continue;
         }
+        let v = layout.val_at(omap_node, i, OMAP_LEAF_VAL_SIZE)?;
         // Update xid in key and paddr in val.
         wr_u64(omap_node, k + 8, new_xid);
-        let v = val_area_end - v_off;
         wr_u64(omap_node, v + 8, new_paddr); // ov_paddr at offset 8 within omap_val
-        return true;
+        return Ok(true);
     }
-    false
-}
-
-/// One catalog leaf touched by an incremental rename, plus the record-level
-/// edits to apply to it. Several logical edits (remove old drec, insert new
-/// drec, replace inode) may resolve to the SAME physical leaf; they are merged
-/// here so each leaf is parsed, edited, and COW'd exactly once.
-struct LeafWork {
-    oid: u64,
-    old_paddr: u64,
-    node: Vec<u8>,
-    removes: Vec<Vec<u8>>,
-    inserts: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
-/// Return the index of the `LeafWork` for `loc.oid`, pushing a fresh entry if
-/// this leaf has not been seen yet.
-fn leafwork_idx(work: &mut Vec<LeafWork>, loc: &LeafLocation) -> usize {
-    if let Some(i) = work.iter().position(|w| w.oid == loc.oid) {
-        return i;
-    }
-    work.push(LeafWork {
-        oid: loc.oid,
-        old_paddr: loc.paddr,
-        node: loc.node.clone(),
-        removes: Vec::new(),
-        inserts: Vec::new(),
-    });
-    work.len() - 1
-}
-
-/// Apply `removes` + `inserts` to one catalog leaf and re-pack it with the SAME
-/// proven packers the full-rebuild path uses, so the result is byte-identical to
-/// `rewrite_fstree`'s output (fsck-valid by construction - this is the #140
-/// "parse + repack" approach that replaces the earlier byte-surgery leaf ops).
-///
-/// Returns:
-///   - `Ok(Some(node))` - the re-packed, re-checksummed leaf (`o_xid = new_xid`);
-///   - `Ok(None)` - caller must fall back to `rewrite_fstree` because the edit
-///     would (a) overflow a single node, (b) empty a NON-root leaf, or (c) change
-///     a NON-root leaf's minimum key.
-///
-/// fstree is a virtual-oid B-tree: internal nodes reference children by OID and
-/// the omap resolves OID→paddr, so COWing a leaf needs only a new paddr + an omap
-/// patch - the parent stays valid AS LONG AS the leaf's minimum key (the parent's
-/// separator) is unchanged. Case (c) enforces that invariant, which the original
-/// (gated-off) fast path lacked. [#140]
-fn repack_cat_leaf_edited(
-    node: &[u8],
-    removes: &[Vec<u8>],
-    inserts: &[(Vec<u8>, Vec<u8>)],
-    new_xid: u64,
-    bsz: usize,
-) -> Result<Option<Vec<u8>>, TxnError> {
-    let is_root = rd_u16(node, 32) & BTNODE_ROOT != 0;
-    let oid = rd_u64(node, 8);
-    let mut recs = parse_cat_leaf(node).map_err(|m| TxnError::SpacemanParse(m.into()))?;
-    let old_min = recs.first().map(|r| r.key.clone());
-    recs.retain(|r| !removes.iter().any(|k| k.as_slice() == r.key.as_slice()));
-    for (k, v) in inserts {
-        recs.push(CatRecord {
-            key: k.clone(),
-            val: v.clone(),
-        });
-    }
-    recs.sort_by(|a, b| cat_key_cmp(&a.key, &b.key));
-
-    // (b)/(c): a non-root leaf must stay non-empty AND keep its minimum key, or
-    // the internal nodes above would need rewriting (outside the fast path).
-    if !is_root {
-        match recs.first() {
-            None => return Ok(None),
-            Some(first) => {
-                if old_min.as_deref() != Some(first.key.as_slice()) {
-                    return Ok(None);
-                }
-            }
-        }
-    }
-
-    // (a): build_fstree_node does NOT range-check; pack_cat_leaf reports overflow
-    // via Err. Unify on one explicit capacity test up front.
-    let used: usize = recs.iter().map(|r| 8 + r.key.len() + r.val.len()).sum();
-    if used > node_capacity(bsz, is_root) {
-        return Ok(None);
-    }
-
-    let mut out = if is_root {
-        // Single-node tree: the leaf IS the root (BTNODE_ROOT + btree_info
-        // footer). pack_cat_leaf preserves the footer and recomputes longest_*.
-        match pack_cat_leaf(node, recs) {
-            Ok(n) => n,
-            Err(_) => return Ok(None),
-        }
-    } else {
-        // Non-root leaf: rebuild via the proven node packer (no footer,
-        // OBJ_VIRTUAL | BTREE_NODE), byte-identical to rewrite_fstree's leaves.
-        let kv: Vec<(Vec<u8>, Vec<u8>)> = recs.into_iter().map(|r| (r.key, r.val)).collect();
-        build_fstree_node(oid, new_xid, false, 0, &kv, None, bsz)
-    };
-    // pack_cat_leaf copies the source header verbatim (old o_xid); build_fstree_node
-    // already stamped new_xid. Normalise o_xid + (re)checksum on both paths.
-    wr_u64(&mut out, 16, new_xid);
-    update_checksum_in_place(&mut out);
-    Ok(Some(out))
-}
-
-/// Incremental rename: modify only the leaf node(s) that contain the affected
-/// drec + inode records, COW each touched leaf, patch the volume omap, return
-/// the new omap paddr.
-///
-/// Returns `Ok(None)` when any touched leaf lacks space for the insert (split
-/// needed) - the caller must fall back to `rewrite_fstree`.
-/// Returns `Ok(Some(new_omap_paddr, node_delta))` on success.
-///
-/// Operations performed:
-///   1. Find the leaf containing `old_drec_key`, remove it, insert
-///      `new_drec_key`/`new_drec_val`.  If old and new drec land in different
-///      leaves (cross-leaf rename - split boundary fell between them) we
-///      perform two separate leaf COWs.
-///   2. Find the leaf containing `inode_key`, replace its value with
-///      `new_inode_val`.
-///   3. COW each touched leaf (alloc_block + stage_raw), patch omap entry.
-///   4. Build a fresh omap node from the updated triples and return its paddr.
-///
-/// [CERTAIN: algorithm derived from APFS PDF B-tree spec §B-Trees +
-///  linux-apfs-rw btree.c apfs_btree_insert/remove/replace pattern]
-#[allow(clippy::too_many_arguments)]
-fn incremental_rename_drec<D: WritableBlockDevice>(
-    txn: &mut Transaction<D>,
-    vsb_raw: &[u8],
-    omap_node: &[u8],
-    new_xid: u64,
-    old_drec_key: &[u8],
-    new_drec_key: &[u8],
-    new_drec_val: &[u8],
-    inode_key: &[u8],
-    new_inode_val: &[u8],
-    bsz: usize,
-) -> Result<Option<(u64, i64)>, TxnError> {
-    let root_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
-    let has_snapshot = rd_u64(vsb_raw, VSBI_NUM_SNAPSHOTS) > 0;
-
-    // Incremental path is only safe on single-node omaps (root = leaf) - multi-
-    // node omaps require a full omap rebuild which we don't implement here.
-    // Detect by checking that the omap node itself is the root *and* leaf.
-    let omap_level = rd_u16(omap_node, 34);
-    if omap_level != 0 {
-        // Multi-level omap: fall back to full rebuild.
-        return Ok(None);
-    }
-
-    // Snapshots require careful omap retention - fall back to rewrite_fstree
-    // which has the full snapshot-pinning logic.
-    if has_snapshot {
-        return Ok(None);
-    }
-
-    // 1. Resolve the (up to three) leaves involved and merge edits that land on
-    //    the same physical leaf, so each leaf is parsed/edited/COW'd exactly once.
-    //    - old_drec_key  : removed from its leaf
-    //    - new_drec_key  : inserted into the leaf where it sorts (may differ)
-    //    - inode_key     : value replaced in its leaf (key is stable)
-    let drec_old_leaf = match find_leaf_with_key(txn, omap_node, root_oid, old_drec_key, bsz)? {
-        Some(l) => l,
-        None => return Ok(None),
-    };
-    let drec_new_leaf = match find_leaf_with_key(txn, omap_node, root_oid, new_drec_key, bsz)? {
-        Some(l) => l,
-        None => return Ok(None),
-    };
-    let inode_leaf = match find_leaf_with_key(txn, omap_node, root_oid, inode_key, bsz)? {
-        Some(l) => l,
-        None => return Ok(None),
-    };
-
-    let mut work: Vec<LeafWork> = Vec::with_capacity(3);
-    let i = leafwork_idx(&mut work, &drec_old_leaf);
-    work[i].removes.push(old_drec_key.to_vec());
-    let i = leafwork_idx(&mut work, &drec_new_leaf);
-    work[i]
-        .inserts
-        .push((new_drec_key.to_vec(), new_drec_val.to_vec()));
-    let i = leafwork_idx(&mut work, &inode_leaf);
-    work[i].removes.push(inode_key.to_vec());
-    work[i]
-        .inserts
-        .push((inode_key.to_vec(), new_inode_val.to_vec()));
-
-    // 2. Re-pack every touched leaf with the proven packers as a PURE pass -
-    //    NO allocation yet. repack_cat_leaf_edited returns None (→ fall back to
-    //    rewrite_fstree) on overflow, an emptied non-root leaf, or a changed
-    //    non-root min key. Allocating before we know ALL leaves repack would
-    //    strand the already-allocated blocks when a later leaf bails (the
-    //    fallback never references them), leaking them as fsck "overallocation".
-    //    So gather all new node bytes first; allocate only past the commit point.
-    //    [#140 - an audit pass root cause 2: the original fast path allocated as it went]
-    let mut repacked: Vec<(u64, u64, Vec<u8>)> = Vec::with_capacity(work.len()); // (oid, old_paddr, node)
-    for w in &work {
-        match repack_cat_leaf_edited(&w.node, &w.removes, &w.inserts, new_xid, bsz)? {
-            Some(n) => repacked.push((w.oid, w.old_paddr, n)),
-            None => return Ok(None),
-        }
-    }
-
-    // Prepare (still PURE) the multi-node root btree_info footer COW. The root
-    // carries bt_longest_key / bt_longest_val high-water marks over the whole
-    // tree ("the longest that has ever been stored"). A rename can introduce a
-    // drec key or inode value longer than any current record; the untouched root
-    // footer would then understate the longest and fsck rejects the tree
-    // ("invalid bt_longest_key … fsroot tree is invalid"). Single-node trees are
-    // the root-leaf already handled above by pack_cat_leaf (recomputes the
-    // footer). [#140 an audit pass root cause 1]
-    let root_paddr = match omap_lookup(omap_node, root_oid, bsz) {
-        Some(p) => p,
-        None => return Ok(None),
-    };
-    let mut root_node = vec![0u8; bsz];
-    txn.read_block(root_paddr, &mut root_node)?;
-    let root_cow: Option<Vec<u8>> = if rd_u16(&root_node, 34) > 0 {
-        let bti = bsz - BTREE_INFO_SIZE;
-        let cur_lk = rd_u32(&root_node, bti + 16);
-        let cur_lv = rd_u32(&root_node, bti + 20);
-        let new_lk = cur_lk.max(new_drec_key.len() as u32);
-        // Cover EVERY value this rename inserts into the tree: the inode value
-        // and the drec value. (drec values are a fixed-size struct already at or
-        // below the existing high-water in any multi-node tree, but guard both so
-        // the invariant holds structurally, not by coincidence.) [#140 review]
-        let new_lv = cur_lv
-            .max(new_inode_val.len() as u32)
-            .max(new_drec_val.len() as u32);
-        if new_lk != cur_lk || new_lv != cur_lv {
-            wr_u32(&mut root_node, bti + 16, new_lk);
-            wr_u32(&mut root_node, bti + 20, new_lv);
-            wr_u64(&mut root_node, 16, new_xid);
-            update_checksum_in_place(&mut root_node);
-            Some(root_node)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // 3. COMMIT POINT: every leaf re-packed and the root footer prepared, so no
-    //    further bail is possible. NOW allocate + stage each new block and record
-    //    its omap patch (oid → new paddr) and the old paddr to free.
-    let mut omap_patches: Vec<(u64, u64)> = Vec::with_capacity(repacked.len() + 1);
-    let mut old_paddrs: Vec<u64> = Vec::with_capacity(repacked.len() + 1);
-    for (oid, old_paddr, new_node) in repacked {
-        let p = txn.alloc_block()?;
-        txn.stage_raw(p, new_node);
-        omap_patches.push((oid, p));
-        old_paddrs.push(old_paddr);
-    }
-    if let Some(rn) = root_cow {
-        let rp = txn.alloc_block()?;
-        txn.stage_raw(rp, rn);
-        omap_patches.push((root_oid, rp));
-        old_paddrs.push(root_paddr);
-    }
-
-    // 4. Incremental omap update: patch the single-node volume omap in place for
-    //    every COW'd object, then COW the omap node itself. Only changed entries
-    //    are touched - no full B-tree rebuild. Falls back to a full omap rebuild
-    //    if a patch target is missing (should not happen for live objects, but we
-    //    never panic). [CERTAIN: APFS PDF §Object Maps + linux-apfs-rw object_map.c]
-    let new_omap_paddr = txn.alloc_block()?;
-    let mut patched_omap = omap_node.to_vec();
-    let mut all_patched = true;
-    for (oid, new_paddr) in &omap_patches {
-        if !patch_omap_entry(&mut patched_omap, *oid, *new_paddr, new_xid, bsz) {
-            all_patched = false;
-            break;
-        }
-    }
-    if all_patched {
-        // Update the omap node's own o_oid + o_xid and re-checksum.
-        wr_u64(&mut patched_omap, 8, new_omap_paddr);
-        wr_u64(&mut patched_omap, 16, new_xid);
-        update_checksum_in_place(&mut patched_omap);
-        txn.stage_raw(new_omap_paddr, patched_omap);
-    } else {
-        let mut triples = parse_omap_entries(omap_node, bsz);
-        for (patch_oid, patch_paddr) in &omap_patches {
-            for t in triples.iter_mut() {
-                if t.0 == *patch_oid {
-                    t.1 = new_xid;
-                    t.2 = *patch_paddr;
-                }
-            }
-        }
-        let fallback_omap = build_omap_node(omap_node, &triples, new_omap_paddr, new_xid, bsz);
-        txn.stage_raw(new_omap_paddr, fallback_omap);
-    }
-
-    // 5. Free the superseded blocks LAST - after every allocation above - so a
-    //    deferred-or-not free can never hand a just-freed block back to an
-    //    alloc_block in this same transaction (the #138 block-reuse class).
-    for p in &old_paddrs {
-        txn.free_block(*p)?;
-    }
-
-    Ok(Some((new_omap_paddr, 0i64))) // node_delta = 0 (same node count)
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -3618,9 +4774,20 @@ pub fn build_fstree_node(
     wr_u16(&mut out, 48, BTOFF_INVALID);
     wr_u16(&mut out, 52, BTOFF_INVALID);
 
-    let toc_len = nkeys * 8;
-    let key_area = DATA_BASE + toc_len;
+    // The table of contents is whole steps of entries (see TOC_STEP), one
+    // step for an emptied node: a table of length zero is rejected outright
+    // ("invalid btn_table_space.len"). Every caller sizes a node by
+    // node_capacity, which keeps room for the rounding; a set of records
+    // that only fits with an exact table (a caller that did not) still gets
+    // one rather than an overflowing node.
     let val_area_end = bsz - if is_root { BTREE_INFO_SIZE } else { 0 };
+    let kv_bytes: usize = recs.iter().map(|(k, v)| k.len() + v.len()).sum();
+    let toc_len = if DATA_BASE + fstree_toc_len(nkeys) + kv_bytes <= val_area_end {
+        fstree_toc_len(nkeys)
+    } else {
+        nkeys * 8
+    };
+    let key_area = DATA_BASE + toc_len;
     let mut key_cursor = key_area;
     let mut val_cursor = val_area_end;
     for (i, (key, val)) in recs.iter().enumerate() {
@@ -3660,19 +4827,45 @@ pub fn packed_size(recs: &[(Vec<u8>, Vec<u8>)]) -> usize {
     recs.iter().map(|(k, v)| 8 + k.len() + v.len()).sum()
 }
 
-/// Maximum record bytes that fit in a node body.
+/// Maximum record bytes that fit in a node body, keeping room to round the
+/// table of contents up to a whole number of [`TOC_STEP`] entries.
 pub fn node_capacity(bsz: usize, is_root: bool) -> usize {
-    bsz - DATA_BASE - if is_root { BTREE_INFO_SIZE } else { 0 }
+    bsz - DATA_BASE - if is_root { BTREE_INFO_SIZE } else { 0 } - (TOC_STEP - 1) * 8
+}
+
+/// A variable-size node's table of contents holds a whole number of steps of
+/// this many entries. macOS grows a table by such steps and counts on it:
+/// rebalancing a node whose table was cut to its exact record count, it
+/// moved records between siblings without moving the parent's separator,
+/// and every lookup past that separator failed (fsck: "invalid key order:
+/// index N is greater than maxkey"; measured: macOS removing 200 files we
+/// wrote in one directory left 6 it could list but not open).
+/// [linux-apfs-rw: APFS_BTREE_TOC_ENTRY_INCREMENT; macOS-written nodes keep
+///  0-7 spare entries]
+const TOC_STEP: usize = 8;
+
+/// The table of contents for `nkeys` variable-size entries: whole steps of
+/// [`TOC_STEP`] entries, at least one step even when empty (a table of
+/// length zero is rejected).
+fn fstree_toc_len(nkeys: usize) -> usize {
+    nkeys.max(1).div_ceil(TOC_STEP) * TOC_STEP * 8
 }
 
 /// Greedily split `recs` into chunks each packing within `cap` bytes
-/// (TOC + key + value per record). Order is preserved.
-fn partition_records(recs: &[CatRec], cap: usize) -> Vec<Vec<CatRec>> {
+/// (TOC + key + value per record). Order is preserved. A record that does
+/// not fit a node on its own is an error: a chunk of it alone would be
+/// packed past the node's end.
+fn partition_records(recs: &[CatRec], cap: usize) -> Result<Vec<Vec<CatRec>>, TxnError> {
     let mut out: Vec<Vec<CatRec>> = Vec::new();
     let mut cur: Vec<CatRec> = Vec::new();
     let mut sz = 0usize;
     for (k, v) in recs {
         let rsz = 8 + k.len() + v.len();
+        if rsz > cap {
+            return Err(TxnError::InvalidArgument(format!(
+                "a record of {rsz} bytes does not fit a node of {cap}"
+            )));
+        }
         if sz + rsz > cap && !cur.is_empty() {
             out.push(std::mem::take(&mut cur));
             sz = 0;
@@ -3683,7 +4876,7 @@ fn partition_records(recs: &[CatRec], cap: usize) -> Vec<Vec<CatRec>> {
     if !cur.is_empty() {
         out.push(cur);
     }
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -3739,9 +4932,20 @@ fn build_extref_node(
     wr_u16(&mut out, 48, BTOFF_INVALID);
     wr_u16(&mut out, 52, BTOFF_INVALID);
 
-    let toc_len = nkeys * 8;
-    let key_area = DATA_BASE + toc_len;
+    // The table of contents is whole steps of entries (see TOC_STEP), one
+    // step for an emptied node: a table of length zero is rejected outright
+    // ("invalid btn_table_space.len"). Every caller sizes a node by
+    // node_capacity, which keeps room for the rounding; a set of records
+    // that only fits with an exact table (a caller that did not) still gets
+    // one rather than an overflowing node.
     let val_area_end = bsz - if is_root { BTREE_INFO_SIZE } else { 0 };
+    let kv_bytes: usize = recs.iter().map(|(k, v)| k.len() + v.len()).sum();
+    let toc_len = if DATA_BASE + fstree_toc_len(nkeys) + kv_bytes <= val_area_end {
+        fstree_toc_len(nkeys)
+    } else {
+        nkeys * 8
+    };
+    let key_area = DATA_BASE + toc_len;
     let mut key_cursor = key_area;
     let mut val_cursor = val_area_end;
     for (i, (key, val)) in recs.iter().enumerate() {
@@ -3779,28 +4983,60 @@ fn build_extref_node(
 /// collecting every leaf (key, value) record and every physical node address
 /// (for later freeing). Handles single-node (root+leaf) and multi-level trees.
 /// [linux-apfs-rw:extents.c apfs_insert_phys_extent APFS_OBJ_PHYSICAL path]
-fn collect_extref_records<D: WritableBlockDevice>(
+pub(crate) fn collect_extref_records<D: WritableBlockDevice>(
     txn: &mut Transaction<D>,
     root_paddr: u64,
     bsz: usize,
 ) -> Result<(Vec<CatRec>, Vec<u64>), TxnError> {
     let mut leaf_recs: Vec<CatRec> = Vec::new();
     let mut all_padrs: Vec<u64> = Vec::new();
-    collect_extref_node(txn, root_paddr, bsz, &mut leaf_recs, &mut all_padrs)?;
+    let mut visited = HashSet::new();
+    collect_extref_node(
+        txn,
+        root_paddr,
+        bsz,
+        &mut leaf_recs,
+        &mut all_padrs,
+        &mut visited,
+        None,
+        0,
+    )?;
     Ok((leaf_recs, all_padrs))
 }
 
+/// Maximum catalog / extentref B-tree depth. Real trees are only a few levels
+/// deep; a deeper chain (or a cycle in crafted child pointers) means a
+/// malformed image, which must not be allowed to recurse until the stack
+/// overflows.
+const MAX_TREE_DEPTH: u32 = 64;
+
+/// One node of the extentref walk. A repeated child (the same physical block
+/// named twice) would have its records collected twice, and a child at the
+/// wrong level is a pointer into some other part of the tree; both are
+/// errors rather than re-walks.
+#[allow(clippy::too_many_arguments)]
 fn collect_extref_node<D: WritableBlockDevice>(
     txn: &mut Transaction<D>,
     paddr: u64,
     bsz: usize,
     leaf_recs: &mut Vec<CatRec>,
     all_padrs: &mut Vec<u64>,
+    visited: &mut HashSet<u64>,
+    parent_level: Option<u16>,
+    depth: u32,
 ) -> Result<(), TxnError> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(TxnError::SpacemanParse(
+            "extref tree exceeds maximum depth (possible cycle or corruption)".into(),
+        ));
+    }
+    if !visited.insert(paddr) {
+        return Err(fstree_cycle(paddr));
+    }
     all_padrs.push(paddr);
     let mut node = vec![0u8; bsz];
     txn.read_block(paddr, &mut node)?;
-    let level = rd_u16(&node, 34);
+    let level = fstree_child_level(&node, paddr, parent_level)?;
     let recs = parse_cat_leaf(&node).map_err(|e| TxnError::SpacemanParse(e.into()))?;
     if level == 0 {
         // Leaf: collect records directly.
@@ -3816,7 +5052,16 @@ fn collect_extref_node<D: WritableBlockDevice>(
                 .ok_or_else(|| {
                     TxnError::SpacemanParse("extref internal node: short child paddr".into())
                 })?;
-            collect_extref_node(txn, child_paddr, bsz, leaf_recs, all_padrs)?;
+            collect_extref_node(
+                txn,
+                child_paddr,
+                bsz,
+                leaf_recs,
+                all_padrs,
+                visited,
+                Some(level),
+                depth + 1,
+            )?;
         }
     }
     Ok(())
@@ -3867,7 +5112,7 @@ fn build_extref_tree<D: WritableBlockDevice>(
         let mut new_padrs: Vec<u64> = Vec::new();
         let mut parent_entries: Vec<(Vec<u8>, u64)> = Vec::new(); // (pivot_key, child_paddr)
 
-        for chunk in partition_records(&recs, cap) {
+        for chunk in partition_records(&recs, cap)? {
             let p = txn.alloc_block()?;
             txn.stage_raw(p, build_extref_node(p, xid, false, 0, &chunk, None, bsz));
             new_padrs.push(p);
@@ -3911,7 +5156,7 @@ fn build_extref_tree<D: WritableBlockDevice>(
 
             // Split into multiple internal nodes and go up another level.
             let mut next: Vec<(Vec<u8>, u64)> = Vec::new();
-            for chunk in partition_records(&lvl_recs, cap) {
+            for chunk in partition_records(&lvl_recs, cap)? {
                 let p = txn.alloc_block()?;
                 txn.stage_raw(
                     p,
@@ -3949,7 +5194,61 @@ fn build_extref_tree<D: WritableBlockDevice>(
 /// [linux-apfs-rw:extents.c apfs_insert_phys_extent / apfs_put_phys_extent;
 ///  template: rewrite_fstree_impl (this file); the APFS spec cross-check]
 #[allow(clippy::too_many_arguments)]
-fn rewrite_extref_tree<D: WritableBlockDevice>(
+/// Bytes of a physical-extent record's key (`j_phys_ext_key_t`) and value
+/// (`j_phys_ext_val_t`).
+const PHYS_EXT_KEY_LEN: usize = 8;
+const PHYS_EXT_VAL_LEN: usize = 20;
+
+/// Refuse a record that is not shaped like a physical-extent record.
+fn check_extref_record_sizes(recs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), TxnError> {
+    for (k, v) in recs {
+        if k.len() != PHYS_EXT_KEY_LEN || v.len() != PHYS_EXT_VAL_LEN {
+            return Err(TxnError::VolumeParse(format!(
+                "extent reference record of {} key bytes and {} value bytes (want {} and {})",
+                k.len(),
+                v.len(),
+                PHYS_EXT_KEY_LEN,
+                PHYS_EXT_VAL_LEN
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a sorted extentref record set no reference tree can hold: a record
+/// over no blocks, a counting record with no reference, a KIND_UPDATE that
+/// changes nothing, or a record starting inside the one before it. fsck_apfs
+/// reports an overlap as keys out of order; the others describe references
+/// that do not exist. A writer bug producing any of them fails here, before
+/// the tree is written, instead of on the next check.
+fn check_extref_records_disjoint(recs: &[(Vec<u8>, Vec<u8>)]) -> Result<(), TxnError> {
+    let mut prev_end: Option<u64> = None;
+    for (k, v) in recs {
+        let start = rd_u64(k, 0) & PHYS_EXT_LEN_MASK;
+        let blocks = rd_u64(v, 0) & PHYS_EXT_LEN_MASK;
+        let empty = if phys_ext_kind(v) == APFS_KIND_UPDATE {
+            phys_ext_update_delta(v) == 0
+        } else {
+            phys_ext_refcnt(v) == 0
+        };
+        if blocks == 0 || empty {
+            return Err(TxnError::VolumeParse(format!(
+                "extent reference record ({start} + {blocks}) holds no reference"
+            )));
+        }
+        if prev_end.is_some_and(|end| start < end) {
+            return Err(TxnError::VolumeParse(format!(
+                "extent reference record ({start} + {blocks}) overlaps the one before it"
+            )));
+        }
+        prev_end = Some(start.checked_add(blocks).ok_or_else(|| {
+            TxnError::VolumeParse(format!("extent reference record at {start} wraps"))
+        })?);
+    }
+    Ok(())
+}
+
+pub(crate) fn rewrite_extref_tree<D: WritableBlockDevice>(
     txn: &mut Transaction<D>,
     old_root_paddr: u64,
     new_xid: u64,
@@ -3958,6 +5257,17 @@ fn rewrite_extref_tree<D: WritableBlockDevice>(
     upsert_recs: &[(Vec<u8>, Vec<u8>)],
     bsz: usize,
 ) -> Result<(u64, Vec<u64>, i64), TxnError> {
+    if !txn.full_rebuild() {
+        return rewrite_extref_paths(
+            txn,
+            old_root_paddr,
+            new_xid,
+            insert_recs,
+            remove_keys,
+            upsert_recs,
+            bsz,
+        );
+    }
     // 1. Collect all existing leaf records + all old node padrs.
     let (old_leaf_recs, old_padrs) = collect_extref_records(txn, old_root_paddr, bsz)?;
     let old_node_count = old_padrs.len() as i64;
@@ -3976,17 +5286,67 @@ fn rewrite_extref_tree<D: WritableBlockDevice>(
         }
     }
 
-    // Apply inserts (reject duplicate keys - same policy as insert_catalog_records).
+    // Apply inserts. A key already present (or given twice) would leave two
+    // equal records in the tree, and a later removal of that key would drop
+    // both - freeing blocks the surviving reference still counts on. Refused,
+    // as the catalog rebuild refuses it.
     for (ik, iv) in insert_recs {
+        if recs.iter().any(|(k, _)| *k == ik) {
+            return Err(TxnError::AlreadyExists(format!(
+                "extent reference record {ik:02x?} inserted twice"
+            )));
+        }
         recs.push((ik, iv));
     }
 
+    // Every record of this tree has an 8-byte key and a 20-byte value; the
+    // rebuilt root's description names those as the longest, and the checker
+    // holds it to them. A record of another shape, from a caller or a
+    // foreign writer, would be carried into the footer as the new longest.
+    check_extref_record_sizes(&recs)?;
+
     // 3. Sort by key (same comparator as catalog/fstree).
     recs.sort_by(|a, b| cat_key_cmp(&a.0, &b.0));
+    check_extref_records_disjoint(&recs)?;
 
     // 4. Rebuild and return.
     let (new_root_paddr, node_delta) = build_extref_tree(txn, recs, new_xid, old_node_count, bsz)?;
     Ok((new_root_paddr, old_padrs, node_delta))
+}
+
+/// [`rewrite_extref_tree`] rewriting only the nodes on the paths to the
+/// changed records. Returns the new root, the node blocks replaced or
+/// dropped, and the nodes the tree gained.
+///
+/// The live tree is the volume's own (taking a snapshot hands the populated
+/// tree to the snapshot), so the nodes left standing are nobody else's and
+/// this path serves volumes with snapshots too. Each rewritten leaf is
+/// checked the way the rebuild checks the whole record set.
+fn rewrite_extref_paths<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    old_root_paddr: u64,
+    new_xid: u64,
+    insert_recs: Vec<(Vec<u8>, Vec<u8>)>,
+    remove_keys: &[Vec<u8>],
+    upsert_recs: &[(Vec<u8>, Vec<u8>)],
+    bsz: usize,
+) -> Result<(u64, Vec<u64>, i64), TxnError> {
+    check_extref_record_sizes(&insert_recs)?;
+    check_extref_record_sizes(upsert_recs)?;
+    let mut batch = EditBatch::new();
+    for k in remove_keys {
+        batch.push(k.clone(), EditOp::Remove)?;
+    }
+    for (k, v) in upsert_recs {
+        batch.push(k.clone(), EditOp::Upsert(v.clone()))?;
+    }
+    for (k, v) in insert_recs {
+        batch.push(k, EditOp::Insert(v))?;
+    }
+    let mut tree =
+        CowTree::new(Shape::ExtentRef, new_xid, bsz).with_leaf_check(check_extref_records_disjoint);
+    let root = tree.apply(txn, old_root_paddr, batch)?;
+    Ok((root, tree.superseded, tree.nodes_added))
 }
 
 /// Recursively collect every (key, value) leaf record of the FSTREE rooted at
@@ -3997,6 +5357,32 @@ fn collect_fstree<D: WritableBlockDevice>(
     oid: u64,
     bsz: usize,
 ) -> Result<Vec<CatRec>, TxnError> {
+    let mut out = Vec::new();
+    let mut visited = HashSet::new();
+    collect_fstree_below(txn, omap_node, oid, bsz, &mut out, &mut visited, None, 0)?;
+    Ok(out)
+}
+
+/// One node of the `collect_fstree` walk. Bounded the way the extentref walk
+/// is: a depth cap, no oid visited twice and every child one level below its
+/// parent, so a crafted cycle is an error instead of unbounded recursion.
+#[allow(clippy::too_many_arguments)]
+fn collect_fstree_below<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    omap_node: &[u8],
+    oid: u64,
+    bsz: usize,
+    out: &mut Vec<CatRec>,
+    visited: &mut HashSet<u64>,
+    parent_level: Option<u16>,
+    depth: u32,
+) -> Result<(), TxnError> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(fstree_too_deep());
+    }
+    if !visited.insert(oid) {
+        return Err(fstree_cycle(oid));
+    }
     // Resolve through the (possibly multi-node) volume omap for the live view.
     // omap_lookup only reads one node and misreads an index root once the omap
     // splits (#157); omap_resolve descends. u64::MAX = latest version.
@@ -4004,30 +5390,352 @@ fn collect_fstree<D: WritableBlockDevice>(
         .ok_or_else(|| TxnError::SpacemanParse("fstree oid not in volume omap".into()))?;
     let mut node = vec![0u8; bsz];
     txn.read_block(paddr, &mut node)?;
+    let level = fstree_child_level(&node, oid, parent_level)?;
     let recs = parse_cat_leaf(&node).map_err(|e| TxnError::SpacemanParse(e.into()))?;
-    if rd_u16(&node, 34) == 0 {
-        return Ok(recs.into_iter().map(|r| (r.key, r.val)).collect());
+    if level == 0 {
+        out.extend(recs.into_iter().map(|r| (r.key, r.val)));
+        return Ok(());
     }
-    let mut out = Vec::new();
     for r in recs {
-        out.extend(collect_fstree(txn, omap_node, rd_u64(&r.val, 0), bsz)?);
+        collect_fstree_below(
+            txn,
+            omap_node,
+            rd_u64(&r.val, 0),
+            bsz,
+            out,
+            visited,
+            Some(level),
+            depth + 1,
+        )?;
     }
-    Ok(out)
+    Ok(())
+}
+
+/// Collect every node oid the catalog reaches, root included.
+///
+/// The volume object map holds a mapping per version of every catalog node,
+/// and a snapshot keeps the versions its own view needs. Once the snapshot is
+/// gone, a mapping whose oid the catalog no longer names points at an object
+/// nothing can reach, and fsck asks to remove it. Bounded by the same depth cap
+/// the extentref walk uses, so a crafted cycle cannot recurse without end.
+pub(crate) fn collect_fstree_oids<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    omap_node: &[u8],
+    oid: u64,
+    bsz: usize,
+    out: &mut HashSet<u64>,
+    depth: u32,
+) -> Result<(), TxnError> {
+    collect_fstree_oids_below(txn, omap_node, oid, bsz, out, depth, None)
+}
+
+/// One node of the `collect_fstree_oids` walk. An oid already in `out` has
+/// been walked (the set may be shared across roots that share subtrees), so
+/// it is not entered again; a pointer loop cannot pass the level rule, since
+/// every child sits one level below its parent. A tree deeper than the cap
+/// is corruption, and a walk that quietly stopped there would report the
+/// nodes past that point as unreachable and let their mappings be removed.
+fn collect_fstree_oids_below<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    omap_node: &[u8],
+    oid: u64,
+    bsz: usize,
+    out: &mut HashSet<u64>,
+    depth: u32,
+    parent_level: Option<u16>,
+) -> Result<(), TxnError> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(fstree_too_deep());
+    }
+    if !out.insert(oid) {
+        return Ok(());
+    }
+    let Some(paddr) = omap_resolve(txn, omap_node, oid, u64::MAX, bsz)? else {
+        return Ok(());
+    };
+    let mut node = vec![0u8; bsz];
+    txn.read_block(paddr, &mut node)?;
+    let level = fstree_child_level(&node, oid, parent_level)?;
+    if level == 0 {
+        return Ok(());
+    }
+    let recs = parse_cat_leaf(&node).map_err(|e| TxnError::SpacemanParse(e.into()))?;
+    for r in recs {
+        collect_fstree_oids_below(
+            txn,
+            omap_node,
+            rd_u64(&r.val, 0),
+            bsz,
+            out,
+            depth + 1,
+            Some(level),
+        )?;
+    }
+    Ok(())
+}
+
+/// The catalog records an operation reads, gathered by key range instead of
+/// by walking the whole tree. Each record appears once, so code that
+/// filters it the way it filtered the whole catalog finds the same records,
+/// as long as every object it looks at was gathered.
+struct Gathered<'a> {
+    omap_node: &'a [u8],
+    root_oid: u64,
+    bsz: usize,
+    recs: Vec<CatRec>,
+    keys: HashSet<Vec<u8>>,
+    objects: HashSet<u64>,
+}
+
+impl<'a> Gathered<'a> {
+    fn new(omap_node: &'a [u8], root_oid: u64, bsz: usize) -> Self {
+        Self {
+            omap_node,
+            root_oid,
+            bsz,
+            recs: Vec::new(),
+            keys: HashSet::new(),
+            objects: HashSet::new(),
+        }
+    }
+
+    fn add(&mut self, recs: Vec<CatRec>) {
+        for (k, v) in recs {
+            if self.keys.insert(k.clone()) {
+                self.recs.push((k, v));
+            }
+        }
+    }
+
+    /// Every record of object `id`.
+    fn object<D: WritableBlockDevice>(
+        &mut self,
+        txn: &mut Transaction<D>,
+        id: u64,
+    ) -> Result<&mut Self, TxnError> {
+        if self.objects.insert(id) {
+            let lo = encode_jkey(id, 0).to_le_bytes();
+            let hi = encode_jkey(id.saturating_add(1), 0).to_le_bytes();
+            let recs =
+                cow_tree::catalog_range(txn, self.omap_node, self.root_oid, &lo, &hi, self.bsz)?;
+            self.add(recs);
+        }
+        Ok(self)
+    }
+
+    /// The entries of directory `parent` whose name hashes like the one in
+    /// `drec_key`: the one `drec_key` names and any it would collide with.
+    fn names_like<D: WritableBlockDevice>(
+        &mut self,
+        txn: &mut Transaction<D>,
+        drec_key: &[u8],
+    ) -> Result<&mut Self, TxnError> {
+        let Some(head) = drec_key.get(..8) else {
+            return Ok(self);
+        };
+        let hash = rd_u32(drec_key, 8) >> 10;
+        let bound = |h: u32| {
+            let mut k = head.to_vec();
+            k.extend_from_slice(&(h << 10).to_le_bytes());
+            k
+        };
+        let hi = match hash.checked_add(1).filter(|h| *h < 1 << 22) {
+            Some(h) => bound(h),
+            None => encode_jkey(
+                rd_u64(drec_key, 0) & 0x0FFF_FFFF_FFFF_FFFF,
+                APFS_TYPE_DIR_REC + 1,
+            )
+            .to_le_bytes()
+            .to_vec(),
+        };
+        let recs = cow_tree::catalog_range(
+            txn,
+            self.omap_node,
+            self.root_oid,
+            &bound(hash),
+            &hi,
+            self.bsz,
+        )?;
+        self.add(recs);
+        Ok(self)
+    }
+
+    /// What [`plan_removal`] reads to take away the name `drec_val` gives
+    /// object `file_id`: the object's records, its content stream's and the
+    /// streams of its attributes.
+    fn removal<D: WritableBlockDevice>(
+        &mut self,
+        txn: &mut Transaction<D>,
+        file_id: u64,
+    ) -> Result<&mut Self, TxnError> {
+        self.object(txn, file_id)?;
+        let mut streams = Vec::new();
+        for (k, v) in &self.recs {
+            if rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF != file_id {
+                continue;
+            }
+            match rd_u64(k, 0) >> 60 {
+                APFS_TYPE_INODE => {
+                    let mode = rd_u16(v, 80);
+                    let id = rd_u64(v, INODE_PRIVATE_ID);
+                    if id != 0 && (mode & 0o170000) != S_IFDIR {
+                        streams.push(id);
+                    }
+                }
+                APFS_TYPE_XATTR if rd_u16(v, 0) & XATTR_DATA_STREAM != 0 => {
+                    streams.push(rd_u64(v, 4));
+                }
+                _ => {}
+            }
+        }
+        for id in streams {
+            self.object(txn, id)?;
+        }
+        Ok(self)
+    }
+}
+
+/// The catalog records an operation on the entries `drec_keys` reads: each
+/// entry's directory record and those it could collide with, and for every
+/// object they name, what [`plan_removal`] reads to take it away. A
+/// transaction asked to rebuild in full reads the whole catalog instead, the
+/// reference this narrower read is checked against.
+fn gather_entries<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    omap_node: &[u8],
+    root_oid: u64,
+    drec_keys: &[&[u8]],
+    bsz: usize,
+) -> Result<Vec<CatRec>, TxnError> {
+    if txn.full_rebuild() {
+        return collect_fstree(txn, omap_node, root_oid, bsz);
+    }
+    let mut g = Gathered::new(omap_node, root_oid, bsz);
+    for key in drec_keys {
+        g.names_like(txn, key)?;
+    }
+    let named: Vec<u64> = g
+        .recs
+        .iter()
+        .filter(|(k, _)| rd_u64(k, 0) >> 60 == APFS_TYPE_DIR_REC)
+        .map(|(_, v)| rd_u64(v, 0) & 0x0FFF_FFFF_FFFF_FFFF)
+        .collect();
+    for id in named {
+        g.removal(txn, id)?;
+    }
+    Ok(g.recs)
+}
+
+/// The inode value of object `id`: from `near` when it holds it, else read
+/// from the catalog. `near` is the whole catalog when the transaction
+/// rebuilds in full.
+fn inode_value<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    omap_node: &[u8],
+    root_oid: u64,
+    id: u64,
+    near: &[CatRec],
+    bsz: usize,
+) -> Result<Option<Vec<u8>>, TxnError> {
+    let key = build_inode_key(id);
+    if let Some((_, v)) = near.iter().find(|(k, _)| *k == key) {
+        return Ok(Some(v.clone()));
+    }
+    if txn.full_rebuild() {
+        return Ok(None);
+    }
+    let hi = encode_jkey(id, APFS_TYPE_INODE + 1).to_le_bytes();
+    Ok(
+        cow_tree::catalog_range(txn, omap_node, root_oid, &key, &hi, bsz)?
+            .into_iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v),
+    )
+}
+
+/// The catalog records an operation on object `id` reads: what
+/// [`Gathered::removal`] gathers for it. A transaction asked to rebuild in
+/// full reads the whole catalog instead.
+fn gather_object<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    omap_node: &[u8],
+    root_oid: u64,
+    id: u64,
+    bsz: usize,
+) -> Result<Vec<CatRec>, TxnError> {
+    if txn.full_rebuild() {
+        return collect_fstree(txn, omap_node, root_oid, bsz);
+    }
+    let mut g = Gathered::new(omap_node, root_oid, bsz);
+    g.removal(txn, id)?;
+    Ok(g.recs)
 }
 
 /// Return true if `drec_key` (a parent+name directory record) already exists in
 /// the catalog. Used to reject duplicate-name creates/writes/renames BEFORE any
 /// block is allocated, so a rejected op leaves no trace (no leaked blocks) and
 /// never produces a duplicate DREC (which corrupts the fsroot tree).
+/// Is there already an entry `drec_key` would collide with?
+///
+/// The key's stored bytes are the name as given, so two spellings of one name
+/// have different keys yet are the same entry to the volume: on a
+/// case-insensitive volume any spelling with the same fold (`FOO` beside
+/// `foo`, `STRASSE` beside `straße`), on a normalization-insensitive one any
+/// spelling with the same decomposition (NFC beside NFD). A byte comparison
+/// let such a name in beside the original with the same hash, which no
+/// lookup could tell apart. Entries under the same parent with the same hash
+/// are compared the way the volume compares names.
 fn drec_exists<D: WritableBlockDevice>(
     txn: &mut Transaction<D>,
     omap_node: &[u8],
     root_tree_oid: u64,
     drec_key: &[u8],
     bsz: usize,
+    case_fold: bool,
+    normalize: bool,
 ) -> Result<bool, TxnError> {
-    let all = collect_fstree(txn, omap_node, root_tree_oid, bsz)?;
-    Ok(all.iter().any(|(k, _)| k.as_slice() == drec_key))
+    let near = if txn.full_rebuild() {
+        collect_fstree(txn, omap_node, root_tree_oid, bsz)?
+    } else {
+        let mut g = Gathered::new(omap_node, root_tree_oid, bsz);
+        g.names_like(txn, drec_key)?;
+        g.recs
+    };
+    Ok(find_drec_collision(&near, drec_key, case_fold, normalize).is_some())
+}
+
+/// The entry `drec_key` names as the volume compares names, if any: same
+/// parent, same hash, and a stored name that folds (case-insensitive volume)
+/// or decomposes (normalization-insensitive volume) to the same string.
+fn find_drec_collision<'a>(
+    all: &'a [(Vec<u8>, Vec<u8>)],
+    drec_key: &[u8],
+    case_fold: bool,
+    normalize: bool,
+) -> Option<&'a (Vec<u8>, Vec<u8>)> {
+    use apfs_core::case_fold::{apfs_names_match, apfs_names_match_case_sensitive};
+    let Some(wanted) = drec_key_name(drec_key) else {
+        return all.iter().find(|(k, _)| k.as_slice() == drec_key);
+    };
+    let wanted_hash = rd_u32(drec_key, 8) >> 10;
+    all.iter().find(|(k, _)| {
+        if k.len() < 13 || k.get(..8) != drec_key.get(..8) || rd_u32(k, 8) >> 10 != wanted_hash {
+            return false;
+        }
+        match drec_key_name(k) {
+            Some(stored) if case_fold => apfs_names_match(stored, wanted),
+            Some(stored) if normalize => apfs_names_match_case_sensitive(stored, wanted),
+            Some(stored) => stored == wanted,
+            None => k.as_slice() == drec_key,
+        }
+    })
+}
+
+/// The name a hashed directory-record key stores (without its terminator).
+fn drec_key_name(key: &[u8]) -> Option<&str> {
+    let raw = key.get(12..)?;
+    let bytes = raw.split(|&b| b == 0).next()?;
+    std::str::from_utf8(bytes).ok()
 }
 
 /// Free the metadata blocks that a copy-on-write mutation replaced, so the
@@ -4098,13 +5806,44 @@ fn drec_exists<D: WritableBlockDevice>(
 ///  linux-apfs-rw extents.c apfs_free_phys_ext sm_fq decrement;
 ///  empirical #149: one omap-btree block at xid=newest_snap goes to sm_fq
 ///  → -1 correction brings actual=26 == expected=26]
+/// Copy-on-write the volume object-map header `vol_omap_raw` so that it
+/// names tree root `tree_root` at transaction `xid`, and return its block. A
+/// header this transaction already staged is named by nothing a checkpoint
+/// holds: it is rewritten where it is, and [`free_replaced_metadata`] keeps
+/// it. Any other header gets a new block and the old one is released there.
+/// Every operation that releases through [`free_replaced_metadata`] stages
+/// its header here, so the two agree on which case applies.
+fn stage_vomap_header<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    vol_omap_raw: &[u8],
+    xid: u64,
+    tree_root: u64,
+    bsz: usize,
+) -> Result<u64, TxnError> {
+    let old = rd_u64(vol_omap_raw, 8);
+    let in_place = txn.staged_live(old);
+    let paddr = if in_place { old } else { txn.alloc_block()? };
+    let mut header = vol_omap_raw.to_vec();
+    header.resize(bsz, 0);
+    wr_u64(&mut header, 8, paddr);
+    wr_u64(&mut header, 16, xid);
+    wr_u64(&mut header, 48, tree_root);
+    update_checksum_in_place(&mut header);
+    if in_place {
+        txn.restage(paddr, header);
+    } else {
+        txn.stage_raw(paddr, header);
+    }
+    Ok(paddr)
+}
+
 fn free_replaced_metadata<D: WritableBlockDevice>(
     txn: &mut Transaction<D>,
     vsb_raw: &[u8],
     vol_omap_raw: &[u8],
     old_omap_node: &[u8],
     old_extref_padrs: &[u64],
-    skip_catalog_reclaim: bool,
+    reclaim: &Reclaim,
     bsz: usize,
 ) -> Result<i64, TxnError> {
     // Newest snapshot xid (0 = no snapshots). Pinned iff a block's xid <= this.
@@ -4114,79 +5853,85 @@ fn free_replaced_metadata<D: WritableBlockDevice>(
     // old freed / sm_fq'd, new allocated - net 0, never subtracted by callers.
     // old_extref_padrs: every block that was part of the old extref tree
     // (may be multiple nodes when the tree was already multi-node). [#151]
-    // Walk the OLD (possibly multi-node) omap b-tree once: every tree node must
-    // be freed (a split omap has more than the root node, else the non-root
-    // nodes leak → fsck "overallocation"), and every LEAF mapping gives the old
-    // catalog node paddrs to reclaim. [#157]
-    let old_omap_root_paddr = rd_u64(vol_omap_raw, 48);
-    let mut old_omap_triples: Vec<(u64, u64, u64)> = Vec::new();
-    let mut old_omap_nodes: Vec<u64> = Vec::new();
-    walk_omap_tree(
-        txn,
-        old_omap_node,
-        old_omap_root_paddr,
-        bsz,
-        &mut old_omap_triples,
-        &mut old_omap_nodes,
-    )?;
+    //
+    // After a rebuild, walk the OLD (possibly multi-node) omap b-tree once:
+    // every tree node must be freed (a split omap has more than the root node,
+    // else the non-root nodes leak → fsck "overallocation"), and every LEAF
+    // mapping gives the old catalog node paddrs to reclaim. [#157] A
+    // path-local rewrite already knows the few blocks it replaced; every
+    // other node still stands in the new trees.
+    let (old_omap_nodes, catalog_padrs): (Vec<u64>, Vec<u64>) = match reclaim {
+        Reclaim::Whole => {
+            let old_omap_root_paddr = rd_u64(vol_omap_raw, 48);
+            let mut old_omap_triples: Vec<OmapRec> = Vec::new();
+            let mut old_omap_nodes: Vec<u64> = Vec::new();
+            walk_omap_tree(
+                txn,
+                old_omap_node,
+                old_omap_root_paddr,
+                bsz,
+                &mut old_omap_triples,
+                &mut old_omap_nodes,
+            )?;
+            // Catalog nodes: only process entries with xid > newest_snap (the
+            // "intermediate" ones that were pruned from the new omap by
+            // rewrite_fstree). Snapshot-pinned entries (xid <= newest_snap)
+            // are RETAINED verbatim in the new omap - their backing blocks
+            // are neither freed nor sm_fq'd here. Processing them would cause
+            // duplicate sm_fq enqueues on every commit because the same paddr
+            // keeps appearing in old_omap_node. [#149 fix]
+            let catalog = old_omap_triples
+                .iter()
+                .filter(|r| r.xid > newest_snap)
+                .map(|r| r.paddr)
+                .collect();
+            (old_omap_nodes, catalog)
+        }
+        Reclaim::Exact {
+            omap_nodes,
+            catalog,
+        } => (omap_nodes.clone(), catalog.clone()),
+    };
 
     let non_catalog: Vec<u64> = {
-        let mut v = vec![rd_u64(vsb_raw, VSBI_OMAP_OID)]; // old omap_phys header
-        v.extend_from_slice(&old_omap_nodes); // every old omap b-tree node
-        v.extend_from_slice(old_extref_padrs);
+        // The old omap_phys header, unless it was staged in this transaction
+        // and so rewritten in place (`stage_vomap_header`).
+        let old_header = rd_u64(vsb_raw, VSBI_OMAP_OID);
+        let mut v = Vec::with_capacity(old_omap_nodes.len() + 1);
+        if !txn.staged_live(old_header) {
+            v.push(old_header);
+        }
+        v.extend_from_slice(&old_omap_nodes); // the old omap b-tree nodes replaced
         v
     };
 
-    // Catalog nodes: only process entries with xid > newest_snap (the
-    // "intermediate" ones that were pruned from the new omap by rewrite_fstree).
-    // Snapshot-pinned entries (xid <= newest_snap) are RETAINED verbatim in
-    // the new omap - their backing blocks are neither freed nor sm_fq'd here.
-    // Processing them would cause duplicate sm_fq enqueues on every commit
-    // because the same paddr keeps appearing in old_omap_node. [#149 fix]
-    //
-    // #140: the INCREMENTAL rename fast path keeps almost every catalog leaf at
-    // its existing paddr (only the touched leaves are COW'd, and the fast path
-    // freed exactly those itself). The full-rebuild's assumption - that EVERY
-    // old catalog node is superseded - is false there, so freeing all of them
-    // would drop blocks the new omap still references (fsck "underallocation").
-    // When the fast path ran, skip catalog reclaim entirely; the non-catalog
-    // COW-pairs (omap header + omap b-tree + extentref) are still superseded and
-    // are reclaimed above regardless.
-    let catalog_padrs: Vec<u64> = if skip_catalog_reclaim {
-        Vec::new()
-    } else {
-        old_omap_triples
-            .iter()
-            .filter(|&&(_oid, xid, _paddr)| xid > newest_snap)
-            .map(|&(_oid, _xid, paddr)| paddr)
-            .collect()
-    };
+    // The live extent-reference tree is never shared with a snapshot: taking
+    // a snapshot hands the populated tree to the snapshot and starts the live
+    // volume on a fresh one, so a superseded live node is nobody else's and
+    // goes straight back. Its transaction id says nothing here - the fresh
+    // root carries the snapshot's own id, and judging it by that queued it as
+    // pinned, so the drain at snapshot deletion took it off the volume's count
+    // a second time.
+    for &paddr in old_extref_padrs {
+        txn.free_block(paddr)?;
+    }
 
     // Net fs_alloc_count correction to return to callers.
     //
-    // Per apfsprogs Q5 model: blocks sent to sm_fq are decremented from
-    // fs_alloc_count at enqueue time (they are no longer live-owned).
-    // Blocks freed immediately via free_block are also decremented.
+    // A block handed to sm_fq is NOT deducted here. fsck derives
+    // apfs_fs_alloc_count by walking everything the volume still reaches, and
+    // a queued block is still reached through the snapshot that pinned it -
+    // the queue only defers clearing its bitmap bit. Deducting at enqueue time
+    // left the field one block low for as long as the snapshot lived (fsck:
+    // "apfs_fs_alloc_count is not valid"). delete_snapshot deducts when it
+    // drains the queue and the block genuinely leaves the volume.
     //
-    // For non-catalog COW-pairs (omap hdr, omap btree, extentref):
-    //   - immediate free: caller's alloc_delta already nets to 0 (new alloc
-    //     cancels old free); no fs_alloc_count adjustment needed here.
-    //   - sm_fq: NEW block was allocated (+1 via alloc_block inside
-    //     rewrite_fstree / COW path), OLD block goes to sm_fq. Per Q5,
-    //     old block must be decremented NOW. So correction = -1.
+    // A block freed outright needs no correction either: for the non-catalog
+    // COW-pairs (omap header, omap b-tree, extentref) the caller's alloc_delta
+    // already nets the new allocation against the old free, and for catalog
+    // nodes node_delta covers it.
     //
-    // For catalog nodes:
-    //   - immediate free (xid > newest_snap): pruned intermediate entry;
-    //     node_delta = new_count - old_replaceable_nodes already accounts
-    //     for it. No additional correction.
-    //   - sm_fq (xid <= newest_snap, after filtering): only snapshot-pinned
-    //     catalog nodes reach here, and they were filtered out above.
-    //     In practice catalog_padrs only contains xid > newest_snap entries,
-    //     so this branch is dead. But if it fires, same logic: sm_fq = -1
-    //     correction (old goes to sm_fq, decrement from fs_alloc_count).
-    //
-    // Summary: correction += -1 for every sm_fq enqueue, 0 for free_block.
-    let mut correction: i64 = 0;
+    // Both branches therefore leave the correction at 0 today.
 
     // Process non-catalog COW-pairs (omap hdr, omap btree, extentref).
     for paddr in non_catalog {
@@ -4199,10 +5944,12 @@ fn free_replaced_metadata<D: WritableBlockDevice>(
             if blk_xid > newest_snap {
                 txn.free_block(paddr)?;
             } else {
-                // sm_fq: old COW-pair block sent to deferred reclaim.
-                // Per Q5: decrement fs_alloc_count at enqueue time.
+                // sm_fq: old COW-pair block sent to deferred reclaim. The
+                // queue only defers clearing the bitmap bit - the snapshot
+                // still reaches the block, and fsck counts fs_alloc_count by
+                // what the volume reaches, so the block stays counted until
+                // delete_snapshot actually drains it.
                 txn.enqueue_sm_fq(newest_snap, paddr)?;
-                correction -= 1;
             }
         }
     }
@@ -4226,36 +5973,58 @@ fn free_replaced_metadata<D: WritableBlockDevice>(
                 txn.free_block(paddr)?;
             } else {
                 // Should not occur after filtering above, but handle correctly.
+                // Same as above: still reachable through the snapshot, so
+                // still counted until the queue is drained.
                 txn.enqueue_sm_fq(newest_snap, paddr)?;
-                correction -= 1;
             }
         }
     }
-    Ok(correction)
+    Ok(0)
 }
 
 /// Parse all entries of a fixed-kv volume omap node into (oid, xid, paddr)
 /// triples. Mirrors `omap_lookup`'s layout decoding. [the APFS specification]
-pub(crate) fn parse_omap_entries(node: &[u8], bsz: usize) -> Vec<(u64, u64, u64)> {
-    let nkeys = rd_u32(node, 36) as usize;
-    let toc_off = rd_u16(node, 40) as usize;
-    let toc_len = rd_u16(node, 42) as usize;
-    let is_root = rd_u16(node, 32) & 0x1 != 0;
-    let key_area = DATA_BASE + toc_off + toc_len;
-    let val_area_end = bsz - if is_root { BTREE_INFO_SIZE } else { 0 };
-    let mut out = Vec::with_capacity(nkeys);
-    for i in 0..nkeys {
-        let te = DATA_BASE + toc_off + i * 4;
-        let k_off = rd_u16(node, te) as usize;
-        let v_off = rd_u16(node, te + 2) as usize;
-        let k = key_area + k_off;
-        let oid = rd_u64(node, k);
-        let xid = rd_u64(node, k + 8);
-        let v = val_area_end - v_off;
-        let paddr = rd_u64(node, v + 8);
-        out.push((oid, xid, paddr));
+/// One mapping of a volume object map: the object's version and where it
+/// lives, with the value's flags and size carried as stored. A rebuild that
+/// wrote every mapping as a live one-block object would turn a tombstone
+/// written by macOS into a mapping to a block that is no longer the object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OmapRec {
+    pub(crate) oid: u64,
+    pub(crate) xid: u64,
+    pub(crate) paddr: u64,
+    pub(crate) flags: u32,
+    pub(crate) size: u32,
+}
+
+impl OmapRec {
+    /// A mapping to a one-block object this writer placed.
+    pub(crate) fn live(oid: u64, xid: u64, paddr: u64, bsz: usize) -> Self {
+        Self {
+            oid,
+            xid,
+            paddr,
+            flags: 0,
+            size: bsz as u32,
+        }
     }
-    out
+}
+
+pub(crate) fn parse_omap_entries(node: &[u8], bsz: usize) -> Result<Vec<OmapRec>, TxnError> {
+    let layout = omap_node_layout(node, bsz)?;
+    let mut out = Vec::with_capacity(layout.nkeys);
+    for i in 0..layout.nkeys {
+        let k = layout.key_at(node, i)?;
+        let v = layout.val_at(node, i, OMAP_LEAF_VAL_SIZE)?;
+        out.push(OmapRec {
+            oid: rd_u64(node, k),
+            xid: rd_u64(node, k + 8),
+            flags: rd_u32(node, v),
+            size: rd_u32(node, v + 4),
+            paddr: rd_u64(node, v + 8),
+        });
+    }
+    Ok(out)
 }
 
 /// Walk a (possibly MULTI-NODE) volume omap b-tree from `node` (its paddr is
@@ -4271,28 +6040,54 @@ fn walk_omap_tree<D: WritableBlockDevice>(
     node: &[u8],
     node_paddr: u64,
     bsz: usize,
-    triples: &mut Vec<(u64, u64, u64)>,
+    triples: &mut Vec<OmapRec>,
     nodes: &mut Vec<u64>,
 ) -> Result<(), TxnError> {
+    let mut visited = HashSet::new();
+    walk_omap_node(txn, node, node_paddr, bsz, triples, nodes, &mut visited, 0)
+}
+
+/// One node of the `walk_omap_tree` descent. Bounded by a depth cap, a set
+/// of visited blocks and the rule that a child is an omap node one level
+/// below its parent, so a crafted cycle is an error rather than unbounded
+/// recursion.
+#[allow(clippy::too_many_arguments)]
+fn walk_omap_node<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    node: &[u8],
+    node_paddr: u64,
+    bsz: usize,
+    triples: &mut Vec<OmapRec>,
+    nodes: &mut Vec<u64>,
+    visited: &mut HashSet<u64>,
+    depth: u32,
+) -> Result<(), TxnError> {
+    if depth > MAX_OMAP_TREE_DEPTH {
+        return Err(TxnError::OmapParse(format!(
+            "omap tree is deeper than {MAX_OMAP_TREE_DEPTH} levels"
+        )));
+    }
+    if !visited.insert(node_paddr) {
+        return Err(TxnError::OmapParse(format!(
+            "omap node {node_paddr} is reached twice: the tree has a cycle"
+        )));
+    }
     nodes.push(node_paddr);
-    if rd_u16(node, 34) == 0 {
+    let level = rd_u16(node, 34);
+    if level == 0 {
         // Leaf: decode its {oid, xid} -> paddr mappings.
-        triples.extend(parse_omap_entries(node, bsz));
+        triples.extend(parse_omap_entries(node, bsz)?);
         return Ok(());
     }
     // Index node: each value is an 8-byte PHYSICAL child paddr - recurse.
-    let nkeys = rd_u32(node, 36) as usize;
-    let toc_off = rd_u16(node, 40) as usize;
-    let is_root = rd_u16(node, 32) & BTNODE_ROOT != 0;
-    let val_area_end = bsz - if is_root { BTREE_INFO_SIZE } else { 0 };
-    for i in 0..nkeys {
-        let te = DATA_BASE + toc_off + i * 4;
-        let v_off = rd_u16(node, te + 2) as usize;
-        let v = val_area_end - v_off;
+    let layout = omap_node_layout(node, bsz)?;
+    for i in 0..layout.nkeys {
+        let v = layout.val_at(node, i, OMAP_INDEX_VAL_SIZE)?;
         let child = rd_u64(node, v);
         let mut buf = vec![0u8; bsz];
         txn.read_block(child, &mut buf)?;
-        walk_omap_tree(txn, &buf, child, bsz, triples, nodes)?;
+        omap_child_level(&buf, child, level)?;
+        walk_omap_node(txn, &buf, child, bsz, triples, nodes, visited, depth + 1)?;
     }
     Ok(())
 }
@@ -4304,49 +6099,78 @@ fn collect_omap_triples<D: WritableBlockDevice>(
     root_node: &[u8],
     root_paddr: u64,
     bsz: usize,
-) -> Result<Vec<(u64, u64, u64)>, TxnError> {
+) -> Result<Vec<OmapRec>, TxnError> {
+    Ok(collect_omap_tree(txn, root_node, root_paddr, bsz)?.0)
+}
+
+/// Same walk, but also returns every node block the tree occupies - a caller
+/// that replaces the tree has to release all of them, not just the root.
+pub(crate) fn collect_omap_tree<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    root_node: &[u8],
+    root_paddr: u64,
+    bsz: usize,
+) -> Result<(Vec<OmapRec>, Vec<u64>), TxnError> {
     let mut triples = Vec::new();
     let mut nodes = Vec::new();
     walk_omap_tree(txn, root_node, root_paddr, bsz, &mut triples, &mut nodes)?;
-    Ok(triples)
+    Ok((triples, nodes))
 }
 
-/// Rebuild the volume omap b-tree (fixed-kv, key {oid,xid} 16B, val
-/// {flags,size,paddr} 16B) from `entries` (oid, xid, paddr) triples - each
-/// keyed by its OWN xid so that snapshot-time versions can coexist with the
-/// live version. The node's own o_xid is set to `xid` (the current txn).
-/// Header/flags/footer skeleton copied from `template`. [the APFS specification]
+/// Rebuild a single-node volume omap b-tree (fixed-kv, key {oid,xid} 16B,
+/// val {flags,size,paddr} 16B) from `entries` (oid, xid, paddr) triples -
+/// each keyed by its OWN xid so that snapshot-time versions can coexist with
+/// the live version. The node's own o_xid is set to `xid` (the current txn).
+/// The object header, subtype and tree description come from `template`; the
+/// node is a root leaf of fixed-size records whatever the template's flags
+/// said, and its description counts one node and 16-byte keys and values.
+/// Entries that do not fit one node are an error, not a node with its keys
+/// and values run together. [the APFS specification]
+#[cfg(test)]
 pub(crate) fn build_omap_node(
     template: &[u8],
-    entries: &[(u64, u64, u64)],
+    entries: &[OmapRec],
     paddr: u64,
     xid: u64,
     bsz: usize,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, TxnError> {
     let mut sorted = entries.to_vec();
     // omap b-tree key order: oid ascending, then xid ascending.
-    sorted.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    sorted.sort_by(|a, b| (a.oid, a.xid).cmp(&(b.oid, b.xid)));
     let nkeys = sorted.len();
     let mut out = vec![0u8; bsz];
-    // obj_phys + btn_flags/level from template (fixed-kv root omap node).
-    wr_bytes(&mut out, 0, template.get(..36).unwrap_or(&[]));
+    // obj_phys from the template (type and subtype), then this node's own
+    // identity and shape.
+    wr_bytes(&mut out, 0, template.get(..32).unwrap_or(&[]));
     wr_u64(&mut out, 8, paddr); // physical o_oid = paddr
     wr_u64(&mut out, 16, xid);
+    wr_u16(
+        &mut out,
+        32,
+        BTNODE_ROOT | BTNODE_LEAF | BTNODE_FIXED_KV_SIZE,
+    );
+    wr_u16(&mut out, 34, 0); // level
     wr_u32(&mut out, 36, nkeys as u32);
     wr_u16(&mut out, 48, BTOFF_INVALID);
     wr_u16(&mut out, 52, BTOFF_INVALID);
-    // Preserve the template's TOC reserve (e.g. 448) so layout matches the kernel.
-    let toc_len = rd_u16(template, 42) as usize;
+    // Keep the template's table reserve (448 on a macOS-written root) when it
+    // holds the entries, so the layout matches the kernel's; grow it otherwise.
+    let toc_len = (rd_u16(template, 42) as usize).max(nkeys * 4).div_ceil(8) * 8;
     let key_area = DATA_BASE + toc_len;
-    let val_area_end = bsz - BTREE_INFO_SIZE;
-    for (i, &(oid, kxid, p)) in sorted.iter().enumerate() {
+    let val_area_end = bsz.saturating_sub(BTREE_INFO_SIZE);
+    if key_area + nkeys * 16 > val_area_end.saturating_sub(nkeys * 16) {
+        return Err(TxnError::OmapParse(format!(
+            "{nkeys} object map entries do not fit one node"
+        )));
+    }
+    for (i, r) in sorted.iter().enumerate() {
         let k = key_area + i * 16;
-        wr_u64(&mut out, k, oid);
-        wr_u64(&mut out, k + 8, kxid);
+        wr_u64(&mut out, k, r.oid);
+        wr_u64(&mut out, k + 8, r.xid);
         let v = val_area_end - (i + 1) * 16;
-        wr_u32(&mut out, v, 0); // ov_flags
-        wr_u32(&mut out, v + 4, bsz as u32); // ov_size
-        wr_u64(&mut out, v + 8, p); // ov_paddr
+        wr_u32(&mut out, v, r.flags); // ov_flags, as stored
+        wr_u32(&mut out, v + 4, r.size); // ov_size, as stored
+        wr_u64(&mut out, v + 8, r.paddr); // ov_paddr
         let te = DATA_BASE + i * 4; // kvoff_t
         wr_u16(&mut out, te, (i * 16) as u16);
         wr_u16(&mut out, te + 2, ((i + 1) * 16) as u16);
@@ -4360,12 +6184,16 @@ pub(crate) fn build_omap_node(
                                                                    // builder is only reached for small (single-node-omap) trees now, but stay
                                                                    // crash-safe regardless. [#157 review]
     wr_u16(&mut out, 46, val_start.saturating_sub(key_end) as u16); // free_space.len
-                                                                    // Footer: copy template, patch key_count.
-    let bti = bsz - BTREE_INFO_SIZE;
+                                                                    // Footer: the tree's flags and sizes from the template, the counts and
+                                                                    // longest key/value from this node.
+    let bti = val_area_end;
     wr_bytes(&mut out, bti, template.get(bti..).unwrap_or(&[]));
+    wr_u32(&mut out, bti + 16, 16); // bt_longest_key
+    wr_u32(&mut out, bti + 20, 16); // bt_longest_val
     wr_u64(&mut out, bti + 24, nkeys as u64); // bt_key_count
+    wr_u64(&mut out, bti + 32, 1); // bt_node_count
     update_checksum_in_place(&mut out);
-    out
+    Ok(out)
 }
 
 /// Serialize ONE volume-omap b-tree node (FIXED-kv, BTREE_PHYSICAL).
@@ -4472,15 +6300,15 @@ fn serialize_omap_node(
 /// [CERTAIN: APFS PDF §Object Maps + apfsprogs/mkfs omap layout; capacities are
 ///  conservative (computed against the root's smaller value area so any node
 ///  fits).]
-fn build_omap_tree<D: WritableBlockDevice>(
+pub(crate) fn build_omap_tree<D: WritableBlockDevice>(
     txn: &mut Transaction<D>,
     template: &[u8],
-    triples: &[(u64, u64, u64)],
+    triples: &[OmapRec],
     new_xid: u64,
     bsz: usize,
 ) -> Result<(u64, u64), TxnError> {
     let mut sorted = triples.to_vec();
-    sorted.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    sorted.sort_by(|a, b| (a.oid, a.xid).cmp(&(b.oid, b.xid)));
     let key_count = sorted.len() as u64;
 
     // Conservative per-node capacity: budget against the ROOT value area
@@ -4495,14 +6323,14 @@ fn build_omap_tree<D: WritableBlockDevice>(
     // Leaf entries: key {oid, xid}, val {ov_flags=0, ov_size=bsz, ov_paddr}.
     let leaf_entries: Vec<([u8; 16], Vec<u8>)> = sorted
         .iter()
-        .map(|&(oid, xid, p)| {
+        .map(|r| {
             let mut k = [0u8; 16];
-            k[..8].copy_from_slice(&oid.to_le_bytes());
-            k[8..].copy_from_slice(&xid.to_le_bytes());
+            k[..8].copy_from_slice(&r.oid.to_le_bytes());
+            k[8..].copy_from_slice(&r.xid.to_le_bytes());
             let mut v = vec![0u8; 16];
-            wr_u32(&mut v, 0, 0); // ov_flags
-            wr_u32(&mut v, 4, bsz as u32); // ov_size
-            wr_u64(&mut v, 8, p); // ov_paddr
+            wr_u32(&mut v, 0, r.flags); // ov_flags, as stored
+            wr_u32(&mut v, 4, r.size); // ov_size, as stored
+            wr_u64(&mut v, 8, r.paddr); // ov_paddr
             (k, v)
         })
         .collect();
@@ -4572,30 +6400,6 @@ fn build_omap_tree<D: WritableBlockDevice>(
     }
 }
 
-/// Rebuild a fixed-kv volume omap node from `template`, dropping the single
-/// entry that matches `(drop_oid, drop_xid)`. Used by snapshot revert (COW-7):
-/// the live-xid `root_tree_oid` mapping must be REMOVED (not zeroed) so that
-/// `Omap::resolve` - which selects the highest xid <= query and only skips
-/// `OMAP_VAL_DELETED`, never a `paddr == 0` - falls back to the snapshot's
-/// fsroot instead of resolving to block 0 (the NX superblock). Reuses
-/// `parse_omap_entries` + `build_omap_node` so the layout matches what the
-/// kernel/fsck expect (no hand-rolled TOC surgery). [COW-7;
-/// docs/refs/di-tier-verification-2026-05.md]
-pub(crate) fn rebuild_omap_node_without(
-    template: &[u8],
-    drop_oid: u64,
-    drop_xid: u64,
-    new_paddr: u64,
-    new_xid: u64,
-    bsz: usize,
-) -> Vec<u8> {
-    let surviving: Vec<(u64, u64, u64)> = parse_omap_entries(template, bsz)
-        .into_iter()
-        .filter(|&(oid, xid, _)| !(oid == drop_oid && xid == drop_xid))
-        .collect();
-    build_omap_node(template, &surviving, new_paddr, new_xid, bsz)
-}
-
 /// Apply a mutation to the FSTREE and rebuild it (whole-tree rebuild), then
 /// rebuild the volume omap b-tree to map every (possibly new) node. Returns the
 /// new volume-omap-btree paddr for the caller to store in the COW'd omap header.
@@ -4614,7 +6418,7 @@ fn rewrite_fstree<D: WritableBlockDevice>(
     parent_patch: Option<(u64, i64)>,
     now: u64,
     bsz: usize,
-) -> Result<(u64, i64), TxnError> {
+) -> Result<FstreeRewrite, TxnError> {
     rewrite_fstree_impl(
         txn,
         vsb_raw,
@@ -4629,10 +6433,37 @@ fn rewrite_fstree<D: WritableBlockDevice>(
     )
 }
 
+/// The catalog and volume object map after [`rewrite_fstree_impl`].
+struct FstreeRewrite {
+    /// The volume object map's new tree root, for the COW'd omap header.
+    omap_tree_paddr: u64,
+    /// Volume-owned metadata blocks gained (negative: lost), for
+    /// `fs_alloc_count`.
+    node_delta: i64,
+    /// What the change left for [`free_replaced_metadata`] to release.
+    reclaim: Reclaim,
+}
+
+/// The catalog and object-map blocks a change superseded.
+enum Reclaim {
+    /// Both trees were rebuilt: every node of the old object map and every
+    /// catalog node version it mapped past the newest snapshot.
+    Whole,
+    /// Only these blocks; every other node still stands in the new trees.
+    Exact {
+        omap_nodes: Vec<u64>,
+        catalog: Vec<u64>,
+    },
+}
+
 /// Like [`rewrite_fstree`] but additionally REPLACES the value of already-present
 /// records listed in `update_records` (matched by exact key). Used by clone_file
 /// to bump the source inode flags + the source dstream_id refcnt without the
 /// duplicate-key rejection that `new_records` enforces. [#141]
+///
+/// On a volume without snapshots only the nodes on the paths to the changed
+/// records are rewritten; otherwise (or when the transaction asks for it) the
+/// whole tree and object map are rebuilt.
 #[allow(clippy::too_many_arguments)]
 fn rewrite_fstree_impl<D: WritableBlockDevice>(
     txn: &mut Transaction<D>,
@@ -4645,7 +6476,21 @@ fn rewrite_fstree_impl<D: WritableBlockDevice>(
     update_records: &[(Vec<u8>, Vec<u8>)],
     now: u64,
     bsz: usize,
-) -> Result<(u64, i64), TxnError> {
+) -> Result<FstreeRewrite, TxnError> {
+    if catalog_by_paths(txn, vsb_raw) {
+        return rewrite_fstree_paths(
+            txn,
+            vsb_raw,
+            omap_node,
+            new_xid,
+            new_records,
+            remove_keys,
+            parent_patch,
+            update_records,
+            now,
+            bsz,
+        );
+    }
     let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
     let mut recs = collect_fstree(txn, omap_node, root_tree_oid, bsz)?;
 
@@ -4653,10 +6498,13 @@ fn rewrite_fstree_impl<D: WritableBlockDevice>(
         let want = encode_jkey(pino, APFS_TYPE_INODE);
         for (k, v) in recs.iter_mut() {
             if rd_u64(k, 0) == want {
+                refuse_dir_stats(v, pino)?;
                 let nch = rd_u32(v, INODE_NCHILDREN) as i64;
                 wr_u32(v, INODE_NCHILDREN, (nch + delta).max(0) as u32);
                 wr_u64(v, INODE_MOD_TIME, now);
                 wr_u64(v, INODE_CHANGE_TIME, now);
+                // The directory's entries changed, whether or not their count did.
+                step_write_generation(v);
             }
         }
     }
@@ -4714,7 +6562,7 @@ fn rewrite_fstree_impl<D: WritableBlockDevice>(
         // [the APFS specification - general N-level tree]
         let cap = node_capacity(bsz, false);
         let mut parent_entries: Vec<(Vec<u8>, u64)> = Vec::new();
-        for chunk in partition_records(&recs, cap) {
+        for chunk in partition_records(&recs, cap)? {
             let oid = txn.alloc_oid();
             let p = txn.alloc_block()?;
             txn.stage_raw(
@@ -4755,7 +6603,7 @@ fn rewrite_fstree_impl<D: WritableBlockDevice>(
                 break;
             }
             let mut next: Vec<(Vec<u8>, u64)> = Vec::new();
-            for chunk in partition_records(&lvl_recs, cap) {
+            for chunk in partition_records(&lvl_recs, cap)? {
                 let oid = txn.alloc_oid();
                 let p = txn.alloc_block()?;
                 txn.stage_raw(
@@ -4792,9 +6640,9 @@ fn rewrite_fstree_impl<D: WritableBlockDevice>(
     // the allocator reuses the freed block (real-disk decoded post-Subtask-A:
     // T3 retained {root, xid=5} -> 2058 while 2058 was freed and re-allocated
     // for the container omap b-tree).
-    let mut omap_triples: Vec<(u64, u64, u64)> = omap_entries
+    let mut omap_triples: Vec<OmapRec> = omap_entries
         .iter()
-        .map(|&(oid, p)| (oid, new_xid, p))
+        .map(|&(oid, p)| OmapRec::live(oid, new_xid, p, bsz))
         .collect();
     // Read EVERY old omap leaf mapping by walking the (possibly multi-node) old
     // omap tree - `parse_omap_entries` alone would see only the root node and so
@@ -4802,7 +6650,8 @@ fn rewrite_fstree_impl<D: WritableBlockDevice>(
     // own physical paddr (BTREE_PHYSICAL). Used for snapshot retention AND the
     // node_delta accounting below.
     let old_omap_root_paddr = rd_u64(omap_node, 8);
-    let old_omap_triples = collect_omap_triples(txn, omap_node, old_omap_root_paddr, bsz)?;
+    let (old_omap_triples, old_omap_nodes) =
+        collect_omap_tree(txn, omap_node, old_omap_root_paddr, bsz)?;
     let has_snapshot = rd_u64(vsb_raw, VSBI_NUM_SNAPSHOTS) > 0;
     if has_snapshot {
         // Read om_most_recent_snap from the live volume omap header to set
@@ -4812,10 +6661,10 @@ fn rewrite_fstree_impl<D: WritableBlockDevice>(
         txn.read_block(vol_omap_paddr, &mut vom)?;
         let newest_snap = rd_u64(&vom, 64); // omap_phys.om_most_recent_snap
         let new_pairs: std::collections::HashSet<(u64, u64)> =
-            omap_triples.iter().map(|&(o, x, _)| (o, x)).collect();
-        for &(oid, xid, p) in &old_omap_triples {
-            if !new_pairs.contains(&(oid, xid)) && xid <= newest_snap {
-                omap_triples.push((oid, xid, p));
+            omap_triples.iter().map(|r| (r.oid, r.xid)).collect();
+        for r in &old_omap_triples {
+            if !new_pairs.contains(&(r.oid, r.xid)) && r.xid <= newest_snap {
+                omap_triples.push(*r);
             }
         }
     }
@@ -4823,7 +6672,7 @@ fn rewrite_fstree_impl<D: WritableBlockDevice>(
     // Build the new volume omap as a (possibly MULTI-NODE) b-tree (#157):
     // the single-node `build_omap_node` overflowed once the mappings no longer
     // fit one node. Returns the root paddr.
-    let (new_omap_tree_paddr, _new_omap_node_count) =
+    let (new_omap_tree_paddr, new_omap_node_count) =
         build_omap_tree(txn, omap_node, &omap_triples, new_xid, bsz)?;
 
     // Net change in volume-owned catalog node count, for fs_alloc_count.
@@ -4855,11 +6704,117 @@ fn rewrite_fstree_impl<D: WritableBlockDevice>(
     // node would undercount on a split omap and skew node_delta (#157).
     let old_replaceable_nodes = old_omap_triples
         .iter()
-        .filter(|&&(_, xid, _)| xid > newest_snap_for_delta)
+        .filter(|r| r.xid > newest_snap_for_delta)
         .count() as i64;
     let new_catalog_nodes = omap_entries.len() as i64;
-    let node_delta = new_catalog_nodes - old_replaceable_nodes;
-    Ok((new_omap_tree_paddr, node_delta))
+    // The object map is rebuilt whole as well, and no snapshot reaches its
+    // old nodes (snapshots share the live object map), so its node count
+    // moves by the difference. It grows on the first write after a snapshot,
+    // when every catalog node gains a second mapping; a delta taken as zero
+    // left fs_alloc_count low by that growth.
+    let omap_node_delta = new_omap_node_count as i64 - old_omap_nodes.len() as i64;
+    let node_delta = new_catalog_nodes - old_replaceable_nodes + omap_node_delta;
+    Ok(FstreeRewrite {
+        omap_tree_paddr: new_omap_tree_paddr,
+        node_delta,
+        reclaim: Reclaim::Whole,
+    })
+}
+
+/// [`rewrite_fstree_impl`] on a volume without snapshots, rewriting only the
+/// catalog nodes on the paths to the changed records and the object-map
+/// nodes that map them.
+///
+/// The edits apply in the rebuild's order: the parent patch, then
+/// `update_records`, then `remove_keys`, then `new_records`, so a key removed
+/// and added again is replaced, and a new key already present is refused.
+/// Whether this transaction changes the catalog path by path: on a volume
+/// without snapshots, unless it was asked to rebuild in full.
+fn catalog_by_paths<D: WritableBlockDevice>(txn: &Transaction<D>, vsb_raw: &[u8]) -> bool {
+    !txn.full_rebuild() && rd_u64(vsb_raw, VSBI_NUM_SNAPSHOTS) == 0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rewrite_fstree_paths<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    vsb_raw: &[u8],
+    omap_node: &[u8],
+    new_xid: u64,
+    new_records: Vec<(Vec<u8>, Vec<u8>)>,
+    remove_keys: &[Vec<u8>],
+    parent_patch: Option<(u64, i64)>,
+    update_records: &[(Vec<u8>, Vec<u8>)],
+    now: u64,
+    bsz: usize,
+) -> Result<FstreeRewrite, TxnError> {
+    let mut batch = EditBatch::new();
+    if let Some((pino, delta)) = parent_patch {
+        batch.push(build_inode_key(pino), entries_changed(pino, delta, now))?;
+    }
+    for (k, v) in update_records {
+        batch.push(k.clone(), EditOp::Update(v.clone()))?;
+    }
+    for k in remove_keys {
+        batch.push(k.clone(), EditOp::Remove)?;
+    }
+    for (k, v) in new_records {
+        batch.push(k, EditOp::Insert(v))?;
+    }
+    rewrite_catalog_batch(txn, vsb_raw, omap_node, new_xid, batch, bsz)
+}
+
+/// The change a directory's inode takes when its entries change: `delta`
+/// more children, new modification and change times, and a stepped write
+/// generation (the entries changed whether or not their count did).
+fn entries_changed(pino: u64, delta: i64, now: u64) -> EditOp {
+    EditOp::Patch(Box::new(move |v| {
+        refuse_dir_stats(v, pino)?;
+        let nch = rd_u32(v, INODE_NCHILDREN) as i64;
+        wr_u32(v, INODE_NCHILDREN, (nch + delta).max(0) as u32);
+        wr_u64(v, INODE_MOD_TIME, now);
+        wr_u64(v, INODE_CHANGE_TIME, now);
+        step_write_generation(v);
+        Ok(())
+    }))
+}
+
+/// Apply `batch` to the catalog of a volume without snapshots, rewriting only
+/// the nodes on the paths to the changed records and the object-map nodes
+/// that map them.
+fn rewrite_catalog_batch<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    vsb_raw: &[u8],
+    omap_node: &[u8],
+    new_xid: u64,
+    batch: EditBatch,
+    bsz: usize,
+) -> Result<FstreeRewrite, TxnError> {
+    let mut tree = CowTree::new(
+        Shape::Catalog {
+            omap_root: omap_node,
+        },
+        new_xid,
+        bsz,
+    );
+    tree.apply(txn, rd_u64(vsb_raw, VSBI_ROOT_TREE_OID), batch)?;
+    let old_omap_root_paddr = rd_u64(omap_node, 8);
+    let remap = remap_catalog_nodes(
+        txn,
+        omap_node,
+        old_omap_root_paddr,
+        &tree.remapped,
+        new_xid,
+        0,
+        bsz,
+    )?;
+    Ok(FstreeRewrite {
+        omap_tree_paddr: remap.root,
+        node_delta: tree.nodes_added + remap.omap_nodes_added,
+        reclaim: Reclaim::Exact {
+            omap_nodes: remap.omap_superseded,
+            catalog: remap.catalog_superseded,
+        },
+    })
 }
 
 /// A decoded (key, value) record pair from a catalog leaf node.
@@ -4922,24 +6877,38 @@ fn cat_key_cmp(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
 }
 
 /// Parse all (key, val) records out of a variable-kv leaf node.
+///
+/// Every geometry field is untrusted: the record count is checked against
+/// what the node can physically hold before anything is reserved for it, and
+/// every offset is bounds-checked, so a crafted node yields an error rather
+/// than a multi-gigabyte allocation or an arithmetic panic.
 fn parse_cat_leaf(node: &[u8]) -> Result<Vec<CatRecord>, &'static str> {
+    const TOC_ENTRY: usize = 8;
     let bsz = node.len();
+    if bsz < DATA_BASE + BTREE_INFO_SIZE {
+        return Err("node shorter than its header");
+    }
     let is_root = rd_u16(node, 32) & 0x1 != 0;
     let nkeys = rd_u32(node, 36) as usize;
     let toc_off = rd_u16(node, 40) as usize;
     let toc_len = rd_u16(node, 42) as usize;
-    let key_area = DATA_BASE + toc_off + toc_len;
-    let val_area_end = bsz - if is_root { BTREE_INFO_SIZE } else { 0 };
     let toc_base = DATA_BASE + toc_off;
+    let key_area = toc_base + toc_len;
+    let val_area_end = bsz - if is_root { BTREE_INFO_SIZE } else { 0 };
+    // A table entry is 8 bytes, so the node cannot hold more records than
+    // its table area has entries.
+    if nkeys > toc_len / TOC_ENTRY || key_area > val_area_end {
+        return Err("record count exceeds the node's table");
+    }
     let mut out = Vec::with_capacity(nkeys);
     for i in 0..nkeys {
-        let te = toc_base + i * 8;
+        let te = toc_base + i * TOC_ENTRY;
         let k_off = rd_u16(node, te) as usize;
         let k_len = rd_u16(node, te + 2) as usize;
         let v_off = rd_u16(node, te + 4) as usize;
         let v_len = rd_u16(node, te + 6) as usize;
         let ks = key_area + k_off;
-        let vs = val_area_end - v_off;
+        let vs = val_area_end.checked_sub(v_off).ok_or("val oob")?;
         let key = node.get(ks..ks + k_len).ok_or("key oob")?.to_vec();
         let val = node.get(vs..vs + v_len).ok_or("val oob")?.to_vec();
         out.push(CatRecord { key, val });
@@ -5004,6 +6973,8 @@ pub fn verify_fsroot<D: WritableBlockDevice>(
     let foot_longest_key = rd_u32(&root, bti + 16);
     let foot_longest_val = rd_u32(&root, bti + 20);
 
+    let foot_node_count = rd_u64(&root, bti + 32);
+
     let mut stats = VerifyStats::default();
     let mut longest_key = 0u32;
     let mut longest_val = 0u32;
@@ -5011,13 +6982,19 @@ pub fn verify_fsroot<D: WritableBlockDevice>(
         txn,
         &omap_node,
         &root,
-        None,
+        NodeBounds::default(),
         bsz,
         &mut stats,
         &mut longest_key,
         &mut longest_val,
     )?;
 
+    if foot_node_count != stats.nodes {
+        return Err(format!(
+            "fsroot bt_node_count footer={foot_node_count} != walked nodes={}",
+            stats.nodes
+        ));
+    }
     if foot_key_count != stats.records {
         return Err(format!(
             "fsroot bt_key_count footer={foot_key_count} != walked leaf records={}",
@@ -5058,21 +7035,67 @@ fn fmt_cat_key(k: &[u8]) -> String {
     }
 }
 
+/// Deeper than any catalog tree a volume holds; a chain past it is a cycle.
+const VERIFY_MAX_DEPTH: u8 = 32;
+/// Size of an index record's value in an unsealed catalog: the child's oid.
+const CATALOG_INDEX_VAL_SIZE: usize = 8;
+
+/// What a node's parent says about it. The root has no parent: no bounds,
+/// any level, and it alone carries the root flag.
+#[derive(Default, Clone, Copy)]
+struct NodeBounds<'a> {
+    /// The separator the parent stored for this node: its first key.
+    min_key: Option<&'a [u8]>,
+    /// The separator of the parent's next child: every key here is below it.
+    below_key: Option<&'a [u8]>,
+    /// One level below the parent's.
+    level: Option<u16>,
+    /// Steps from the root.
+    depth: u8,
+}
+
 /// Recursive worker for [`verify_fsroot`]. Validates one catalog node and (for an
-/// internal node) descends into every child, threading the parent-separator key
-/// and the running longest-key/val + node/record counters.
+/// internal node) descends into every child, threading the bounds its parent
+/// sets and the running longest-key/val + node/record counters.
 #[allow(clippy::too_many_arguments)]
 fn verify_cat_node<D: WritableBlockDevice>(
     txn: &mut Transaction<D>,
     omap_node: &[u8],
     node: &[u8],
-    expect_min_key: Option<&[u8]>,
+    bounds: NodeBounds<'_>,
     bsz: usize,
     stats: &mut VerifyStats,
     longest_key: &mut u32,
     longest_val: &mut u32,
 ) -> Result<(), String> {
     let level = rd_u16(node, 34);
+    let flags = rd_u16(node, 32);
+    if bounds.depth > VERIFY_MAX_DEPTH {
+        return Err(format!(
+            "catalog tree deeper than {VERIFY_MAX_DEPTH} levels (a cycle)"
+        ));
+    }
+    if let Some(want) = bounds.level {
+        if level != want {
+            return Err(format!(
+                "catalog child at level {level}, its parent wants {want}"
+            ));
+        }
+    }
+    let is_root = bounds.level.is_none();
+    if (flags & BTNODE_ROOT != 0) != is_root {
+        return Err(format!(
+            "catalog node root flag {} on a {} node (level {level})",
+            flags & BTNODE_ROOT != 0,
+            if is_root { "root" } else { "child" }
+        ));
+    }
+    if (flags & BTNODE_LEAF != 0) != (level == 0) {
+        return Err(format!(
+            "catalog node leaf flag {} at level {level}",
+            flags & BTNODE_LEAF != 0
+        ));
+    }
     stats.nodes += 1;
     let recs =
         parse_cat_leaf(node).map_err(|e| format!("parse catalog node (level {level}): {e}"))?;
@@ -5081,10 +7104,20 @@ fn verify_cat_node<D: WritableBlockDevice>(
     }
     // Separator invariant: this node's minimum key must equal the key the parent
     // stored as the separator for it. (The root has no parent → skip.)
-    if let Some(min) = expect_min_key {
+    if let Some(min) = bounds.min_key {
         if recs[0].key.as_slice() != min {
             return Err(format!(
                 "catalog node min key != parent separator (level {level})"
+            ));
+        }
+    }
+    // Every key sits below the separator of the parent's next child.
+    if let (Some(below), Some(last)) = (bounds.below_key, recs.last()) {
+        if cat_key_cmp(&last.key, below) != core::cmp::Ordering::Less {
+            return Err(format!(
+                "catalog node last key {} reaches the next separator {} (level {level})",
+                fmt_cat_key(&last.key),
+                fmt_cat_key(below)
             ));
         }
     }
@@ -5152,10 +7185,11 @@ fn verify_cat_node<D: WritableBlockDevice>(
             stats.records += 1;
         }
     } else {
-        for r in &recs {
-            if r.val.len() < 8 {
+        for (i, r) in recs.iter().enumerate() {
+            if r.val.len() != CATALOG_INDEX_VAL_SIZE {
                 return Err(format!(
-                    "internal catalog value shorter than 8 bytes (level {level})"
+                    "internal catalog value of {} bytes, not {CATALOG_INDEX_VAL_SIZE} (level {level})",
+                    r.val.len()
                 ));
             }
             let child_oid = rd_u64(&r.val, 0);
@@ -5165,11 +7199,20 @@ fn verify_cat_node<D: WritableBlockDevice>(
             let mut child = vec![0u8; bsz];
             txn.read_block(child_paddr, &mut child)
                 .map_err(|e| format!("read child node paddr {child_paddr}: {e}"))?;
+            let next = recs
+                .get(i + 1)
+                .map(|n| n.key.as_slice())
+                .or(bounds.below_key);
             verify_cat_node(
                 txn,
                 omap_node,
                 &child,
-                Some(&r.key),
+                NodeBounds {
+                    min_key: Some(&r.key),
+                    below_key: next,
+                    level: Some(level.saturating_sub(1)),
+                    depth: bounds.depth.saturating_add(1),
+                },
                 bsz,
                 stats,
                 longest_key,
@@ -5229,6 +7272,10 @@ pub fn upsert_catalog_record(
 fn pack_cat_leaf(node: &[u8], recs: Vec<CatRecord>) -> Result<Vec<u8>, &'static str> {
     let bsz = node.len();
     let nkeys = recs.len();
+    let footer_at = bsz
+        .checked_sub(BTREE_INFO_SIZE)
+        .filter(|&f| f >= DATA_BASE)
+        .ok_or("short node")?;
 
     let mut out = vec![0u8; bsz];
     // Copy obj_phys header + node fields verbatim, then overwrite layout fields.
@@ -5236,34 +7283,45 @@ fn pack_cat_leaf(node: &[u8], recs: Vec<CatRecord>) -> Result<Vec<u8>, &'static 
     // btree_info_t footer copied verbatim (root node); we patch longest_*.
     wr_bytes(
         &mut out,
-        bsz - BTREE_INFO_SIZE,
-        node.get(bsz - BTREE_INFO_SIZE..).ok_or("short footer")?,
+        footer_at,
+        node.get(footer_at..).ok_or("short footer")?,
     );
 
-    // TOC capacity. A non-empty node packs the table of contents tightly
-    // (nkeys * 8 bytes per kvloc entry). An EMPTY node must still reserve a
-    // non-zero TOC area: the kernel's canonical empty b-tree root reserves
-    // 64 bytes (8 kvloc slots) with table_space.len == 64. A node packed with
-    // table_space.len == 0 is rejected by fsck_apfs ("tree is invalid"). This
-    // only triggers when a single-node tree is emptied by deletion (e.g. the
-    // extentref tree after unlinking the last extent-bearing file).
+    // TOC capacity: whole steps of entries (see TOC_STEP), one step for an
+    // EMPTY node - the kernel's canonical empty b-tree root reserves 64 bytes
+    // (8 kvloc slots), and a node packed with table_space.len == 0 is
+    // rejected by fsck_apfs ("tree is invalid"). An exact table only when the
+    // records leave no room for the rounding.
     // [CERTAIN: empirical - kernel fresh-format empty extentref node carries
-    //  table_space(off=0,len=64), free_space(off=0,len=3936); reproducing it
-    //  byte-for-byte makes fsck CLEAN. To be confirmed via the APFS specification (the APFS spec).]
-    const EMPTY_TOC_CAP: usize = 64;
-    let toc_cap = if nkeys == 0 { EMPTY_TOC_CAP } else { nkeys * 8 };
-    let key_area = DATA_BASE + toc_cap;
-    let val_area_end = bsz - BTREE_INFO_SIZE; // root node
+    //  table_space(off=0,len=64), free_space(off=0,len=3936)]
+    let kv_bytes: usize = recs.iter().map(|r| r.key.len() + r.val.len()).sum();
+    let toc_cap = if DATA_BASE + fstree_toc_len(nkeys) + kv_bytes <= footer_at {
+        fstree_toc_len(nkeys)
+    } else {
+        nkeys.checked_mul(8).ok_or("node overflow")?
+    };
+    let key_area = DATA_BASE.checked_add(toc_cap).ok_or("node overflow")?;
+    let val_area_end = footer_at; // root node
+    if key_area > val_area_end {
+        return Err("node overflow");
+    }
 
     let mut key_cursor = key_area;
     let mut val_cursor = val_area_end;
     let mut longest_k = 0u32;
     let mut longest_v = 0u32;
     for (i, r) in recs.iter().enumerate() {
+        // Room for this record is checked before anything is written: the
+        // keys grow up and the values down, and they must not cross.
+        let key_end = key_cursor.checked_add(r.key.len()).ok_or("node overflow")?;
+        let val_start = val_cursor.checked_sub(r.val.len()).ok_or("node overflow")?;
+        if key_end > val_start {
+            return Err("node overflow");
+        }
         let k_off = key_cursor - key_area;
         wr_bytes(&mut out, key_cursor, &r.key);
-        key_cursor += r.key.len();
-        val_cursor -= r.val.len();
+        key_cursor = key_end;
+        val_cursor = val_start;
         wr_bytes(&mut out, val_cursor, &r.val);
         let v_off = val_area_end - val_cursor;
         let te = DATA_BASE + i * 8;
@@ -5273,9 +7331,6 @@ fn pack_cat_leaf(node: &[u8], recs: Vec<CatRecord>) -> Result<Vec<u8>, &'static 
         wr_u16(&mut out, te + 6, r.val.len() as u16);
         longest_k = longest_k.max(r.key.len() as u32);
         longest_v = longest_v.max(r.val.len() as u32);
-        if key_cursor > val_cursor {
-            return Err("node overflow");
-        }
     }
     // Node header layout fields.
     wr_u32(&mut out, 36, nkeys as u32); // btn_nkeys
@@ -5290,7 +7345,7 @@ fn pack_cat_leaf(node: &[u8], recs: Vec<CatRecord>) -> Result<Vec<u8>, &'static 
     wr_u16(&mut out, 52, BTOFF_INVALID); // val_free_list.off
     wr_u16(&mut out, 54, 0);
     // Footer longest_key/longest_val (variable-kv → ksz/vsz already 0).
-    let bti = bsz - BTREE_INFO_SIZE;
+    let bti = footer_at;
     wr_u32(&mut out, bti + 16, longest_k);
     wr_u32(&mut out, bti + 20, longest_v);
     wr_u64(&mut out, bti + 24, nkeys as u64); // key_count
@@ -5318,6 +7373,9 @@ pub fn set_volume_label<D: WritableBlockDevice>(
     vsb_raw: &[u8],
     new_label: &str,
 ) -> Result<(), TxnError> {
+    let vsb_now = txn.current_vsb(vsb_raw)?;
+    let vsb_raw = vsb_now.as_slice();
+    ensure_volume_mutable(vsb_raw)?;
     let bsz = txn.nx.block_size as usize;
     let new_xid = txn.xid;
     let now = now_ns();
@@ -5374,10 +7432,14 @@ pub fn move_entry<D: WritableBlockDevice>(
     new_name: &str,
     replace_if_exists: bool,
 ) -> Result<(), TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, vol_omap_raw)?;
+    let (vsb_raw, vol_omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
+    validate_entry_name(new_name)?;
     let bsz = txn.nx.block_size as usize;
     let new_xid = txn.xid;
     let now = now_ns();
     let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
+    ensure_volume_mutable(vsb_raw)?;
     let incompat = rd_u64(vsb_raw, VSBI_INCOMPAT_FEATURES);
     let case_fold = incompat & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
     let normalize = true;
@@ -5385,10 +7447,17 @@ pub fn move_entry<D: WritableBlockDevice>(
     let omap_tree_paddr = rd_u64(vol_omap_raw, 48);
     let mut omap_node = vec![0u8; bsz];
     txn.read_block(omap_tree_paddr, &mut omap_node)?;
-    let all = collect_fstree(txn, &omap_node, root_tree_oid, bsz)?;
+    let old_drec_key = build_drec_key(old_parent_ino, old_name, case_fold, normalize);
+    let new_drec_key = build_drec_key(new_parent_ino, new_name, case_fold, normalize);
+    let all = gather_entries(
+        txn,
+        &omap_node,
+        root_tree_oid,
+        &[&old_drec_key, &new_drec_key],
+        bsz,
+    )?;
 
     // Locate old DREC -> file_id, date_added, dt_type.
-    let old_drec_key = build_drec_key(old_parent_ino, old_name, case_fold, normalize);
     let drec_val = all
         .iter()
         .find(|(k, _)| *k == old_drec_key)
@@ -5426,38 +7495,71 @@ pub fn move_entry<D: WritableBlockDevice>(
                 if cur <= 2 {
                     break;
                 }
-                let ancestor_key = build_inode_key(cur);
-                match all
-                    .iter()
-                    .find(|(k, _)| *k == ancestor_key)
-                    .map(|(_, v)| v.as_slice())
-                {
-                    Some(v) => cur = rd_u64(v, 0),
+                match inode_value(txn, &omap_node, root_tree_oid, cur, &all, bsz)? {
+                    Some(v) => cur = rd_u64(&v, 0),
                     None => break,
                 }
             }
         }
     }
 
-    // Rebuild inode: update parent_id + NAME xfield, bump mtime + ctime.
-    let mut new_inode_val = rebuild_inode_with_name(&old_inode_val, new_name, now);
-    // Overwrite parent_id (offset 0 in j_inode_val fixed prefix).
-    wr_u64(&mut new_inode_val, 0, new_parent_ino);
-    // Also bump mod_time (rebuild_inode_with_name only bumps change_time).
-    wr_u64(&mut new_inode_val, INODE_MOD_TIME, now);
+    // A name that is one of several carries the sibling id binding it to the
+    // inode, and the record behind that id names both the name and the
+    // directory holding it - a move changes both.
+    let sibling_id = drec_sibling_id(&drec_val);
+    let moves_primary = match sibling_id {
+        None => true,
+        Some(sid) => {
+            let lowest = all
+                .iter()
+                .filter(|(k, _)| {
+                    rd_u64(k, 0) >> 60 == APFS_TYPE_SIBLING_LINK
+                        && rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF == file_id
+                })
+                .map(|(k, _)| rd_u64(k, 8))
+                .min();
+            lowest == Some(sid)
+        }
+    };
+
+    // Rebuild inode: update parent_id + NAME xfield, bump mtime + ctime. The
+    // inode describes the primary link, so moving any other name leaves both
+    // alone and only the timestamps move.
+    let new_inode_val = if moves_primary {
+        let mut v = rebuild_inode_with_name(&old_inode_val, new_name, now);
+        // Overwrite parent_id (offset 0 in j_inode_val fixed prefix).
+        wr_u64(&mut v, 0, new_parent_ino);
+        v
+    } else {
+        let mut v = old_inode_val.clone();
+        wr_u64(&mut v, INODE_CHANGE_TIME, now);
+        v
+    };
+    // Only the change time moves: the file's content is untouched by a move,
+    // and macOS leaves its modification time alone (measured in
+    // `tests/rename_times.rs`); the directories' times move below.
 
     // New DREC under new_parent_ino with new_name (preserve date_added + dt_type).
-    let new_drec_key = build_drec_key(new_parent_ino, new_name, case_fold, normalize);
     let new_drec = (
         new_drec_key.clone(),
-        build_drec_val(file_id, date_added, dt_type),
+        match sibling_id {
+            Some(sid) => build_drec_val_with_sibling(file_id, date_added, dt_type, sid),
+            None => build_drec_val(file_id, date_added, dt_type),
+        },
     );
 
     // Detect an existing target with `new_name` under `new_parent_ino`. If
     // present and `replace_if_exists`, collect its records + owned blocks
     // for the same transaction; otherwise return AlreadyExists.
-    let target_replace =
-        collect_replace_target(&all, &new_drec_key, file_id, replace_if_exists, bsz)?;
+    let target_replace = collect_replace_target(
+        &all,
+        &new_drec_key,
+        file_id,
+        replace_if_exists,
+        bsz,
+        case_fold,
+        normalize,
+    )?;
 
     // Free target's data blocks (if any are owned by the live extref tree).
     let target_data_blocks: Vec<(u64, u64)> = target_replace
@@ -5476,41 +7578,64 @@ pub fn move_entry<D: WritableBlockDevice>(
     }
     let new_records = vec![new_drec, (inode_key, new_inode_val)];
 
-    // Apply nchildren deltas directly to the collected records.
-    // We pass parent_patch=None to rewrite_fstree and do this ourselves so
-    // we can handle two distinct parent inodes in one pass.
+    // Apply nchildren deltas to both parents in one pass. Deltas depend on
+    // whether a target was replaced and whether the move is same-parent or
+    // cross-parent:
+    //
+    //   cross-parent, no replace: old -1, new +1  (one entry moves between dirs)
+    //   cross-parent, with replace: old -1, new  0  (target slot filled by src)
+    //   same-parent,  no replace: same  0          (in-place rename)
+    //   same-parent,  with replace: same -1        (two entries collapse into one)
     let same_parent = old_parent_ino == new_parent_ino;
-    let (new_omap_tree_paddr, node_delta) = {
-        // We need a version of rewrite_fstree that can patch two parents.
-        // Strategy: pre-patch the collected records, then call with parent_patch=None.
-        // collect_fstree was already called above; replay inline.
+    let replacing = target_replace.is_some();
+    let old_parent_delta: i64 = if same_parent {
+        if replacing {
+            -1
+        } else {
+            0
+        }
+    } else {
+        -1
+    };
+    let new_parent_delta: i64 = if same_parent || replacing { 0 } else { 1 };
+
+    let (new_omap_tree_paddr, node_delta, reclaim) = if catalog_by_paths(txn, vsb_raw) {
+        // The rebuild below in edit form, in the same order: the parents,
+        // the sibling link, what replacing leaves changed, the removals, then
+        // the new records (refused if already present).
+        let mut batch = EditBatch::new();
+        batch.push(
+            build_inode_key(old_parent_ino),
+            entries_changed(old_parent_ino, old_parent_delta, now),
+        )?;
+        if !same_parent {
+            batch.push(
+                build_inode_key(new_parent_ino),
+                entries_changed(new_parent_ino, new_parent_delta, now),
+            )?;
+        }
+        if let Some(sid) = sibling_id {
+            batch.push(
+                build_sibling_link_key(file_id, sid),
+                EditOp::Update(build_sibling_link_val(new_parent_ino, new_name)),
+            )?;
+        }
+        if let Some(ref tr) = target_replace {
+            for (k, v) in &tr.updates {
+                batch.push(k.clone(), EditOp::Update(v.clone()))?;
+            }
+        }
+        for k in &remove_keys {
+            batch.push(k.clone(), EditOp::Remove)?;
+        }
+        for (k, v) in new_records {
+            batch.push(k, EditOp::Insert(v))?;
+        }
+        let rw = rewrite_catalog_batch(txn, vsb_raw, &omap_node, new_xid, batch, bsz)?;
+        (rw.omap_tree_paddr, rw.node_delta, rw.reclaim)
+    } else {
         let root_oid = root_tree_oid;
         let mut recs = collect_fstree(txn, &omap_node, root_oid, bsz)?;
-
-        // Apply parent nchildren patches. Deltas depend on whether a target
-        // was replaced and whether the move is same-parent or cross-parent:
-        //
-        //   cross-parent, no replace: old -1, new +1  (one entry moves between dirs)
-        //   cross-parent, with replace: old -1, new  0  (target slot filled by src)
-        //   same-parent,  no replace: same  0          (in-place rename)
-        //   same-parent,  with replace: same -1        (two entries collapse into one)
-        let replacing = target_replace.is_some();
-        let old_parent_delta: i64 = if same_parent {
-            if replacing {
-                -1
-            } else {
-                0
-            }
-        } else {
-            -1
-        };
-        let new_parent_delta: i64 = if same_parent {
-            0
-        } else if replacing {
-            0
-        } else {
-            1
-        };
 
         for (k, v) in recs.iter_mut() {
             let oid = rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF;
@@ -5519,21 +7644,44 @@ pub fn move_entry<D: WritableBlockDevice>(
                 continue;
             }
             if oid == old_parent_ino {
+                refuse_dir_stats(v, oid)?;
                 if old_parent_delta != 0 {
                     let nch = rd_u32(v, INODE_NCHILDREN) as i64;
                     wr_u32(v, INODE_NCHILDREN, (nch + old_parent_delta).max(0) as u32);
                 }
-                // Always bump mtime/ctime on old parent.
+                // Always bump mtime/ctime on old parent: its entries changed.
                 wr_u64(v, INODE_MOD_TIME, now);
                 wr_u64(v, INODE_CHANGE_TIME, now);
+                step_write_generation(v);
             }
             if oid == new_parent_ino && !same_parent {
+                refuse_dir_stats(v, oid)?;
                 if new_parent_delta != 0 {
                     let nch = rd_u32(v, INODE_NCHILDREN) as i64;
                     wr_u32(v, INODE_NCHILDREN, (nch + new_parent_delta).max(0) as u32);
                 }
                 wr_u64(v, INODE_MOD_TIME, now);
                 wr_u64(v, INODE_CHANGE_TIME, now);
+                step_write_generation(v);
+            }
+        }
+
+        // Point the moved name's sibling-link record at where it now lives.
+        if let Some(sid) = sibling_id {
+            let key = build_sibling_link_key(file_id, sid);
+            let val = build_sibling_link_val(new_parent_ino, new_name);
+            if let Some(slot) = recs.iter_mut().find(|(k, _)| *k == key) {
+                slot.1 = val;
+            }
+        }
+        // What replacing the target leaves changed rather than removed: a
+        // shared stream's count, a hard-linked inode re-pointed at its next
+        // name.
+        if let Some(ref tr) = target_replace {
+            for (k, v) in &tr.updates {
+                if let Some(slot) = recs.iter_mut().find(|(rk, _)| rk == k) {
+                    slot.1 = v.clone();
+                }
             }
         }
 
@@ -5575,7 +7723,7 @@ pub fn move_entry<D: WritableBlockDevice>(
         } else {
             let cap = node_capacity(bsz, false);
             let mut parent_entries: Vec<(Vec<u8>, u64)> = Vec::new();
-            for chunk in partition_records(&recs, cap) {
+            for chunk in partition_records(&recs, cap)? {
                 let oid = txn.alloc_oid();
                 let p = txn.alloc_block()?;
                 txn.stage_raw(
@@ -5616,7 +7764,7 @@ pub fn move_entry<D: WritableBlockDevice>(
                     break;
                 }
                 let mut next: Vec<(Vec<u8>, u64)> = Vec::new();
-                for chunk in partition_records(&lvl_recs, cap) {
+                for chunk in partition_records(&lvl_recs, cap)? {
                     let oid = txn.alloc_oid();
                     let p = txn.alloc_block()?;
                     txn.stage_raw(
@@ -5632,44 +7780,55 @@ pub fn move_entry<D: WritableBlockDevice>(
             }
         }
 
-        let mut omap_triples: Vec<(u64, u64, u64)> = omap_entries
+        // Walk the WHOLE old omap. Reading just the root misses every mapping
+        // once the omap has split, and misreads an index root as a leaf.
+        let old_omap_triples = collect_omap_triples(txn, &omap_node, omap_tree_paddr, bsz)?;
+
+        let mut omap_triples: Vec<OmapRec> = omap_entries
             .iter()
-            .map(|&(oid, p)| (oid, new_xid, p))
+            .map(|&(oid, p)| OmapRec::live(oid, new_xid, p, bsz))
             .collect();
         let has_snapshot = rd_u64(vsb_raw, VSBI_NUM_SNAPSHOTS) > 0;
-        if has_snapshot {
+        let newest_snap = if has_snapshot {
             let vol_omap_paddr = rd_u64(vsb_raw, VSBI_OMAP_OID);
             let mut vom = vec![0u8; bsz];
             txn.read_block(vol_omap_paddr, &mut vom)?;
-            let newest_snap = rd_u64(&vom, 64);
+            rd_u64(&vom, 64) // om_most_recent_snap
+        } else {
+            0
+        };
+        if has_snapshot {
             let new_pairs: std::collections::HashSet<(u64, u64)> =
-                omap_triples.iter().map(|&(o, x, _)| (o, x)).collect();
-            for (oid, xid, p) in parse_omap_entries(&omap_node, bsz) {
-                if !new_pairs.contains(&(oid, xid)) && xid <= newest_snap {
-                    omap_triples.push((oid, xid, p));
+                omap_triples.iter().map(|r| (r.oid, r.xid)).collect();
+            for r in &old_omap_triples {
+                if !new_pairs.contains(&(r.oid, r.xid)) && r.xid <= newest_snap {
+                    omap_triples.push(*r);
                 }
             }
         }
 
-        let new_omap_tree_paddr = txn.alloc_block()?;
-        let node = build_omap_node(&omap_node, &omap_triples, new_omap_tree_paddr, new_xid, bsz);
-        txn.stage_raw(new_omap_tree_paddr, node);
+        // Build a possibly multi-node omap. The single-node builder writes one
+        // node whatever it is given: past its capacity it ran off the end of the
+        // value area (a subtraction overflow in debug, a wrapped offset and a
+        // corrupt node in release) and, on an already-split omap, replaced the
+        // whole tree with a single node that orphaned every real leaf.
+        let (new_omap_tree_paddr, _new_omap_node_count) =
+            build_omap_tree(txn, &omap_node, &omap_triples, new_xid, bsz)?;
 
-        let old_catalog_nodes = parse_omap_entries(&omap_node, bsz).len() as i64;
+        // Count only the entries actually being replaced. Snapshot-pinned
+        // carries appear in both the old and the new omap at the same paddr, so
+        // counting them here would report growth that never happened.
+        let old_replaceable_nodes = old_omap_triples
+            .iter()
+            .filter(|r| r.xid > newest_snap)
+            .count() as i64;
         let new_catalog_nodes = omap_entries.len() as i64;
-        let node_delta = new_catalog_nodes - old_catalog_nodes;
-        (new_omap_tree_paddr, node_delta)
+        let node_delta = new_catalog_nodes - old_replaceable_nodes;
+        (new_omap_tree_paddr, node_delta, Reclaim::Whole)
     };
 
     // COW the volume omap header.
-    let new_vomap_paddr = txn.alloc_block()?;
-    let mut new_vomap = vol_omap_raw.to_vec();
-    new_vomap.resize(bsz, 0);
-    wr_u64(&mut new_vomap, 8, new_vomap_paddr);
-    wr_u64(&mut new_vomap, 16, new_xid);
-    wr_u64(&mut new_vomap, 48, new_omap_tree_paddr);
-    update_checksum_in_place(&mut new_vomap);
-    txn.stage_raw(new_vomap_paddr, new_vomap);
+    let new_vomap_paddr = stage_vomap_header(txn, vol_omap_raw, new_xid, new_omap_tree_paddr, bsz)?;
 
     // Stage the updated (virtual) volume superblock. When a target was
     // replaced we also patch the extentref tree pointer (if any blocks
@@ -5681,21 +7840,18 @@ pub fn move_entry<D: WritableBlockDevice>(
     wr_u64(&mut new_vsb, VSBI_OMAP_OID, new_vomap_paddr);
     wr_u64(&mut new_vsb, VSBI_EXTENTREF_TREE_OID, new_extref_paddr);
     // Reclaim COW-replaced metadata. extref_old_padrs is empty when no blocks freed. [#151]
-    // move_entry always uses the full rebuild (no incremental fast path), so the
-    // old catalog nodes are genuinely superseded → reclaim them (skip = false).
     let frm_correction = free_replaced_metadata(
         txn,
         vsb_raw,
         vol_omap_raw,
         &omap_node,
         &extref_old_padrs,
-        false,
+        &reclaim,
         bsz,
     )?;
 
-    if target_replace.is_some() {
-        let num_files = rd_u64(&new_vsb, VSBI_NUM_FILES);
-        wr_u64(&mut new_vsb, VSBI_NUM_FILES, num_files.saturating_sub(1));
+    if let Some(ref tr) = target_replace {
+        uncount_replaced(&mut new_vsb, tr);
     }
     let fs_alloc = rd_u64(&new_vsb, VSBI_FS_ALLOC_COUNT) as i64;
     let alloc_delta = -(freed_count as i64) + node_delta + extref_node_delta + frm_correction;
@@ -5743,10 +7899,13 @@ pub fn set_inode_attrs<D: WritableBlockDevice>(
     bsd_flags_set: Option<u32>,
     bsd_flags_clear: Option<u32>,
 ) -> Result<(), TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, vol_omap_raw)?;
+    let (vsb_raw, vol_omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
     let bsz = txn.nx.block_size as usize;
     let new_xid = txn.xid;
     let now = now_ns();
     let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
+    ensure_volume_mutable(vsb_raw)?;
     let incompat = rd_u64(vsb_raw, VSBI_INCOMPAT_FEATURES);
     let case_fold = incompat & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
     let normalize = true;
@@ -5754,10 +7913,10 @@ pub fn set_inode_attrs<D: WritableBlockDevice>(
     let omap_tree_paddr = rd_u64(vol_omap_raw, 48);
     let mut omap_node = vec![0u8; bsz];
     txn.read_block(omap_tree_paddr, &mut omap_node)?;
-    let all = collect_fstree(txn, &omap_node, root_tree_oid, bsz)?;
+    let drec_key = build_drec_key(parent_ino, name, case_fold, normalize);
+    let all = gather_entries(txn, &omap_node, root_tree_oid, &[&drec_key], bsz)?;
 
     // Locate DREC -> file_id.
-    let drec_key = build_drec_key(parent_ino, name, case_fold, normalize);
     let file_id = all
         .iter()
         .find(|(k, _)| *k == drec_key)
@@ -5778,8 +7937,6 @@ pub fn set_inode_attrs<D: WritableBlockDevice>(
     // j_inode_val fixed field offsets (empirical, confirmed by InodeValArgs):
     //   0: parent_id, 8: private_id, 16: create_time (btime), 24: mod_time,
     //  32: change_time, 40: access_time, 56: nchildren_or_nlink, 80: mode
-    const INODE_CREATE_TIME: usize = 16; // btime (birth time)
-    const INODE_ACCESS_TIME: usize = 40;
     const INODE_MODE: usize = 80;
 
     if let Some(t) = btime_ns {
@@ -5787,6 +7944,12 @@ pub fn set_inode_attrs<D: WritableBlockDevice>(
     }
     if let Some(t) = mtime_ns {
         wr_u64(&mut new_inode_val, INODE_MOD_TIME, t);
+        // A modification time set earlier than the birth time pulls the
+        // birth time back to it (measured on macOS with `touch -t` in
+        // `tests/link_clone_times.rs`).
+        if t < rd_u64(&new_inode_val, INODE_CREATE_TIME) {
+            wr_u64(&mut new_inode_val, INODE_CREATE_TIME, t);
+        }
     }
     if let Some(t) = ctime_ns {
         wr_u64(&mut new_inode_val, INODE_CHANGE_TIME, t);
@@ -5813,7 +7976,11 @@ pub fn set_inode_attrs<D: WritableBlockDevice>(
     }
 
     // Rewrite fstree: remove old inode, insert updated inode (no parent nchildren change).
-    let (new_omap_tree_paddr, node_delta) = rewrite_fstree(
+    let FstreeRewrite {
+        omap_tree_paddr: new_omap_tree_paddr,
+        node_delta,
+        reclaim,
+    } = rewrite_fstree(
         txn,
         vsb_raw,
         &omap_node,
@@ -5826,18 +7993,11 @@ pub fn set_inode_attrs<D: WritableBlockDevice>(
     )?;
 
     // COW the volume omap header.
-    let new_vomap_paddr = txn.alloc_block()?;
-    let mut new_vomap = vol_omap_raw.to_vec();
-    new_vomap.resize(bsz, 0);
-    wr_u64(&mut new_vomap, 8, new_vomap_paddr);
-    wr_u64(&mut new_vomap, 16, new_xid);
-    wr_u64(&mut new_vomap, 48, new_omap_tree_paddr);
-    update_checksum_in_place(&mut new_vomap);
-    txn.stage_raw(new_vomap_paddr, new_vomap);
+    let new_vomap_paddr = stage_vomap_header(txn, vol_omap_raw, new_xid, new_omap_tree_paddr, bsz)?;
 
     // Reclaim COW-replaced metadata (set_inode_attrs never touches extentref).
     let frm_correction =
-        free_replaced_metadata(txn, vsb_raw, vol_omap_raw, &omap_node, &[], false, bsz)?;
+        free_replaced_metadata(txn, vsb_raw, vol_omap_raw, &omap_node, &[], &reclaim, bsz)?;
 
     // Stage the updated (virtual) volume superblock (counters unchanged).
     let vsb_oid = rd_u64(vsb_raw, 8);
@@ -5867,24 +8027,24 @@ pub enum TruncateOutcome {
     FastPathDeclined,
 }
 
-/// Metadata-only file resize - patches `dstream.size` and the inode mtime,
-/// without reading or writing any data blocks. Covers two cases on the fast
-/// path: any extend (`new_size >= current_size`) and any shrink that drops
-/// only whole past-EOF extents (no partial-extent boundary cut needed).
+/// Resize a file without reading or rewriting its content.
 ///
-/// For an extend, the resulting file is sparse: read past `alloced_size`
-/// returns zeros, and a subsequent write into the extended range materialises
-/// the blocks lazily through `write_file`.
+/// An extend (`new_size >= current_size`) only moves the size: the new tail
+/// is a hole that reads as zeros, and a later write into it gets blocks.
 ///
-/// For an aligned shrink, the dropped extents' blocks are freed via the
-/// spaceman-free-queue / live-extref-tree pattern; the boundary extent (if
-/// any) is left intact, leaving at most `bsz - 1` bytes of internal slack
-/// (POSIX-legal, future M8 #5b can reclaim).
+/// A shrink cuts the stream at the new end, wherever it falls: extents past
+/// it go and the one across it is shortened ([`cut_stream`]), their blocks
+/// losing the file's reference through the live extent-reference tree. The
+/// block holding the new end is first rewritten with zeros past it
+/// ([`write_range`], one block), so that growing the file again reads zeros
+/// there.
 ///
 /// Returns:
 /// - `Ok(TruncateOutcome::Applied)` - done.
-/// - `Ok(TruncateOutcome::FastPathDeclined)` - out-of-scope (e.g. partial-
-///   extent boundary cut). The caller should fall back.
+/// - `Ok(TruncateOutcome::FastPathDeclined)` - nothing changed: the file is
+///   compressed, its stream is shared with a clone macOS made, or an extent
+///   is encrypted or not a whole number of blocks. The caller rewrites the
+///   whole content.
 /// - `Err(TxnError::NotFound)` - name not in parent.
 ///
 /// `current_size` is the file's current logical size (callers already know
@@ -5899,10 +8059,13 @@ pub fn truncate_file_fast<D: WritableBlockDevice>(
     new_size: u64,
     current_size: u64,
 ) -> Result<TruncateOutcome, TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, omap_raw)?;
+    let (vsb_raw, omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
     let bsz = txn.nx.block_size as usize;
     let new_xid = txn.xid;
     let now = now_ns();
     let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
+    ensure_volume_mutable(vsb_raw)?;
     let incompat = rd_u64(vsb_raw, VSBI_INCOMPAT_FEATURES);
     let case_fold = incompat & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
     let normalize = true;
@@ -5910,41 +8073,56 @@ pub fn truncate_file_fast<D: WritableBlockDevice>(
     let omap_tree_paddr = rd_u64(omap_raw, 48);
     let mut omap_node = vec![0u8; bsz];
     txn.read_block(omap_tree_paddr, &mut omap_node)?;
-    let all = collect_fstree(txn, &omap_node, root_tree_oid, bsz)?;
-
     let drec_key = build_drec_key(parent_ino, name, case_fold, normalize);
+    let all = gather_entries(txn, &omap_node, root_tree_oid, &[&drec_key], bsz)?;
+
     let file_id = all
         .iter()
         .find(|(k, _)| *k == drec_key)
         .map(|(_, v)| rd_u64(v, 0) & 0x0FFF_FFFF_FFFF_FFFF)
         .ok_or_else(|| TxnError::NotFound(format!("'{name}' not in parent {parent_ino}")))?;
 
-    // Walk extents for this file; classify each as keep / drop on shrink.
-    // For extend, every extent is kept (no walk needed) - but we still need
-    // total alloced size to write into the new inode's dstream xfield.
-    let mut old_inode_val: Option<Vec<u8>> = None;
-    let mut old_alloced: u64 = 0;
-    let mut extents: Vec<(u64, u64, u64, u64)> = Vec::new(); // (logical_addr, length_bytes, phys_start, block_count)
-    for (k, v) in &all {
-        let oid = rd_u64(k, 0) & 0x0FFF_FFFF_FFFF_FFFF;
-        let ty = rd_u64(k, 0) >> 60;
-        if oid != file_id {
-            continue;
-        }
-        if ty == APFS_TYPE_INODE {
-            old_inode_val = Some(v.clone());
-        }
-        if ty == APFS_TYPE_FILE_EXTENT {
-            let logical_addr = rd_u64(k, 8);
-            let len_bytes = rd_u64(v, 0) & 0x00FF_FFFF_FFFF_FFFF;
-            let phys = rd_u64(v, 8);
-            let block_count = len_bytes / bsz as u64;
-            old_alloced += len_bytes;
-            extents.push((logical_addr, len_bytes, phys, block_count));
-        }
+    let old_inode_val = all
+        .iter()
+        .find(|(k, _)| *k == build_inode_key(file_id))
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| TxnError::NotFound(format!("inode {file_id}")))?;
+
+    // A compressed file's content lives in its decmpfs attribute and resource
+    // fork; the data stream holds none of it, so there is nothing here to
+    // resize and any change to the stream would be invisible to readers.
+    // Truncation has to keep the part it does not remove, which means reading
+    // the content back through the compression, cutting it, and writing it as
+    // a plain file - the read-and-rewrite path every caller already has for a
+    // declined fast path, and the one `overwrite_existing_file` completes by
+    // dropping the compression along with the old content.
+    if rd_u32(&old_inode_val, INOI_BSD_FLAGS) & UF_COMPRESSED != 0 {
+        return Ok(TruncateOutcome::FastPathDeclined);
     }
-    let old_inode_val =
-        old_inode_val.ok_or_else(|| TxnError::NotFound(format!("inode {file_id}")))?;
+
+    // The extents this path edits are keyed by the inode's stream id. A
+    // stream more than one inode names is shared with a clone macOS made:
+    // cutting it here would cut the other file too, so the file is first
+    // given a stream of its own (`unshare_stream`, or the read-and-rewrite
+    // path). A stream keyed by another id but named by this inode alone is
+    // this file's.
+    let stream_id = match rd_u64(&old_inode_val, INODE_PRIVATE_ID) {
+        0 => file_id,
+        id => id,
+    };
+    let stream_rec = all
+        .iter()
+        .find(|(k, _)| *k == build_dstream_id_key(stream_id))
+        .map(|(_, v)| rd_u32(v, 0));
+    if stream_rec.is_some_and(|n| n > 1) {
+        return Ok(TruncateOutcome::FastPathDeclined);
+    }
+    // The bytes the stream's extents cover, which an extend continues from.
+    let old_alloced: u64 = all
+        .iter()
+        .filter(|(k, _)| rd_u64(k, 0) == encode_jkey(stream_id, APFS_TYPE_FILE_EXTENT))
+        .map(|(_, v)| rd_u64(v, 0) & 0x00FF_FFFF_FFFF_FFFF)
+        .sum();
 
     // The full 92-byte fixed prefix and all xfields are forwarded via
     // rebuild_inode_preserving_unknown - only the name is extracted separately.
@@ -5955,21 +8133,47 @@ pub fn truncate_file_fast<D: WritableBlockDevice>(
         return Ok(TruncateOutcome::Applied);
     }
 
-    // ---- Extend (new_size > current_size): no extent change. ----
+    // ---- Extend (new_size > current_size): the tail becomes a hole. ----
+    // The bytes past the last real block own no blocks, but the stream still
+    // has to be described end to end: a hole extent (physical block 0) covers
+    // the tail, the allocated size counts it, and the inode counts the hole
+    // bytes and carries the sparse flag. Leaving the allocated size behind
+    // the size made fsck reject the stream outright ("dstream.size is greater
+    // than dstream.alloced_size", "invalid dstream"). This is what macOS
+    // writes for `truncate -s` past the end, measured in `truncate_extend.rs`.
+    // [CERTAIN: linux-apfs-rw/extents.c apfs_create_hole; apfsprogs/apfsck
+    //  extents.c parse_extent (phys 0 counts as sparse bytes) and inode.c
+    //  "wrong count of sparse bytes" / "wrong setting for sparse flag"]
     if new_size > current_size {
-        // Preserve unknown xfields from the original inode. [W4-FRAG-1]
-        let new_inode_val = rebuild_inode_preserving_unknown(
+        let new_alloced = new_size.div_ceil(bsz as u64) * bsz as u64;
+        let hole_len = new_alloced.saturating_sub(old_alloced);
+        let old_sparse = apfs_core::inode::Inode::parse(&old_inode_val)
+            .ok()
+            .and_then(|i| i.sparse_bytes)
+            .unwrap_or(0);
+        let inode_key = build_inode_key(file_id);
+        let new_inode_val = with_write_generation_step(rebuild_inode_with_sparse_bytes(
             &old_inode_val,
             old_name_str,
             Some(DstreamArgs {
                 size: new_size,
-                // alloced_size unchanged - sparse extension. Reading past the
-                // last extent returns zeros via the reader's extent-walk.
-                alloced_size: old_alloced,
+                alloced_size: new_alloced,
             }),
+            old_sparse + hole_len,
             now,
-        );
-        let inode_key = build_inode_key(file_id);
+        ));
+        let mut new_records = vec![(inode_key.clone(), new_inode_val)];
+        if hole_len > 0 {
+            new_records.push((
+                build_file_extent_key(stream_id, old_alloced),
+                build_file_extent_val(hole_len, 0),
+            ));
+        }
+        // A file created empty has no stream record yet; the stream it gains
+        // here needs its reference count.
+        if stream_rec.is_none() {
+            new_records.push((build_dstream_id_key(stream_id), build_dstream_id_val(1)));
+        }
         return finish_metadata_only_rewrite(
             txn,
             vsb_raw,
@@ -5977,89 +8181,128 @@ pub fn truncate_file_fast<D: WritableBlockDevice>(
             &omap_node,
             new_xid,
             now,
-            vec![(inode_key.clone(), new_inode_val)],
+            new_records,
             vec![inode_key],
             None,
+            0,
             bsz,
         )
         .map(|()| TruncateOutcome::Applied);
     }
 
-    // ---- Shrink: classify extents. Decline on boundary cut. ----
-    let new_alloced_eof = new_size; // file logical EOF; alloced is bsz-rounded
-    let mut keep_alloced: u64 = 0;
-    let mut drop_keys: Vec<Vec<u8>> = Vec::new();
-    let mut drop_runs: Vec<(u64, u64)> = Vec::new();
-    for &(logical_addr, len_bytes, phys, blk_count) in &extents {
-        let ext_end = logical_addr + len_bytes;
-        if ext_end <= new_alloced_eof {
-            keep_alloced = keep_alloced.max(ext_end);
-        } else if logical_addr >= new_alloced_eof {
-            drop_keys.push(build_file_extent_key(file_id, logical_addr));
-            drop_runs.push((phys, blk_count));
-        } else {
-            // Boundary: extent crosses the new EOF - needs partial-extent
-            // cut (M8 #5b). Decline so caller can fall back.
+    // ---- Shrink: the blocks past the new end go, the block holding it
+    // keeps nothing past it. ----
+    // A later extend only moves the size, so the bytes after the new end in
+    // the block that holds it have to read as zeros: they are zeroed first,
+    // through the range writer, in this transaction (a hole there already
+    // reads as zeros). The cut then works on the stream as that left it.
+    let b = bsz as u64;
+    let Some(map) = stream_extent_map(&all, stream_id, b) else {
+        return Ok(TruncateOutcome::FastPathDeclined);
+    };
+    if !new_size.is_multiple_of(b) && mapped_block(&map, new_size / b).is_some() {
+        let zeros = vec![0u8; (b - new_size % b) as usize];
+        if write_range(txn, vsb_raw, omap_raw, parent_ino, name, new_size, &zeros)?
+            == RangeWrite::Declined
+        {
             return Ok(TruncateOutcome::FastPathDeclined);
         }
     }
+    cut_stream(txn, vsb_raw, omap_raw, parent_ino, name, new_size)?;
+    Ok(TruncateOutcome::Applied)
+}
 
-    // Free dropped blocks against the live extref tree. [#151: multi-node aware]
-    let old_extref_paddr = rd_u64(vsb_raw, VSBI_EXTENTREF_TREE_OID);
-    // extref_update: Some((new_paddr, old_padrs, node_delta, freed_count)) or None.
-    let extref_update_opt = if drop_runs.is_empty() {
+/// Cut the stream of file `name` in directory `parent_ino` to `new_size`
+/// bytes, the block holding the new end already reading as zeros past it:
+/// the extents past the new end go, the one across it is shortened, and
+/// the blocks they mapped lose the file's reference the way every release
+/// does (freed when it was the last, lowered for a clone, recorded for a
+/// snapshot that holds them).
+/// [linux-apfs-rw: extents.c apfs_truncate / apfs_shrink_extent_tail;
+///  apfs_range_put_reference]
+fn cut_stream<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    vsb_raw: &[u8],
+    omap_raw: &[u8],
+    parent_ino: u64,
+    name: &str,
+    new_size: u64,
+) -> Result<(), TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, omap_raw)?;
+    let (vsb_raw, omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
+    let bsz = txn.nx.block_size as usize;
+    let b = bsz as u64;
+    let new_xid = txn.xid;
+    let now = now_ns();
+    let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
+    let case_fold = rd_u64(vsb_raw, VSBI_INCOMPAT_FEATURES) & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
+    let omap_tree_paddr = rd_u64(omap_raw, 48);
+    let mut omap_node = vec![0u8; bsz];
+    txn.read_block(omap_tree_paddr, &mut omap_node)?;
+    let drec_key = build_drec_key(parent_ino, name, case_fold, true);
+    let all = gather_entries(txn, &omap_node, root_tree_oid, &[&drec_key], bsz)?;
+    let file_id = all
+        .iter()
+        .find(|(k, _)| *k == drec_key)
+        .map(|(_, v)| rd_u64(v, 0) & 0x0FFF_FFFF_FFFF_FFFF)
+        .ok_or_else(|| TxnError::NotFound(format!("'{name}' not in parent {parent_ino}")))?;
+    let inode_key = build_inode_key(file_id);
+    let old_inode_val = all
+        .iter()
+        .find(|(k, _)| *k == inode_key)
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| TxnError::NotFound(format!("inode {file_id}")))?;
+    let stream_id = match rd_u64(&old_inode_val, INODE_PRIVATE_ID) {
+        0 => file_id,
+        id => id,
+    };
+    let mut map = stream_extent_map(&all, stream_id, b).ok_or_else(|| {
+        TxnError::Unsupported(format!("extents of inode {file_id} are not whole blocks"))
+    })?;
+    let old_map = map.clone();
+    let keep = new_size.div_ceil(b);
+    let end = map.last_key_value().map_or(0, |(s, (n, _))| s + n);
+    let released = if end > keep {
+        punch_extents(&mut map, keep, end - keep)
+    } else {
+        Vec::new()
+    };
+    let (mut remove_keys, mut new_records) = extent_record_changes(stream_id, &old_map, &map, b);
+    remove_keys.push(inode_key.clone());
+    let sparse: u64 = map
+        .values()
+        .filter(|(_, p)| *p == 0)
+        .map(|(n, _)| n * b)
+        .sum();
+    let alloced = map.last_key_value().map_or(0, |(s, (n, _))| (s + n) * b);
+    let old_name = extract_inode_name(&old_inode_val).unwrap_or(name);
+    new_records.push((
+        inode_key,
+        with_write_generation_step(rebuild_inode_with_sparse_bytes(
+            &old_inode_val,
+            old_name,
+            Some(DstreamArgs {
+                size: new_size,
+                alloced_size: alloced,
+            }),
+            sparse,
+            now,
+        )),
+    ));
+    // The cut blocks lose this file's reference: refcnt 1 -> removed and
+    // freed, shared -> lowered and kept, held by a snapshot -> a
+    // KIND_UPDATE(-1). [#0]
+    let extref_update = if released.is_empty() {
         None
     } else {
-        let (live_recs_pairs, _) = collect_extref_records(txn, old_extref_paddr, bsz)?;
-        let live_keys: Vec<Vec<u8>> = live_recs_pairs.into_iter().map(|(k, _)| k).collect();
-        let mut owned_keys: Vec<Vec<u8>> = Vec::new();
-        let mut owned_runs: Vec<(u64, u64)> = Vec::new();
-        for &(phys, count) in &drop_runs {
-            let key = build_phys_ext_key(phys);
-            if live_keys.contains(&key) {
-                owned_keys.push(key);
-                owned_runs.push((phys, count));
-            }
-        }
-        if owned_keys.is_empty() {
+        let (new_paddr, old_padrs, nd, freed) =
+            free_blocks_owned_by_live_extref(txn, vsb_raw, new_xid, &released, bsz)?;
+        if old_padrs.is_empty() && nd == 0 && freed == 0 {
             None
         } else {
-            let (new_paddr, old_padrs, nd) = rewrite_extref_tree(
-                txn,
-                old_extref_paddr,
-                new_xid,
-                vec![],
-                &owned_keys,
-                &[],
-                bsz,
-            )?;
-            let mut total: u64 = 0;
-            for &(phys, count) in &owned_runs {
-                for b in phys..phys + count {
-                    txn.free_block(b)?;
-                }
-                total += count;
-            }
-            Some((new_paddr, old_padrs, nd, total))
+            Some((new_paddr, old_padrs, nd, freed))
         }
     };
-
-    // Preserve unknown xfields from the original inode. [W4-FRAG-1]
-    let new_inode_val = rebuild_inode_preserving_unknown(
-        &old_inode_val,
-        old_name_str,
-        Some(DstreamArgs {
-            size: new_size,
-            alloced_size: keep_alloced,
-        }),
-        now,
-    );
-    let inode_key = build_inode_key(file_id);
-    let mut new_records: Vec<(Vec<u8>, Vec<u8>)> = vec![(inode_key.clone(), new_inode_val)];
-    let mut remove_keys: Vec<Vec<u8>> = vec![inode_key];
-    remove_keys.append(&mut drop_keys);
-    let _ = &mut new_records; // no extra inserts beyond inode replacement
-
     finish_metadata_only_rewrite(
         txn,
         vsb_raw,
@@ -6069,19 +8312,668 @@ pub fn truncate_file_fast<D: WritableBlockDevice>(
         now,
         new_records,
         remove_keys,
-        extref_update_opt,
+        extref_update,
+        0,
         bsz,
     )
-    .map(|()| TruncateOutcome::Applied)
 }
 
-/// Shared tail of [`truncate_file_fast`]: rewrite the fstree with the inode
-/// replacement (+ optional extent drops), COW the volume omap, stage the
-/// volume superblock with adjusted accounting, free COW-replaced metadata.
+/// What [`write_range`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeWrite {
+    /// The bytes are written.
+    Written,
+    /// Nothing changed: the file's content is not in a data stream of its
+    /// own (it is compressed, or its stream is shared with a clone macOS
+    /// made). Replacing the whole content gives it one.
+    Declined,
+}
+
+/// A data stream's extents: first logical block -> (block count, first
+/// physical block, 0 for a hole).
+type ExtentMap = std::collections::BTreeMap<u64, (u64, u64)>;
+
+/// The extent map of stream `stream_id` from the catalog records `all`, in
+/// blocks of `b` bytes. `None` when an extent is encrypted or not a whole
+/// number of blocks, which the paths editing the map leave to a rewrite of
+/// the whole file.
+fn stream_extent_map(all: &[CatRec], stream_id: u64, b: u64) -> Option<ExtentMap> {
+    let mut map = ExtentMap::new();
+    for (k, v) in all {
+        if rd_u64(k, 0) != encode_jkey(stream_id, APFS_TYPE_FILE_EXTENT) {
+            continue;
+        }
+        let (la, len) = (rd_u64(k, 8), rd_u64(v, 0) & 0x00FF_FFFF_FFFF_FFFF);
+        if la % b != 0 || len % b != 0 || len == 0 || rd_u64(v, 16) != 0 {
+            return None;
+        }
+        map.insert(la / b, (len / b, rd_u64(v, 8)));
+    }
+    Some(map)
+}
+
+/// The file-extent records that turn stream `stream_id`'s `old` map into
+/// `new`: keys to remove and records to insert (an extent whose value
+/// changed is both).
+fn extent_record_changes(
+    stream_id: u64,
+    old: &ExtentMap,
+    new: &ExtentMap,
+    b: u64,
+) -> (Vec<Vec<u8>>, Vec<CatRec>) {
+    let remove = old
+        .iter()
+        .filter(|(s, ext)| new.get(s) != Some(ext))
+        .map(|(s, _)| build_file_extent_key(stream_id, s * b))
+        .collect();
+    let insert = new
+        .iter()
+        .filter(|(s, ext)| old.get(s) != Some(ext))
+        .map(|(s, &(n, p))| {
+            (
+                build_file_extent_key(stream_id, s * b),
+                build_file_extent_val(n * b, p),
+            )
+        })
+        .collect();
+    (remove, insert)
+}
+
+/// The physical block behind logical block `lb`, if a real extent maps it.
+fn mapped_block(map: &ExtentMap, lb: u64) -> Option<u64> {
+    let (&start, &(count, phys)) = map.range(..=lb).next_back()?;
+    (lb < start + count && phys != 0).then(|| phys + (lb - start))
+}
+
+/// Cut logical blocks `[first, first + count)` out of `map`, keeping the
+/// parts of the extents around them, and return the physical runs the cut
+/// part mapped (holes map none).
+fn punch_extents(map: &mut ExtentMap, first: u64, count: u64) -> Vec<(u64, u64)> {
+    let end = first + count;
+    let starts: Vec<u64> = map
+        .range(..end)
+        .filter(|(s, (n, _))| **s + *n > first)
+        .map(|(s, _)| *s)
+        .collect();
+    let mut cut = Vec::new();
+    for s in starts {
+        let Some((n, p)) = map.remove(&s) else {
+            continue;
+        };
+        let at = |lb: u64| if p == 0 { 0 } else { p + (lb - s) };
+        if s < first {
+            map.insert(s, (first - s, p));
+        }
+        if s + n > end {
+            map.insert(end, (s + n - end, at(end)));
+        }
+        let (lo, hi) = (s.max(first), (s + n).min(end));
+        if p != 0 && lo < hi {
+            cut.push((at(lo), hi - lo));
+        }
+    }
+    cut
+}
+
+/// Join neighbouring extents that continue each other: holes with holes,
+/// and real extents whose blocks follow on.
+fn join_extents(map: &mut ExtentMap) {
+    let mut joined = ExtentMap::new();
+    let mut last: Option<(u64, u64, u64)> = None;
+    for (&s, &(n, p)) in map.iter() {
+        match last {
+            Some((ls, ln, lp))
+                if ls + ln == s && ((lp == 0 && p == 0) || (lp != 0 && lp + ln == p)) =>
+            {
+                last = Some((ls, ln + n, lp));
+            }
+            _ => {
+                if let Some((ls, ln, lp)) = last {
+                    joined.insert(ls, (ln, lp));
+                }
+                last = Some((s, n, p));
+            }
+        }
+    }
+    if let Some((ls, ln, lp)) = last {
+        joined.insert(ls, (ln, lp));
+    }
+    *map = joined;
+}
+
+/// The live extent-reference record covering physical block `phys`:
+/// (first block, value).
+fn extref_record_at<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    extref_root: u64,
+    phys: u64,
+    bsz: usize,
+) -> Result<Option<(u64, Vec<u8>)>, TxnError> {
+    Ok(
+        cow_tree::extref_covering(txn, extref_root, phys, phys + 1, bsz)?
+            .into_iter()
+            .filter(|(k, _)| k.len() >= 8 && rd_u64(k, 0) >> 60 == APFS_TYPE_EXTENT)
+            .map(|(k, v)| (rd_u64(&k, 0) & PHYS_EXT_LEN_MASK, v))
+            .find(|(start, v)| {
+                v.len() >= 20 && *start <= phys && phys < start + (rd_u64(v, 0) & PHYS_EXT_LEN_MASK)
+            }),
+    )
+}
+
+/// Whether the record value says its blocks belong to `stream` alone, as
+/// blocks it was given new.
+fn owned_alone_by(val: &[u8], stream: u64) -> bool {
+    phys_ext_kind(val) == APFS_KIND_NEW && phys_ext_refcnt(val) == 1 && rd_u64(val, 8) == stream
+}
+
+/// Write `data` at byte `offset` of the regular file `name` in directory
+/// `parent_ino`. A write reaching past the end makes the file that long; a
+/// gap between the old end and `offset` reads as zeros (a hole).
+///
+/// Only the blocks the write touches change, copy-on-write: each gets a new
+/// block holding its old content with the written bytes laid over it, the
+/// extent that mapped it is split around it, and the old block loses this
+/// file's reference (freed when it was the last, kept for a clone that
+/// shares it or a snapshot that holds it). A block this transaction itself
+/// gave the file, that nothing else references, is rewritten where it is:
+/// no checkpoint names it yet. Neighbouring extents that continue each
+/// other are joined, so writes appended in one transaction stay one
+/// extent.
+/// [linux-apfs-rw: inode.c write_begin (read-modify-write into a new
+///  block), extents.c apfs_update_extent / apfs_split_extent /
+///  apfs_range_put_reference, apfs_insert_phys_extent (a new run joins the
+///  record before it when that one is the stream's alone)]
+pub fn write_range<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    vsb_raw: &[u8],
+    omap_raw: &[u8],
+    parent_ino: u64,
+    name: &str,
+    offset: u64,
+    data: &[u8],
+) -> Result<RangeWrite, TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, omap_raw)?;
+    let (vsb_raw, omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
+    let bsz = txn.nx.block_size as usize;
+    let b = bsz as u64;
+    let new_xid = txn.xid;
+    let now = now_ns();
+    ensure_volume_mutable(vsb_raw)?;
+    let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
+    let case_fold = rd_u64(vsb_raw, VSBI_INCOMPAT_FEATURES) & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
+    // APFS file sizes are signed 64-bit; past that no block arithmetic
+    // below can overflow.
+    let end = offset
+        .checked_add(data.len() as u64)
+        .filter(|e| *e <= i64::MAX as u64)
+        .ok_or_else(|| TxnError::InvalidArgument("write past the largest file size".into()))?;
+
+    let omap_tree_paddr = rd_u64(omap_raw, 48);
+    let mut omap_node = vec![0u8; bsz];
+    txn.read_block(omap_tree_paddr, &mut omap_node)?;
+    let drec_key = build_drec_key(parent_ino, name, case_fold, true);
+    let all = gather_entries(txn, &omap_node, root_tree_oid, &[&drec_key], bsz)?;
+    let file_id = all
+        .iter()
+        .find(|(k, _)| *k == drec_key)
+        .map(|(_, v)| rd_u64(v, 0) & 0x0FFF_FFFF_FFFF_FFFF)
+        .ok_or_else(|| TxnError::NotFound(format!("'{name}' not in parent {parent_ino}")))?;
+    let inode_key = build_inode_key(file_id);
+    let old_inode_val = all
+        .iter()
+        .find(|(k, _)| *k == inode_key)
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| TxnError::NotFound(format!("inode {file_id}")))?;
+    if rd_u16(&old_inode_val, 80) & 0o170000 != S_IFREG {
+        return Err(TxnError::InvalidArgument(format!(
+            "'{name}' is not a regular file"
+        )));
+    }
+    // A compressed file keeps its content outside the data stream, and a
+    // stream named by more than this inode is a clone's too: writing either
+    // in place would be invisible or would change the other file.
+    if rd_u32(&old_inode_val, INOI_BSD_FLAGS) & UF_COMPRESSED != 0 {
+        return Ok(RangeWrite::Declined);
+    }
+    let stream_id = match rd_u64(&old_inode_val, INODE_PRIVATE_ID) {
+        0 => file_id,
+        id => id,
+    };
+    let stream_rec = all
+        .iter()
+        .find(|(k, _)| *k == build_dstream_id_key(stream_id))
+        .map(|(_, v)| rd_u32(v, 0));
+    // A stream keyed by another id but named by this inode alone (a clone
+    // given its own stream, or one whose other side is gone) is this
+    // file's: everything below works on `stream_id`.
+    if stream_rec.is_some_and(|n| n > 1) {
+        return Ok(RangeWrite::Declined);
+    }
+    if data.is_empty() {
+        return Ok(RangeWrite::Written);
+    }
+    let inode = apfs_core::inode::Inode::parse(&old_inode_val)
+        .map_err(|e| TxnError::VolumeParse(format!("inode {file_id}: {e:?}")))?;
+    let size = inode.dstream.as_ref().map_or(0, |d| d.size);
+
+    let Some(mut map) = stream_extent_map(&all, stream_id, b) else {
+        return Ok(RangeWrite::Declined);
+    };
+    let old_map = map.clone();
+    let new_size = size.max(end);
+    let mapped_end = map.last_key_value().map_or(0, |(s, (n, _))| s + n);
+    let blocks_end = new_size.div_ceil(b);
+    if blocks_end > mapped_end {
+        map.insert(mapped_end, (blocks_end - mapped_end, 0));
+    }
+
+    // The blocks to write: those the range covers, and the block holding
+    // the old end when the write starts past it, whose bytes past the old
+    // end must read as zeros from now on (a hole there already does).
+    // Whole blocks between the old end and the write become a hole: blocks
+    // a stream keeps past its end hold whatever they held, and would
+    // otherwise show up inside the file.
+    let (first, last) = (offset / b, end.div_ceil(b));
+    let mut released: Vec<(u64, u64)> = Vec::new();
+    if offset > size {
+        let gap_first = size.div_ceil(b);
+        if gap_first < first {
+            released.extend(punch_extents(&mut map, gap_first, first - gap_first));
+            map.insert(gap_first, (first - gap_first, 0));
+        }
+    }
+    let mut touched: Vec<u64> = (first..last).collect();
+    if offset > size && size % b != 0 && size / b < first && mapped_block(&map, size / b).is_some()
+    {
+        touched.insert(0, size / b);
+    }
+    let no_snapshots = rd_u64(vsb_raw, VSBI_NUM_SNAPSHOTS) == 0;
+    let extref_root = rd_u64(vsb_raw, VSBI_EXTENTREF_TREE_OID);
+    // A block the data covers whole is written from the data (`None`); only
+    // the blocks at the ends, which keep some old bytes, get a buffer of
+    // their own. A buffer for every block, joined into one more per run,
+    // held twice the write in memory, 64 MiB for one 32 MiB write.
+    let whole = |lb: u64| lb * b >= offset && (lb + 1) * b <= end;
+    let data_of = |lb: u64, n: u64| {
+        data.get((lb * b - offset) as usize..((lb + n) * b - offset) as usize)
+            .ok_or_else(|| TxnError::InvalidArgument("write range out of its data".into()))
+    };
+    let mut cow: Vec<(u64, Option<Vec<u8>>)> = Vec::new();
+    for lb in touched {
+        let phys = mapped_block(&map, lb);
+        if whole(lb) {
+            let in_place = match phys {
+                Some(p) if no_snapshots && (txn.staged_live(p) || txn.fresh_data(p)) => {
+                    extref_record_at(txn, extref_root, p, bsz)?
+                        .is_some_and(|(_, v)| owned_alone_by(&v, stream_id))
+                }
+                _ => false,
+            };
+            match phys {
+                Some(p) if in_place && txn.staged_live(p) => {
+                    txn.restage(p, data_of(lb, 1)?.to_vec())
+                }
+                Some(p) if in_place => txn.rewrite_fresh_data(p, data_of(lb, 1)?)?,
+                _ => cow.push((lb, None)),
+            }
+            continue;
+        }
+        let mut blk = vec![0u8; bsz];
+        if let Some(p) = phys {
+            txn.read_block(p, &mut blk)?;
+        }
+        let start = lb * b;
+        if size < start + b {
+            let from = size.saturating_sub(start) as usize;
+            if let Some(tail) = blk.get_mut(from..) {
+                tail.fill(0);
+            }
+        }
+        let (lo, hi) = (offset.max(start), end.min(start + b));
+        if lo < hi {
+            let src = data
+                .get((lo - offset) as usize..(hi - offset) as usize)
+                .ok_or_else(|| TxnError::InvalidArgument("write range out of its data".into()))?;
+            if let Some(dst) = blk.get_mut((lo - start) as usize..(hi - start) as usize) {
+                dst.copy_from_slice(src);
+            }
+        }
+        let in_place = match phys {
+            Some(p) if no_snapshots && (txn.staged_live(p) || txn.fresh_data(p)) => {
+                extref_record_at(txn, extref_root, p, bsz)?
+                    .is_some_and(|(_, v)| owned_alone_by(&v, stream_id))
+            }
+            _ => false,
+        };
+        match phys {
+            Some(p) if in_place && txn.staged_live(p) => txn.restage(p, blk),
+            Some(p) if in_place => txn.rewrite_fresh_data(p, &blk)?,
+            _ => cow.push((lb, Some(blk))),
+        }
+    }
+
+    // Copy-on-write the rest, one run of consecutive logical blocks at a
+    // time.
+    let mut new_runs: Vec<(u64, u64)> = Vec::new();
+    let mut added = 0u64;
+    let mut i = 0;
+    while i < cow.len() {
+        let run_first = cow.get(i).map_or(0, |(lb, _)| *lb);
+        let mut n = 1usize;
+        while cow
+            .get(i + n)
+            .is_some_and(|(lb, _)| *lb == run_first + n as u64)
+        {
+            n += 1;
+        }
+        released.extend(punch_extents(&mut map, run_first, n as u64));
+        let mut done = 0usize;
+        while done < n {
+            let (q, got) = txn.alloc_blocks_run(n - done)?;
+            if got == 0 {
+                return Err(TxnError::NoFreeBlocks);
+            }
+            let piece = cow
+                .get_mut(i + done..i + done + got)
+                .ok_or_else(|| TxnError::InvalidArgument("write run out of its blocks".into()))?;
+            // Consecutive whole blocks go out as one slice of the data; an
+            // edge block, from its own buffer.
+            let mut k = 0usize;
+            while k < piece.len() {
+                let at = q + k as u64;
+                let (lb, own) = match piece.get_mut(k) {
+                    Some((lb, blk)) => (*lb, blk.take()),
+                    None => break,
+                };
+                if let Some(own) = own {
+                    txn.write_new_data(at, &own)?;
+                    k += 1;
+                    continue;
+                }
+                let mut m = 1usize;
+                while piece.get(k + m).is_some_and(|(_, blk)| blk.is_none()) {
+                    m += 1;
+                }
+                txn.write_new_data(at, data_of(lb, m as u64)?)?;
+                k += m;
+            }
+            map.insert(run_first + done as u64, (got as u64, q));
+            match new_runs.last_mut() {
+                Some((lq, ln)) if *lq + *ln == q => *ln += got as u64,
+                _ => new_runs.push((q, got as u64)),
+            }
+            added += got as u64;
+            done += got;
+        }
+        i += n;
+    }
+    join_extents(&mut map);
+
+    // The extent-reference tree: the replaced blocks lose this file's
+    // reference, the new runs get records of their own, the first one
+    // joining the record that ends where it starts when that record is
+    // this stream's alone.
+    let mut extref_update = None;
+    if !released.is_empty() || !new_runs.is_empty() {
+        let release = if released.is_empty() {
+            ExtrefRelease {
+                remove_keys: Vec::new(),
+                upserts: Vec::new(),
+                update_inserts: Vec::new(),
+                owned_runs: Vec::new(),
+            }
+        } else {
+            let live = extref_records_for_runs(txn, extref_root, &released, bsz)?;
+            plan_extref_release(&live, &released)?
+        };
+        let touched_keys: HashSet<Vec<u8>> = release
+            .remove_keys
+            .iter()
+            .chain(release.upserts.iter().map(|(k, _)| k))
+            .cloned()
+            .collect();
+        let mut upserts = release.upserts;
+        let mut inserts = release.update_inserts;
+        for (n, &(q, count)) in new_runs.iter().enumerate() {
+            let before = if n == 0 && q > 0 {
+                extref_record_at(txn, extref_root, q - 1, bsz)?
+            } else {
+                None
+            };
+            match before {
+                Some((s, v))
+                    if owned_alone_by(&v, stream_id)
+                        && s + (rd_u64(&v, 0) & PHYS_EXT_LEN_MASK) == q
+                        && !touched_keys.contains(&build_phys_ext_key(s)) =>
+                {
+                    let blocks = (rd_u64(&v, 0) & PHYS_EXT_LEN_MASK) + count;
+                    upserts.push((build_phys_ext_key(s), phys_ext_with_blocks(&v, blocks)));
+                }
+                _ => inserts.push((
+                    build_phys_ext_key(q),
+                    build_phys_ext_val(count, stream_id, 1),
+                )),
+            }
+        }
+        let (new_root, old_nodes, node_delta) = rewrite_extref_tree(
+            txn,
+            extref_root,
+            new_xid,
+            inserts,
+            &release.remove_keys,
+            &upserts,
+            bsz,
+        )?;
+        let mut freed = 0u64;
+        for &(phys, count) in &release.owned_runs {
+            for blk in phys..phys + count {
+                txn.free_block(blk)?;
+            }
+            freed += count;
+        }
+        extref_update = Some((new_root, old_nodes, node_delta, freed));
+    }
+
+    // The catalog: the extents that changed, the stream record a file
+    // created empty lacks, and the inode with its new size, allocated size
+    // and hole count.
+    let (mut remove_keys, mut new_records) = extent_record_changes(stream_id, &old_map, &map, b);
+    remove_keys.push(inode_key.clone());
+    if stream_rec.is_none() {
+        new_records.push((build_dstream_id_key(stream_id), build_dstream_id_val(1)));
+    }
+    let sparse: u64 = map
+        .values()
+        .filter(|(_, p)| *p == 0)
+        .map(|(n, _)| n * b)
+        .sum();
+    let alloced = map.last_key_value().map_or(0, |(s, (n, _))| (s + n) * b);
+    let old_name = extract_inode_name(&old_inode_val).unwrap_or(name);
+    new_records.push((
+        inode_key,
+        with_write_generation_step(rebuild_inode_with_sparse_bytes(
+            &old_inode_val,
+            old_name,
+            Some(DstreamArgs {
+                size: new_size,
+                alloced_size: alloced,
+            }),
+            sparse,
+            now,
+        )),
+    ));
+    finish_metadata_only_rewrite(
+        txn,
+        vsb_raw,
+        omap_raw,
+        &omap_node,
+        new_xid,
+        now,
+        new_records,
+        remove_keys,
+        extref_update,
+        added,
+        bsz,
+    )?;
+    Ok(RangeWrite::Written)
+}
+
+/// Give the regular file `name` in directory `parent_ino` a data stream of
+/// its own when it shares one with another inode (a clone macOS made names
+/// the original's stream), so that its content can be edited in place.
+/// Nothing is copied: the new stream's extents name the same blocks, and
+/// each of those blocks gains a reference, the way [`clone_file`] shares
+/// them; the shared stream loses this inode from its count. Returns whether
+/// the stream was shared.
+/// [linux-apfs-rw: inode.c apfs_inode_create_dstream_rec on a shared
+///  stream - put the shared record, clone the extents under a new id]
+pub fn unshare_stream<D: WritableBlockDevice>(
+    txn: &mut Transaction<D>,
+    vsb_raw: &[u8],
+    omap_raw: &[u8],
+    parent_ino: u64,
+    name: &str,
+) -> Result<bool, TxnError> {
+    let (vsb_now, omap_now) = txn.current_volume(vsb_raw, omap_raw)?;
+    let (vsb_raw, omap_raw) = (vsb_now.as_slice(), omap_now.as_slice());
+    let bsz = txn.nx.block_size as usize;
+    let b = bsz as u64;
+    let new_xid = txn.xid;
+    let now = now_ns();
+    ensure_volume_mutable(vsb_raw)?;
+    let root_tree_oid = rd_u64(vsb_raw, VSBI_ROOT_TREE_OID);
+    let case_fold = rd_u64(vsb_raw, VSBI_INCOMPAT_FEATURES) & APFS_INCOMPAT_CASE_INSENSITIVE != 0;
+    let omap_tree_paddr = rd_u64(omap_raw, 48);
+    let mut omap_node = vec![0u8; bsz];
+    txn.read_block(omap_tree_paddr, &mut omap_node)?;
+    let drec_key = build_drec_key(parent_ino, name, case_fold, true);
+    let all = gather_entries(txn, &omap_node, root_tree_oid, &[&drec_key], bsz)?;
+    let file_id = all
+        .iter()
+        .find(|(k, _)| *k == drec_key)
+        .map(|(_, v)| rd_u64(v, 0) & 0x0FFF_FFFF_FFFF_FFFF)
+        .ok_or_else(|| TxnError::NotFound(format!("'{name}' not in parent {parent_ino}")))?;
+    let inode_key = build_inode_key(file_id);
+    let mut inode_val = all
+        .iter()
+        .find(|(k, _)| *k == inode_key)
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| TxnError::NotFound(format!("inode {file_id}")))?;
+    if rd_u16(&inode_val, 80) & 0o170000 != S_IFREG {
+        return Err(TxnError::InvalidArgument(format!(
+            "'{name}' is not a regular file"
+        )));
+    }
+    let shared_id = match rd_u64(&inode_val, INODE_PRIVATE_ID) {
+        0 => file_id,
+        id => id,
+    };
+    let refcnt = all
+        .iter()
+        .find(|(k, _)| *k == build_dstream_id_key(shared_id))
+        .map_or(1, |(_, v)| rd_u32(v, 0));
+    if refcnt <= 1 {
+        return Ok(false);
+    }
+
+    // The new stream: a fresh id (the original's own number may be the
+    // shared stream's), its count, and the shared stream's extents.
+    let own_id = rd_u64(vsb_raw, VSBI_NEXT_OBJ_ID);
+    let mut new_records = vec![(build_dstream_id_key(own_id), build_dstream_id_val(1))];
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for (k, v) in &all {
+        if rd_u64(k, 0) != encode_jkey(shared_id, APFS_TYPE_FILE_EXTENT) {
+            continue;
+        }
+        let (la, len, phys) = (
+            rd_u64(k, 8),
+            rd_u64(v, 0) & 0x00FF_FFFF_FFFF_FFFF,
+            rd_u64(v, 8),
+        );
+        new_records.push((build_file_extent_key(own_id, la), v.clone()));
+        if !is_sparse_hole(phys) && len > 0 {
+            runs.push((phys, len.div_ceil(b)));
+        }
+    }
+    wr_u64(&mut inode_val, INODE_PRIVATE_ID, own_id);
+    wr_u64(&mut inode_val, INODE_CHANGE_TIME, now);
+    let updates = vec![
+        (
+            build_dstream_id_key(shared_id),
+            build_dstream_id_val(refcnt - 1),
+        ),
+        (inode_key, inode_val),
+    ];
+    let FstreeRewrite {
+        omap_tree_paddr: new_omap_tree_paddr,
+        node_delta,
+        reclaim,
+    } = rewrite_fstree_impl(
+        txn,
+        vsb_raw,
+        &omap_node,
+        new_xid,
+        new_records,
+        &[],
+        None,
+        &updates,
+        now,
+        bsz,
+    )?;
+
+    // Every block the extents name gains this stream's reference.
+    let old_extref_paddr = rd_u64(vsb_raw, VSBI_EXTENTREF_TREE_OID);
+    let (new_extref_paddr, old_extref_padrs, extref_node_delta) = if runs.is_empty() {
+        (old_extref_paddr, Vec::new(), 0i64)
+    } else {
+        let live = extref_records_for_runs(txn, old_extref_paddr, &runs, bsz)?;
+        let plan = plan_extref_take(&live, &runs)?;
+        rewrite_extref_tree(
+            txn,
+            old_extref_paddr,
+            new_xid,
+            plan.update_inserts,
+            &plan.remove_keys,
+            &plan.upserts,
+            bsz,
+        )?
+    };
+
+    let new_vomap_paddr = stage_vomap_header(txn, omap_raw, new_xid, new_omap_tree_paddr, bsz)?;
+    let vsb_oid = rd_u64(vsb_raw, 8);
+    let mut new_vsb = vsb_raw.to_vec();
+    new_vsb.resize(bsz, 0);
+    wr_u64(&mut new_vsb, VSBI_OMAP_OID, new_vomap_paddr);
+    wr_u64(&mut new_vsb, VSBI_EXTENTREF_TREE_OID, new_extref_paddr);
+    wr_u64(&mut new_vsb, VSBI_NEXT_OBJ_ID, own_id + 1);
+    let frm_correction = free_replaced_metadata(
+        txn,
+        vsb_raw,
+        omap_raw,
+        &omap_node,
+        &old_extref_padrs,
+        &reclaim,
+        bsz,
+    )?;
+    // No data block is added or freed: only tree nodes change.
+    let fs_alloc = rd_u64(&new_vsb, VSBI_FS_ALLOC_COUNT) as i64;
+    let alloc = (fs_alloc + node_delta + extref_node_delta + frm_correction).max(0) as u64;
+    wr_u64(&mut new_vsb, VSBI_FS_ALLOC_COUNT, alloc);
+    wr_u64(&mut new_vsb, VSBI_LAST_MOD_TIME, now);
+    let body = new_vsb.get(32..bsz).unwrap_or(&[]).to_vec();
+    txn.stage_virtual(vsb_oid, OBJECT_TYPE_FS, 0, &body)?;
+    Ok(true)
+}
+
+/// Shared tail of [`truncate_file_fast`] and [`write_range`]: rewrite the
+/// fstree with the inode replacement (+ extent changes), COW the volume omap,
+/// stage the volume superblock with adjusted accounting, free COW-replaced
+/// metadata.
 ///
 /// `extref_update` is `Some((new_extref_paddr, old_padrs, extref_node_delta,
-/// freed_block_count))` when the shrink path freed past-EOF extents; `None`
-/// for extend. [#151: multi-node capable]
+/// freed_block_count))` when the extent-reference tree changed; `None`
+/// otherwise. `data_blocks_added` counts the data blocks the change
+/// allocated. [#151: multi-node capable]
 #[allow(clippy::too_many_arguments)]
 fn finish_metadata_only_rewrite<D: WritableBlockDevice>(
     txn: &mut Transaction<D>,
@@ -6093,9 +8985,14 @@ fn finish_metadata_only_rewrite<D: WritableBlockDevice>(
     new_records: Vec<(Vec<u8>, Vec<u8>)>,
     remove_keys: Vec<Vec<u8>>,
     extref_update: Option<(u64, Vec<u64>, i64, u64)>,
+    data_blocks_added: u64,
     bsz: usize,
 ) -> Result<(), TxnError> {
-    let (new_omap_tree_paddr, node_delta) = rewrite_fstree(
+    let FstreeRewrite {
+        omap_tree_paddr: new_omap_tree_paddr,
+        node_delta,
+        reclaim,
+    } = rewrite_fstree(
         txn,
         vsb_raw,
         omap_node,
@@ -6107,14 +9004,7 @@ fn finish_metadata_only_rewrite<D: WritableBlockDevice>(
         bsz,
     )?;
 
-    let new_vomap_paddr = txn.alloc_block()?;
-    let mut new_vomap = omap_raw.to_vec();
-    new_vomap.resize(bsz, 0);
-    wr_u64(&mut new_vomap, 8, new_vomap_paddr);
-    wr_u64(&mut new_vomap, 16, new_xid);
-    wr_u64(&mut new_vomap, 48, new_omap_tree_paddr);
-    update_checksum_in_place(&mut new_vomap);
-    txn.stage_raw(new_vomap_paddr, new_vomap);
+    let new_vomap_paddr = stage_vomap_header(txn, omap_raw, new_xid, new_omap_tree_paddr, bsz)?;
 
     let vsb_oid = rd_u64(vsb_raw, 8);
     let mut new_vsb = vsb_raw.to_vec();
@@ -6142,12 +9032,15 @@ fn finish_metadata_only_rewrite<D: WritableBlockDevice>(
         omap_raw,
         omap_node,
         old_extref_padrs,
-        false,
+        &reclaim,
         bsz,
     )?;
 
     let fs_alloc = rd_u64(&new_vsb, VSBI_FS_ALLOC_COUNT) as i64;
-    let alloc_delta = -(freed_count as i64) + node_delta + extref_node_delta_opt + frm_correction;
+    let alloc_delta = data_blocks_added as i64 - freed_count as i64
+        + node_delta
+        + extref_node_delta_opt
+        + frm_correction;
     wr_u64(
         &mut new_vsb,
         VSBI_FS_ALLOC_COUNT,
@@ -6163,64 +9056,336 @@ fn finish_metadata_only_rewrite<D: WritableBlockDevice>(
 mod tests {
     use super::*;
 
-    /// COW-7: `rebuild_omap_node_without` removes exactly the live-xid
-    /// root_tree mapping, leaves the snapshot's lower-xid mapping (and unrelated
-    /// entries) intact, and never leaves a paddr==0 entry. After removal the
-    /// highest xid for root_tree_oid is the snapshot's, so `Omap::resolve`
-    /// returns the snapshot fsroot instead of block 0 (the NX superblock).
     #[test]
-    fn rebuild_omap_node_without_removes_live_xid_entry() {
-        let bsz = 4096usize;
-        // Minimal fixed-kv root+leaf omap template (BTNODE_ROOT|LEAF|FIXED_KV).
-        let mut template = vec![0u8; bsz];
-        template[32] = 0x07;
-        wr_u16(&mut template, 42, 64); // table_space.len reserve
+    fn punching_an_extent_keeps_both_sides_and_returns_the_middle() {
+        let mut map = ExtentMap::new();
+        map.insert(0, (10, 100));
+        map.insert(10, (5, 0));
+        map.insert(15, (5, 300));
+        // Blocks 4..17: the tail of the first extent, the hole, the head of
+        // the third.
+        let cut = punch_extents(&mut map, 4, 13);
+        assert_eq!(cut, vec![(104, 6), (300, 2)]);
+        let left: Vec<_> = map.into_iter().collect();
+        assert_eq!(left, vec![(0, (4, 100)), (17, (3, 302))]);
+    }
 
-        let root_oid = 0x402u64;
-        let snap_xid = 5u64;
-        let live_xid = 6u64;
-        let revert_xid = 7u64;
-        let entries = vec![
-            (root_oid, snap_xid, 0x100u64), // snapshot fsroot
-            (root_oid, live_xid, 0x200u64), // live fsroot (to be dropped)
-            (0x500u64, 4u64, 0x300u64),     // unrelated mapping
-        ];
-        let node = build_omap_node(&template, &entries, 0x111, revert_xid - 1, bsz);
-
-        let rebuilt = rebuild_omap_node_without(&node, root_oid, live_xid, 0x222, revert_xid, bsz);
-        let got = parse_omap_entries(&rebuilt, bsz);
-
-        assert!(
-            !got.iter().any(|&(o, x, _)| o == root_oid && x == live_xid),
-            "live_xid root mapping must be removed: {got:?}"
-        );
-        assert!(
-            got.iter()
-                .any(|&(o, x, p)| o == root_oid && x == snap_xid && p == 0x100),
-            "snap_xid root mapping must survive: {got:?}"
-        );
-        assert!(
-            got.iter()
-                .any(|&(o, x, p)| o == 0x500 && x == 4 && p == 0x300),
-            "unrelated mapping must survive: {got:?}"
-        );
-        assert!(
-            !got.iter().any(|&(_, _, p)| p == 0),
-            "no surviving entry may point at block 0 (the NXSB): {got:?}"
-        );
-        assert_eq!(got.len(), 2, "exactly one entry removed: {got:?}");
-        let max_root = got
-            .iter()
-            .filter(|&&(o, _, _)| o == root_oid)
-            .map(|&(_, x, _)| x)
-            .max();
+    #[test]
+    fn neighbouring_extents_join_only_when_they_continue() {
+        let mut map = ExtentMap::new();
+        map.insert(0, (4, 100));
+        map.insert(4, (2, 104)); // follows on
+        map.insert(6, (1, 200)); // does not
+        map.insert(7, (3, 0));
+        map.insert(10, (2, 0)); // holes join
+        map.insert(12, (1, 1)); // a real block after a hole stays apart
+        join_extents(&mut map);
+        let joined: Vec<_> = map.into_iter().collect();
         assert_eq!(
-            max_root,
-            Some(snap_xid),
-            "after revert the highest root_tree xid must be the snapshot's"
+            joined,
+            vec![(0, (6, 100)), (6, (1, 200)), (7, (5, 0)), (12, (1, 1))]
         );
-        assert_eq!(rd_u64(&rebuilt, 16), revert_xid, "node o_xid = revert_xid");
-        assert_eq!(rd_u64(&rebuilt, 8), 0x222, "node o_oid = new paddr");
+        let mut map = ExtentMap::new();
+        map.insert(0, (2, 50));
+        assert_eq!(mapped_block(&map, 1), Some(51));
+        assert_eq!(mapped_block(&map, 2), None);
+    }
+
+    fn live(start: u64, blocks: u64, val: Vec<u8>) -> CatRecord {
+        CatRecord {
+            key: build_phys_ext_key(start),
+            val: phys_ext_with_blocks(&val, blocks),
+        }
+    }
+
+    fn new_rec(start: u64, blocks: u64, refcnt: u32) -> CatRecord {
+        live(start, blocks, build_phys_ext_val(blocks, 500, refcnt))
+    }
+
+    fn key_start(key: &[u8]) -> u64 {
+        rd_u64(key, 0) & PHYS_EXT_LEN_MASK
+    }
+
+    fn upsert_at(release: &ExtrefRelease, start: u64) -> Option<&Vec<u8>> {
+        release
+            .upserts
+            .iter()
+            .find(|(k, _)| key_start(k) == start)
+            .map(|(_, v)| v)
+    }
+
+    // A run that coincides with one record: the last reference removes the
+    // record and frees the run; a shared one just loses a reference.
+    #[test]
+    fn extref_release_exact_record() {
+        let recs = vec![new_rec(100, 10, 1), new_rec(200, 4, 3)];
+        let r = plan_extref_release(&recs, &[(100, 10), (200, 4)]).unwrap();
+        assert_eq!(r.remove_keys, vec![build_phys_ext_key(100)]);
+        assert_eq!(r.owned_runs, vec![(100, 10)]);
+        assert_eq!(r.update_inserts.len(), 0);
+        let v = upsert_at(&r, 200).expect("shared record rewritten");
+        assert_eq!(phys_ext_refcnt(v), 2);
+        assert_eq!(rd_u64(v, 0) & PHYS_EXT_LEN_MASK, 4);
+    }
+
+    // One extent over three records, as macOS leaves the original after
+    // rewriting part of its clone: the shared ends lose a reference, the
+    // middle (held only by this file) goes away and is freed.
+    #[test]
+    fn extref_release_run_spanning_three_records() {
+        let recs = vec![new_rec(100, 10, 2), new_rec(110, 5, 1), new_rec(115, 49, 2)];
+        let r = plan_extref_release(&recs, &[(100, 64)]).unwrap();
+        assert_eq!(r.remove_keys, vec![build_phys_ext_key(110)]);
+        assert_eq!(r.owned_runs, vec![(110, 5)]);
+        assert!(r.update_inserts.is_empty());
+        assert_eq!(phys_ext_refcnt(upsert_at(&r, 100).unwrap()), 1);
+        assert_eq!(phys_ext_refcnt(upsert_at(&r, 115).unwrap()), 1);
+        assert_eq!(r.upserts.len(), 2);
+    }
+
+    // A run inside a larger record splits it: the parts outside keep the
+    // record's count under their own keys, the part inside loses one.
+    #[test]
+    fn extref_release_run_inside_a_record_splits_it() {
+        let recs = vec![new_rec(100, 64, 2)];
+        let r = plan_extref_release(&recs, &[(110, 5)]).unwrap();
+        assert!(r.remove_keys.is_empty());
+        assert!(r.owned_runs.is_empty());
+        let head = upsert_at(&r, 100).expect("head keeps the key");
+        assert_eq!(rd_u64(head, 0) & PHYS_EXT_LEN_MASK, 10);
+        assert_eq!(phys_ext_refcnt(head), 2);
+        let middle = upsert_at(&r, 110).expect("middle under its own key");
+        assert_eq!(rd_u64(middle, 0) & PHYS_EXT_LEN_MASK, 5);
+        assert_eq!(phys_ext_refcnt(middle), 1);
+        let tail = upsert_at(&r, 115).expect("tail under its own key");
+        assert_eq!(rd_u64(tail, 0) & PHYS_EXT_LEN_MASK, 49);
+        assert_eq!(phys_ext_refcnt(tail), 2);
+        assert_eq!(r.upserts.len(), 3);
+
+        // The same with the last reference: the middle is freed, not kept.
+        let recs = vec![new_rec(100, 64, 1)];
+        let r = plan_extref_release(&recs, &[(110, 5)]).unwrap();
+        assert_eq!(r.owned_runs, vec![(110, 5)]);
+        assert!(upsert_at(&r, 110).is_none());
+        assert_eq!(
+            rd_u64(upsert_at(&r, 100).unwrap(), 0) & PHYS_EXT_LEN_MASK,
+            10
+        );
+        assert_eq!(
+            rd_u64(upsert_at(&r, 115).unwrap(), 0) & PHYS_EXT_LEN_MASK,
+            49
+        );
+    }
+
+    // A range no live record covers belongs to a snapshot: the volume
+    // withdraws one reference from exactly that range, and only that range.
+    #[test]
+    fn extref_release_gap_gets_an_update_of_its_own_length() {
+        let recs = vec![new_rec(100, 10, 1), new_rec(130, 10, 2)];
+        let r = plan_extref_release(&recs, &[(100, 40)]).unwrap();
+        assert_eq!(r.remove_keys, vec![build_phys_ext_key(100)]);
+        assert_eq!(r.owned_runs, vec![(100, 10)]);
+        assert_eq!(r.update_inserts.len(), 1);
+        let (k, v) = &r.update_inserts[0];
+        assert_eq!(key_start(k), 110);
+        assert_eq!(rd_u64(v, 0) & PHYS_EXT_LEN_MASK, 20);
+        assert_eq!(phys_ext_kind(v), APFS_KIND_UPDATE);
+        assert_eq!(phys_ext_update_delta(v), -1);
+        assert_eq!(phys_ext_refcnt(upsert_at(&r, 130).unwrap()), 1);
+    }
+
+    // A KIND_UPDATE record is a signed delta over its range; a run through
+    // part of it splits the range and lowers the delta of the part inside.
+    #[test]
+    fn extref_release_splits_an_update_record() {
+        let recs = vec![live(100, 20, build_phys_ext_update_val(20, 2))];
+        let r = plan_extref_release(&recs, &[(105, 5)]).unwrap();
+        assert!(r.owned_runs.is_empty());
+        assert!(r.remove_keys.is_empty());
+        let head = upsert_at(&r, 100).unwrap();
+        assert_eq!(
+            (
+                rd_u64(head, 0) & PHYS_EXT_LEN_MASK,
+                phys_ext_update_delta(head)
+            ),
+            (5, 2)
+        );
+        let middle = upsert_at(&r, 105).unwrap();
+        assert_eq!(
+            (
+                rd_u64(middle, 0) & PHYS_EXT_LEN_MASK,
+                phys_ext_update_delta(middle)
+            ),
+            (5, 1)
+        );
+        let tail = upsert_at(&r, 110).unwrap();
+        assert_eq!(
+            (
+                rd_u64(tail, 0) & PHYS_EXT_LEN_MASK,
+                phys_ext_update_delta(tail)
+            ),
+            (10, 2)
+        );
+        // Delta reaching zero drops the piece.
+        let recs = vec![live(100, 20, build_phys_ext_update_val(20, 1))];
+        let r = plan_extref_release(&recs, &[(100, 20)]).unwrap();
+        assert_eq!(r.remove_keys, vec![build_phys_ext_key(100)]);
+        assert!(r.upserts.is_empty() && r.owned_runs.is_empty());
+    }
+
+    // A leaf whose header claims more records than its table can hold, or a
+    // table entry pointing outside the node, is an error: no reservation is
+    // made for the claimed count and no offset arithmetic can panic.
+    #[test]
+    fn parse_cat_leaf_refuses_crafted_geometry() {
+        let mut node = vec![0u8; 4096];
+        node[36..40].copy_from_slice(&u32::MAX.to_le_bytes());
+        node[42..44].copy_from_slice(&16u16.to_le_bytes());
+        assert!(parse_cat_leaf(&node).is_err());
+
+        // One real record, then the same node with its value offset past the
+        // start of the block and with the table beyond the value area.
+        let mut node = vec![0u8; 4096];
+        node[36..40].copy_from_slice(&1u32.to_le_bytes());
+        node[42..44].copy_from_slice(&8u16.to_le_bytes());
+        let toc = DATA_BASE;
+        node[toc..toc + 2].copy_from_slice(&0u16.to_le_bytes());
+        node[toc + 2..toc + 4].copy_from_slice(&8u16.to_le_bytes());
+        node[toc + 4..toc + 6].copy_from_slice(&8u16.to_le_bytes());
+        node[toc + 6..toc + 8].copy_from_slice(&8u16.to_le_bytes());
+        assert_eq!(parse_cat_leaf(&node).expect("well-formed").len(), 1);
+        node[toc + 4..toc + 6].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(parse_cat_leaf(&node).is_err());
+        node[toc + 4..toc + 6].copy_from_slice(&8u16.to_le_bytes());
+        node[42..44].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(parse_cat_leaf(&node).is_err());
+        assert!(parse_cat_leaf(&node[..40]).is_err());
+    }
+
+    // The two name-rule bits are the only incompatible features a mutation
+    // knows how to honour; any other bit, with or without them, is refused
+    // by name, and the sealed bit keeps its own message.
+    #[test]
+    fn unknown_incompatible_feature_bits_refuse_mutation() {
+        let vsb = |incompat: u64| {
+            let mut v = vec![0u8; 0x200];
+            v[VSBI_INCOMPAT_FEATURES..VSBI_INCOMPAT_FEATURES + 8]
+                .copy_from_slice(&incompat.to_le_bytes());
+            v[VSBI_FS_FLAGS..VSBI_FS_FLAGS + 8].copy_from_slice(&APFS_FS_UNENCRYPTED.to_le_bytes());
+            v
+        };
+        // Neither hashing bit: the directory records use the plain-name key
+        // layout this writer does not produce, so the volume is refused too.
+        match ensure_volume_mutable(&vsb(0)) {
+            Err(TxnError::Unsupported(msg)) => assert!(msg.contains("by name rather than by hash")),
+            other => panic!("an unhashed volume must be refused as unsupported, got {other:?}"),
+        }
+        assert!(ensure_volume_mutable(&vsb(0x1)).is_ok());
+        assert!(ensure_volume_mutable(&vsb(0x8)).is_ok());
+        assert!(ensure_volume_mutable(&vsb(0x9)).is_ok());
+        for bits in [0x2u64, 0x4, 0x10, 0x40, 0x80, 0x100, 0x1 | 0x2] {
+            match ensure_volume_mutable(&vsb(bits)) {
+                Err(TxnError::Unsupported(msg)) => assert!(
+                    msg.contains(&format!("{:#x}", bits & !0x9)),
+                    "{bits:#x}: the refusal names the bits: {msg}"
+                ),
+                other => panic!("{bits:#x} must be refused as unsupported, got {other:?}"),
+            }
+        }
+        match ensure_volume_mutable(&vsb(0x20)) {
+            Err(TxnError::Unsupported(msg)) => assert!(msg.contains("sealed")),
+            other => panic!("sealed must keep its message, got {other:?}"),
+        }
+    }
+
+    // A directory that maintains statistics is refused; one that does not,
+    // and a value too short to carry flags, pass.
+    #[test]
+    fn directory_statistics_flag_refuses_the_change() {
+        let mut val = vec![0u8; 96];
+        assert!(refuse_dir_stats(&val, 42).is_ok());
+        val[INODE_INTERNAL_FLAGS..INODE_INTERNAL_FLAGS + 8]
+            .copy_from_slice(&(INODE_MAINTAIN_DIR_STATS | 0x10).to_le_bytes());
+        assert!(matches!(
+            refuse_dir_stats(&val, 42),
+            Err(TxnError::Unsupported(_))
+        ));
+        val[INODE_INTERNAL_FLAGS..INODE_INTERNAL_FLAGS + 8].copy_from_slice(&0x10u64.to_le_bytes());
+        assert!(refuse_dir_stats(&val, 42).is_ok());
+        assert!(refuse_dir_stats(&val[..40], 42).is_ok());
+    }
+
+    /// A clone's run spanning a split record takes a reference on every
+    /// piece: the record macOS left shared, the one only the source held,
+    /// and a range only a snapshot owns (KIND_UPDATE(+1)). A delta that
+    /// returns to zero drops its record.
+    #[test]
+    fn extref_take_walks_every_record_a_run_spans() {
+        let recs = vec![new_rec(100, 4, 2), new_rec(104, 6, 1)];
+        let r = plan_extref_take(&recs, &[(100, 10), (200, 5)]).unwrap();
+        assert!(r.owned_runs.is_empty(), "taking a reference frees nothing");
+        let refcnt_at = |start: u64| {
+            r.upserts
+                .iter()
+                .find(|(k, _)| *k == build_phys_ext_key(start))
+                .map(|(_, v)| phys_ext_refcnt(v))
+        };
+        assert_eq!(refcnt_at(100), Some(3));
+        assert_eq!(refcnt_at(104), Some(2));
+        assert_eq!(r.update_inserts.len(), 1);
+        let (k, v) = r.update_inserts.first().expect("one KIND_UPDATE insert");
+        assert_eq!(*k, build_phys_ext_key(200));
+        assert_eq!(phys_ext_update_delta(v), 1);
+
+        // Only part of a record: it splits at the run's edges.
+        let r = plan_extref_take(&[new_rec(100, 10, 1)], &[(103, 2)]).unwrap();
+        assert_eq!(refcnt_at_in(&r, 100), Some((3, 1)));
+        assert_eq!(refcnt_at_in(&r, 103), Some((2, 2)));
+        assert_eq!(refcnt_at_in(&r, 105), Some((5, 1)));
+
+        // A snapshot-side delta of -1 cancelled by the new reference.
+        let minus = CatRecord {
+            key: build_phys_ext_key(300),
+            val: build_phys_ext_update_val(5, -1),
+        };
+        let r = plan_extref_take(&[minus], &[(300, 5)]).unwrap();
+        assert_eq!(r.remove_keys, vec![build_phys_ext_key(300)]);
+        assert!(r.upserts.is_empty() && r.update_inserts.is_empty());
+    }
+
+    #[test]
+    fn extref_records_must_be_disjoint_and_hold_a_reference() {
+        let pair = |r: CatRecord| (r.key, r.val);
+        let ok = vec![pair(new_rec(100, 10, 1)), pair(new_rec(110, 5, 2))];
+        assert!(check_extref_records_disjoint(&ok).is_ok());
+        let overlap = vec![pair(new_rec(100, 10, 1)), pair(new_rec(109, 5, 1))];
+        assert!(check_extref_records_disjoint(&overlap).is_err());
+        assert!(check_extref_records_disjoint(&[pair(new_rec(100, 0, 1))]).is_err());
+        assert!(check_extref_records_disjoint(&[pair(new_rec(100, 3, 0))]).is_err());
+        let no_change = (build_phys_ext_key(100), build_phys_ext_update_val(3, 0));
+        assert!(check_extref_records_disjoint(&[no_change]).is_err());
+        let minus = (build_phys_ext_key(100), build_phys_ext_update_val(3, -1));
+        assert!(check_extref_records_disjoint(&[minus]).is_ok());
+    }
+
+    /// `(blocks, refcnt)` of the record a plan leaves at `start`.
+    fn refcnt_at_in(r: &ExtrefRelease, start: u64) -> Option<(u64, u32)> {
+        r.upserts
+            .iter()
+            .find(|(k, _)| *k == build_phys_ext_key(start))
+            .map(|(_, v)| (rd_u64(v, 0) & PHYS_EXT_LEN_MASK, phys_ext_refcnt(v)))
+    }
+
+    #[test]
+    fn extref_release_skips_holes_and_rejects_short_values() {
+        let recs = vec![new_rec(100, 10, 1)];
+        let r = plan_extref_release(&recs, &[(0, 5)]).unwrap();
+        assert!(r.remove_keys.is_empty() && r.owned_runs.is_empty() && r.update_inserts.is_empty());
+        let short = CatRecord {
+            key: build_phys_ext_key(100),
+            val: vec![0u8; 8],
+        };
+        assert!(plan_extref_release(&[short], &[(100, 1)]).is_err());
     }
 
     #[test]
@@ -6456,6 +9621,39 @@ mod tests {
         n
     }
 
+    /// More records than the node holds is an error, not a node whose values
+    /// were written over its keys (or a subtraction that wraps).
+    #[test]
+    fn catalog_insert_past_the_node_is_refused() {
+        let bsz = 4096;
+        let base = empty_cat_leaf(bsz);
+        let big: Vec<(Vec<u8>, Vec<u8>)> = (16..24u64)
+            .map(|ino| (build_inode_key(ino), vec![0u8; 600]))
+            .collect();
+        assert_eq!(
+            insert_catalog_records(&base, big).err(),
+            Some("node overflow")
+        );
+        // One value larger than the whole value area.
+        let huge = vec![(build_inode_key(16), vec![0u8; bsz])];
+        assert_eq!(
+            insert_catalog_records(&base, huge).err(),
+            Some("node overflow")
+        );
+        // A block too short to hold a header and a footer.
+        let short = base.get(..64).expect("a 64-byte prefix");
+        assert!(insert_catalog_records(short, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn a_record_larger_than_a_node_is_not_partitioned() {
+        let small = (vec![1u8; 8], vec![0u8; 100]);
+        let chunks = partition_records(&[small.clone(), small.clone()], 200).unwrap();
+        assert_eq!(chunks.len(), 2, "two records of 116 bytes split at 200");
+        let huge = (vec![1u8; 8], vec![0u8; 5000]);
+        assert!(partition_records(&[small, huge], node_capacity(4096, false)).is_err());
+    }
+
     #[test]
     fn catalog_insert_roundtrip_sorted() {
         let bsz = 4096;
@@ -6577,15 +9775,34 @@ mod tests {
     }
 
     #[test]
-    fn xattr_embedded_threshold_below_xattr_max_embedded_size() {
-        // Our threshold must be strictly below the spec max so we never
-        // accidentally try to embed something too large.
-        assert!(
-            XATTR_EMBEDDED_THRESHOLD < apfs_core::xattr::XATTR_MAX_EMBEDDED_SIZE,
-            "XATTR_EMBEDDED_THRESHOLD ({}) must be < XATTR_MAX_EMBEDDED_SIZE ({})",
-            XATTR_EMBEDDED_THRESHOLD,
+    fn xattr_embedded_threshold_is_the_checkers_limit_less_the_record_header() {
+        // The largest value embedded plus the record's length and flags
+        // words is exactly the checker's limit on the whole value; measured
+        // on macOS as 3800 embedded, 3801 a stream.
+        assert_eq!(XATTR_EMBEDDED_THRESHOLD, 3800);
+        assert_eq!(
+            build_xattr_val_embedded(&[0u8; XATTR_EMBEDDED_THRESHOLD]).len(),
             apfs_core::xattr::XATTR_MAX_EMBEDDED_SIZE,
+            "the largest embedded record is exactly the limit"
         );
+    }
+
+    #[test]
+    fn a_long_attribute_name_lowers_the_embedded_value_limit() {
+        // Measured on macOS: with a 127-byte name 3794 bytes are embedded and
+        // 3795 a stream; with a 124-byte name the cut is 3797/3798.
+        let long = format!("user.{}", "n".repeat(122));
+        let key = build_xattr_key(10, &long).len();
+        assert!(xattr_value_embeds(key, 3794));
+        assert!(!xattr_value_embeds(key, 3795));
+        let shorter = format!("user.{}", "n".repeat(119));
+        let key = build_xattr_key(10, &shorter).len();
+        assert!(xattr_value_embeds(key, 3797));
+        assert!(!xattr_value_embeds(key, 3798));
+        // A short name leaves the value limit where it was.
+        let key = build_xattr_key(10, "user.sized").len();
+        assert!(xattr_value_embeds(key, XATTR_EMBEDDED_THRESHOLD));
+        assert!(!xattr_value_embeds(key, XATTR_EMBEDDED_THRESHOLD + 1));
     }
 
     #[test]
@@ -6889,5 +10106,279 @@ mod tests {
         let xdata_len = u16::from_le_bytes(v[2..4].try_into().unwrap());
         assert_eq!(xdata_len as usize, data.len());
         assert_eq!(&v[4..], data);
+    }
+
+    // -----------------------------------------------------------------------
+    // Crafted-tree guards: the omap and catalog walkers over an in-memory
+    // device holding hand-built nodes.
+    // -----------------------------------------------------------------------
+
+    use crate::txn::test_support::MemDev;
+
+    /// The header fields the omap node builders inherit from the live root:
+    /// a physical B-tree root of the object map with the table reserve
+    /// macOS uses.
+    fn omap_template() -> Vec<u8> {
+        let mut t = vec![0u8; 4096];
+        wr_u32(&mut t, 24, OBJ_PHYSICAL | OBJECT_TYPE_BTREE);
+        wr_u32(&mut t, 28, OBJECT_TYPE_OMAP);
+        wr_u16(&mut t, 32, BTNODE_ROOT | BTNODE_LEAF | BTNODE_FIXED_KV_SIZE);
+        wr_u16(&mut t, 42, 448);
+        t
+    }
+
+    /// A single-node volume omap mapping each `(oid, paddr)` at xid 1.
+    fn omap_root(entries: &[(u64, u64)]) -> Vec<u8> {
+        let triples: Vec<OmapRec> = entries
+            .iter()
+            .map(|&(o, p)| OmapRec::live(o, 1, p, 4096))
+            .collect();
+        build_omap_node(&omap_template(), &triples, 50, 1, 4096).expect("fits one node")
+    }
+
+    // The single-node builder describes the node it makes: a root leaf of
+    // fixed-size records whatever the template's flags said, one node, 16-byte
+    // keys and values, and no room taken from the entries.
+    #[test]
+    fn single_node_omap_builder_describes_its_own_node() {
+        let mut template = omap_template();
+        wr_u16(&mut template, 32, BTNODE_FIXED_KV_SIZE); // neither root nor leaf
+        wr_u16(&mut template, 34, 3); // a level it is not
+                                      // A tombstone and a live mapping: each keeps its flags and size.
+        let entries = [
+            OmapRec {
+                oid: 1028,
+                xid: 4,
+                paddr: 700,
+                flags: 0x1,
+                size: 4096,
+            },
+            OmapRec::live(1027, 2, 600, 4096),
+        ];
+        let node = build_omap_node(&template, &entries, 50, 9, 4096).expect("two entries fit");
+        let back = parse_omap_entries(&node, 4096).expect("the node parses");
+        assert_eq!(back, vec![OmapRec::live(1027, 2, 600, 4096), entries[0]]);
+        assert_eq!(
+            rd_u16(&node, 32),
+            BTNODE_ROOT | BTNODE_LEAF | BTNODE_FIXED_KV_SIZE
+        );
+        assert_eq!(rd_u16(&node, 34), 0, "a single node is a leaf at level 0");
+        assert_eq!(rd_u32(&node, 36), 2);
+        assert_eq!(rd_u64(&node, 8), 50);
+        assert_eq!(rd_u64(&node, 16), 9);
+        let bti = 4096 - BTREE_INFO_SIZE;
+        assert_eq!(rd_u32(&node, bti + 16), 16, "longest key");
+        assert_eq!(rd_u32(&node, bti + 20), 16, "longest value");
+        assert_eq!(rd_u64(&node, bti + 24), 2, "key count");
+        assert_eq!(rd_u64(&node, bti + 32), 1, "node count");
+        // Sorted by (oid, xid): 1027 first.
+        let key_area = DATA_BASE + rd_u16(&node, 42) as usize;
+        assert_eq!(rd_u64(&node, key_area), 1027);
+        assert_eq!(rd_u64(&node, key_area + 16), 1028);
+    }
+
+    // The records the writer builds are the shape the extent-reference tree
+    // holds; anything else is refused before it can become the footer's
+    // longest key or value.
+    #[test]
+    fn extent_reference_records_must_have_the_trees_shape() {
+        let key = build_phys_ext_key(500);
+        let val = build_phys_ext_val(3, 1028, 1);
+        assert_eq!((key.len(), val.len()), (PHYS_EXT_KEY_LEN, PHYS_EXT_VAL_LEN));
+        assert!(check_extref_record_sizes(&[(key.clone(), val.clone())]).is_ok());
+        let mut long_val = val.clone();
+        long_val.extend_from_slice(&[0u8; 4]);
+        assert!(check_extref_record_sizes(&[(key.clone(), long_val)]).is_err());
+        assert!(check_extref_record_sizes(&[(vec![0u8; 16], val)]).is_err());
+    }
+
+    // Entries that do not fit one node are refused instead of overlapping.
+    #[test]
+    fn single_node_omap_builder_refuses_more_entries_than_fit() {
+        let triples: Vec<OmapRec> = (0..200)
+            .map(|i| OmapRec::live(1000 + i, 1, 500 + i, 4096))
+            .collect();
+        let err = build_omap_node(&omap_template(), &triples, 50, 1, 4096);
+        assert!(
+            matches!(err, Err(TxnError::OmapParse(_))),
+            "got {:?}",
+            err.map(|n| n.len())
+        );
+        let just_fits: Vec<OmapRec> = (0..110)
+            .map(|i| OmapRec::live(1000 + i, 1, 500 + i, 4096))
+            .collect();
+        assert!(build_omap_node(&omap_template(), &just_fits, 50, 1, 4096).is_ok());
+    }
+
+    /// The 16-byte omap key `{oid, xid 1}`.
+    fn omap_key(oid: u64) -> [u8; 16] {
+        let mut k = [0u8; 16];
+        k[..8].copy_from_slice(&oid.to_le_bytes());
+        k[8..].copy_from_slice(&1u64.to_le_bytes());
+        k
+    }
+
+    /// A non-root fstree node at `level`; index values are 8-byte child oids.
+    fn fstree_node(oid: u64, level: u16, recs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+        build_fstree_node(oid, 1, false, level, recs, None, 4096)
+    }
+
+    fn child_ref(oid: u64) -> Vec<u8> {
+        oid.to_le_bytes().to_vec()
+    }
+
+    /// A transaction over a 64-block device holding `blocks`.
+    fn txn_over(blocks: &[(u64, Vec<u8>)]) -> Transaction<MemDev> {
+        let mut dev = MemDev::new(64);
+        for (bno, block) in blocks {
+            dev.put(*bno, block);
+        }
+        Transaction::over(dev)
+    }
+
+    /// A record count beyond what the table of contents holds must be an
+    /// error before it sizes anything or drives an offset.
+    #[test]
+    fn parse_omap_entries_refuses_a_record_count_beyond_the_table() {
+        let mut node = omap_root(&[(0x500, 10)]);
+        wr_u32(&mut node, 36, 0x7FFF_FFFF);
+        update_checksum_in_place(&mut node);
+        assert!(parse_omap_entries(&node, 4096).is_err());
+    }
+
+    /// A value offset reaching back past the key area points into the table
+    /// or the header, not at a value.
+    #[test]
+    fn omap_node_readers_refuse_a_value_offset_past_the_node() {
+        let mut node = omap_root(&[(0x500, 10)]);
+        wr_u16(&mut node, DATA_BASE + 2, 0xFFFF); // v_off of record 0
+        update_checksum_in_place(&mut node);
+        assert!(omap_lookup(&node, 0x500, 4096).is_err());
+        assert!(parse_omap_entries(&node, 4096).is_err());
+        let mut patched = node.clone();
+        assert!(patch_omap_entry(&mut patched, 0x500, 11, 2, 4096).is_err());
+    }
+
+    /// An omap index node whose child pointer leads back to itself is a
+    /// cycle; the walk must report it rather than recurse until the stack
+    /// runs out.
+    #[test]
+    fn walk_omap_tree_refuses_a_cycle() {
+        let entries = [(omap_key(0x500), child_ref(30))];
+        let index = serialize_omap_node(&omap_template(), 1, true, &entries, 30, 1, 1, 1, 4096);
+        let mut txn = txn_over(&[(30, index.clone())]);
+        let err =
+            collect_omap_tree(&mut txn, &index, 30, 4096).expect_err("a cycle must be an error");
+        assert!(matches!(err, TxnError::OmapParse(_)), "got: {err:?}");
+    }
+
+    /// A child one level down is the only child an omap index node may name.
+    #[test]
+    fn omap_walkers_refuse_a_child_at_the_wrong_level() {
+        let leaf = serialize_omap_node(
+            &omap_template(),
+            0,
+            false,
+            &[(omap_key(0x500), vec![0u8; 16])],
+            31,
+            1,
+            1,
+            1,
+            4096,
+        );
+        // A level-2 root pointing straight at the leaf.
+        let index = serialize_omap_node(
+            &omap_template(),
+            2,
+            true,
+            &[(omap_key(0x500), child_ref(31))],
+            30,
+            1,
+            1,
+            2,
+            4096,
+        );
+        let mut txn = txn_over(&[(30, index.clone()), (31, leaf)]);
+        assert!(collect_omap_tree(&mut txn, &index, 30, 4096).is_err());
+        assert!(omap_resolve(&mut txn, &index, 0x500, u64::MAX, 4096).is_err());
+    }
+
+    /// A catalog index node whose child oid resolves back to itself is a
+    /// cycle; collecting the tree must report it, not recurse without end.
+    #[test]
+    fn collect_fstree_refuses_a_cycle() {
+        let omap = omap_root(&[(0x500, 10)]);
+        let node = fstree_node(0x500, 1, &[(build_inode_key(2), child_ref(0x500))]);
+        let mut txn = txn_over(&[(10, node)]);
+        let err =
+            collect_fstree(&mut txn, &omap, 0x500, 4096).expect_err("a cycle must be an error");
+        assert!(matches!(err, TxnError::VolumeParse(_)), "got: {err:?}");
+    }
+
+    /// A child sits one level below its parent; a leaf directly under a
+    /// level-2 node means the pointers do not describe one tree.
+    #[test]
+    fn collect_fstree_refuses_a_child_at_the_wrong_level() {
+        let omap = omap_root(&[(0x500, 10), (0x501, 11)]);
+        let top = fstree_node(0x500, 2, &[(build_inode_key(2), child_ref(0x501))]);
+        let leaf = fstree_node(0x501, 0, &[(build_inode_key(2), vec![7u8; 16])]);
+        let mut txn = txn_over(&[(10, top), (11, leaf)]);
+        assert!(collect_fstree(&mut txn, &omap, 0x500, 4096).is_err());
+        let mut reached = std::collections::HashSet::new();
+        assert!(collect_fstree_oids(&mut txn, &omap, 0x500, 4096, &mut reached, 0).is_err());
+    }
+
+    /// One insert through the path-local writer into the catalog at 0x500.
+    fn path_insert(txn: &mut Transaction<MemDev>, omap: &[u8]) -> Result<u64, TxnError> {
+        let mut batch = EditBatch::new();
+        batch.push(build_inode_key(3), EditOp::Insert(vec![7u8; 16]))?;
+        CowTree::new(Shape::Catalog { omap_root: omap }, 99, 4096).apply(txn, 0x500, batch)
+    }
+
+    /// The path-local writer follows the same pointers and must stop on a
+    /// cycle too, instead of looping forever.
+    #[test]
+    fn path_edit_refuses_a_cycle() {
+        let omap = omap_root(&[(0x500, 10)]);
+        let node = fstree_node(0x500, 1, &[(build_inode_key(2), child_ref(0x500))]);
+        let mut txn = txn_over(&[(10, node)]);
+        let err = path_insert(&mut txn, &omap).expect_err("a cycle must be an error");
+        assert!(matches!(err, TxnError::VolumeParse(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn path_edit_refuses_a_child_at_the_wrong_level() {
+        let omap = omap_root(&[(0x500, 10), (0x501, 11)]);
+        let top = fstree_node(0x500, 2, &[(build_inode_key(2), child_ref(0x501))]);
+        let leaf = fstree_node(0x501, 0, &[(build_inode_key(2), vec![7u8; 16])]);
+        let mut txn = txn_over(&[(10, top), (11, leaf)]);
+        assert!(path_insert(&mut txn, &omap).is_err());
+    }
+
+    /// An extentref index node naming the same child twice would have that
+    /// child's records collected twice; a repeated child is an error.
+    #[test]
+    fn collect_extref_refuses_a_repeated_child() {
+        let leaf = fstree_node(21, 0, &[(build_inode_key(2), vec![7u8; 16])]);
+        let index = fstree_node(
+            20,
+            1,
+            &[
+                (build_inode_key(2), child_ref(21)),
+                (build_inode_key(3), child_ref(21)),
+            ],
+        );
+        let mut txn = txn_over(&[(20, index), (21, leaf)]);
+        let err = collect_extref_records(&mut txn, 20, 4096)
+            .expect_err("a repeated child must be an error");
+        assert!(matches!(err, TxnError::VolumeParse(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn collect_extref_refuses_a_child_at_the_wrong_level() {
+        let leaf = fstree_node(21, 0, &[(build_inode_key(2), vec![7u8; 16])]);
+        let index = fstree_node(20, 2, &[(build_inode_key(2), child_ref(21))]);
+        let mut txn = txn_over(&[(20, index), (21, leaf)]);
+        assert!(collect_extref_records(&mut txn, 20, 4096).is_err());
     }
 }

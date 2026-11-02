@@ -315,6 +315,22 @@ refreshBtn.addEventListener('click', () => {
   refresh();
 });
 
-// Auto-refresh on load + every 3 seconds so device-arrival/removal shows up.
+// Which build this is, under the title: the version, the commit and the
+// build date, so a report can name it.
+if (invoke) {
+  invoke('app_version')
+    .then((v) => { document.getElementById('app-version').textContent = v; })
+    .catch((e) => { document.getElementById('app-version').textContent = `version unknown: ${e}`; });
+}
+
+// Auto-refresh on load + every 3 seconds so device-arrival/removal shows up,
+// but only while the window is shown: one refresh is two WMI queries
+// (~40 ms of WMI service CPU), which a window hidden in the tray does not
+// need. Showing the window again refreshes at once.
 refresh();
-setInterval(refresh, 3000);
+setInterval(() => {
+  if (!document.hidden) refresh();
+}, 3000);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refresh();
+});

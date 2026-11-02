@@ -16,6 +16,13 @@ pub enum BlockError {
 pub trait BlockDevice {
     fn size(&self) -> u64;
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockError>;
+
+    /// Read file content: the same bytes as [`read_at`](Self::read_at). A
+    /// device with a cache keeps content out of what it holds for metadata;
+    /// a layer between the reader and such a device passes this through.
+    fn read_content_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        self.read_at(offset, buf)
+    }
 }
 
 /// Extension of `BlockDevice` for writable devices.

@@ -327,7 +327,15 @@ mod r156 {
             let v = verdict_lines(&out);
             println!("[#156 rename {r:>3} {old} -> {new}] fsck_clean={ok}  {v:?}");
             if !ok {
-                fails.push(format!("rename {r} ({old}): fsck DIRTY {v:?}"));
+                // A verdict with no fsck complaint in it means the harness
+                // itself failed (attach, detach, or a lock on the mounted
+                // volume), and only the raw output can say which.
+                let detail = if v.is_empty() {
+                    format!("(no fsck complaint; raw verify output follows)\n{out}")
+                } else {
+                    format!("{v:?}")
+                };
+                fails.push(format!("rename {r} ({old}): fsck DIRTY {detail}"));
                 // Preserve the first corrupt image for offline byte-decode.
                 let _ = std::fs::copy(IMG, format!("/tmp/apfs-156-corrupt-r{r}.img"));
                 break; // first corruption pinpointed - stop.

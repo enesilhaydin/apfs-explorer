@@ -134,7 +134,8 @@ pub fn mount_apfs_image(
         FileBlockDeviceRw::open_rw(path).map_err(io_err("FileBlockDeviceRw::open_rw"))?;
 
     let dev = CachingBlockDevice::new(OffsetBlockDevice::new(file_dev, range.offset, range.length));
-    let mut fsview = FsView::open_selected(dev, selector).map_err(io_err("FsView::open"))?;
+    let mut fsview = FsView::open_selected(crate::group::GroupDev::Plain(dev), selector)
+        .map_err(io_err("FsView::open"))?;
     // Snapshot-guard (#149): writing to a CLEAN volume is fsck-validated on real
     // hardware, but writing to a SNAPSHOTTED volume hits the unproven
     // snapshot-pinned sm_fq free path (fsck-fails). Refuse writable when the
@@ -155,6 +156,7 @@ pub fn mount_apfs_image(
         .unicode_on_disk(true)
         .read_only_volume(!writable)
         .post_cleanup_when_modified_only(true)
+        // Same as the drive mount; see PassQueryDirectoryFileName in mount.rs.
         .pass_query_directory_filename(true)
         .persistent_acls(true)
         .flush_and_purge_on_cleanup(true)
@@ -162,6 +164,7 @@ pub fn mount_apfs_image(
         .volume_serial_number(serial)
         .max_component_length(255)
         .reparse_points(true);
+    crate::mount::apply_info_timeouts(&mut vp);
     // NOTE: WinFsp 2.1 SDK (winfsp-sys 0.12 / winfsp 0.13) does not expose a
     // RemovableMedia bitfield in FSP_FSCTL_VOLUME_PARAMS - the field was present
     // in earlier WinFsp versions but is absent from the 2.1 bindgen output.
@@ -169,10 +172,13 @@ pub fn mount_apfs_image(
     // Removable-media reporting (DriveType=2, "Safely Remove Hardware" tray)
     // is a deferred enhancement tracked in the M13 roadmap.
 
-    let fs = ApfsFs::new(fsview);
+    let fs = ApfsFs::new(fsview).read_only(!writable);
     let dirty_arc = fs.dirty_arc();
-    let mut host = FileSystemHost::<ApfsFs<ImageDev>, FineGuard>::new(vp, fs)
-        .map_err(io_err("FileSystemHost::new"))?;
+    let mut host = FileSystemHost::<ApfsFs<ImageDev>, FineGuard>::new_with_options(
+        crate::mount::host_params(vp),
+        fs,
+    )
+    .map_err(io_err("FileSystemHost::new"))?;
     // Plain drive-letter mount; cross-elevation visibility via the install-time
     // EnableLinkedConnections policy (see mount_apfs for the rationale).
     host.mount(mountpoint).map_err(io_err("host.mount"))?;

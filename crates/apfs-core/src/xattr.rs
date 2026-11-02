@@ -27,10 +27,22 @@ pub struct XattrDstream {
     pub size: u64,
 }
 
+/// Bytes of a stream attribute's value: the stream's id and a data stream
+/// (size, allocated size, default crypto id, bytes written, bytes read).
+pub const XATTR_DSTREAM_LEN: usize = 48;
+
 impl XattrDstream {
     /// Parse from xdata: xattr_obj_id u64@0; j_dstream_t@8 whose first
-    /// field `size` is u64@8.
+    /// field `size` is u64@8. The value is exactly 48 bytes; a shorter one is
+    /// not a stream attribute, whatever its flags say.
     pub fn parse(xdata: &[u8]) -> Result<Self, ParseError> {
+        if xdata.len() != XATTR_DSTREAM_LEN {
+            return Err(ParseError::Short {
+                at: 0,
+                need: XATTR_DSTREAM_LEN,
+                len: xdata.len(),
+            });
+        }
         Ok(Self {
             xattr_obj_id: u64_le(xdata, 0)?,
             size: u64_le(xdata, 8)?,
@@ -68,6 +80,25 @@ pub fn xattr_val(val: &[u8]) -> Result<(u16, &[u8]), ParseError> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    // A stream attribute's value is the stream id and a data stream, 48
+    // bytes; a shorter value carrying the stream flag is not one.
+    #[test]
+    fn stream_value_must_be_whole() {
+        let mut whole = vec![0u8; XATTR_DSTREAM_LEN];
+        whole[0..8].copy_from_slice(&77u64.to_le_bytes());
+        whole[8..16].copy_from_slice(&5000u64.to_le_bytes());
+        let ds = XattrDstream::parse(&whole).unwrap();
+        assert_eq!((ds.xattr_obj_id, ds.size), (77, 5000));
+        assert!(
+            XattrDstream::parse(&whole[..16]).is_err(),
+            "16 bytes is not a stream value"
+        );
+        assert!(
+            XattrDstream::parse(&[0u8; 56]).is_err(),
+            "nor is a longer one"
+        );
+    }
 
     #[test]
     fn parses_key_name_strips_trailing_nul() {

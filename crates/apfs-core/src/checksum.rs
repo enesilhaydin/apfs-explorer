@@ -11,12 +11,21 @@ const MOD: u64 = 0xFFFF_FFFF;
 fn fletcher64_words(data: &[u8]) -> u64 {
     let mut s1: u64 = 0;
     let mut s2: u64 = 0;
-    for w in data.chunks_exact(4) {
-        let mut a = [0u8; 4];
-        a.copy_from_slice(w);
-        let v = u64::from(u32::from_le_bytes(a));
-        s1 = (s1 + v) % MOD;
-        s2 = (s2 + s1) % MOD;
+    // The sums are reduced once per REDUCE_EVERY words instead of after
+    // every word: the same residues, without two divisions per word (the
+    // checksum was the costliest step of a small write). Starting below MOD,
+    // after k words s1 < (k + 1) * 2^32 and s2 < (k + 1)^2 * 2^31, inside a
+    // u64 while k < 90 000.
+    const REDUCE_EVERY: usize = 4096;
+    for group in data.chunks(REDUCE_EVERY * 4) {
+        for w in group.chunks_exact(4) {
+            let mut a = [0u8; 4];
+            a.copy_from_slice(w);
+            s1 += u64::from(u32::from_le_bytes(a));
+            s2 += s1;
+        }
+        s1 %= MOD;
+        s2 %= MOD;
     }
     let c1 = MOD - ((s1 + s2) % MOD);
     let c2 = MOD - ((s1 + c1) % MOD);
@@ -46,6 +55,45 @@ pub fn verify_block(block: &[u8]) -> Result<(), ParseError> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// The checksum reducing after every word, as first written.
+    fn reference(data: &[u8]) -> u64 {
+        let (mut s1, mut s2) = (0u64, 0u64);
+        for w in data.chunks_exact(4) {
+            let v = u64::from(u32::from_le_bytes([w[0], w[1], w[2], w[3]]));
+            s1 = (s1 + v) % MOD;
+            s2 = (s2 + s1) % MOD;
+        }
+        let c1 = MOD - ((s1 + s2) % MOD);
+        let c2 = MOD - ((s1 + c1) % MOD);
+        (c2 << 32) | c1
+    }
+
+    /// Reducing once per group of words gives the same checksum, for words
+    /// at the top of the range, over several groups, and for a length that
+    /// is not a whole number of words.
+    #[test]
+    fn deferred_reduction_matches_per_word() {
+        let mut x: u32 = 0x1234_5678;
+        let mut noise = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let mut cases: Vec<Vec<u8>> = vec![
+            vec![0xFF; 4096],
+            vec![0xFF; 64 * 4096 + 3],
+            vec![0; 4096],
+            Vec::new(),
+        ];
+        for len in [4088usize, 4096, 16_384 + 7, 100_000] {
+            cases.push((0..len).map(|_| noise() as u8).collect());
+        }
+        for c in &cases {
+            assert_eq!(fletcher64_words(c), reference(c), "length {}", c.len());
+        }
+    }
 
     #[test]
     fn verifies_real_apfs_block_zero() {

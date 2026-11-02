@@ -44,6 +44,7 @@ impl<D: BlockDevice> BlockDevice for OffsetBlockDevice<D> {
                 len: blen,
                 size: self.len,
             })?;
+        let _t = crate::stats::timed("device.read");
         self.inner.read_at(abs, buf)
     }
 }
@@ -71,6 +72,7 @@ impl<D: WritableBlockDevice> WritableBlockDevice for OffsetBlockDevice<D> {
                 len: blen,
                 size: self.len,
             })?;
+        let _t = crate::stats::timed("device.write");
         self.inner.write_at(abs, buf)
     }
 
@@ -79,6 +81,7 @@ impl<D: WritableBlockDevice> WritableBlockDevice for OffsetBlockDevice<D> {
     /// without this delegation the trait no-op default would swallow the
     /// barrier before it reached `PhysicalDrive::flush_data`.
     fn flush_data(&mut self) -> Result<(), BlockError> {
+        let _t = crate::stats::timed("device.flush");
         self.inner.flush_data()
     }
 }

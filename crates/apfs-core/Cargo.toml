@@ -9,6 +9,12 @@ workspace = true
 
 [dependencies]
 thiserror.workspace = true
+# decmpfs codecs: zlib (methods 3/4) and LZFSE (11/12). Pure Rust, so the
+# Windows host builds without a C toolchain.
+miniz_oxide = "0.8"
+lzfse_rust = "0.2"
+# Name folding for hashed directories: NFD plus the full Unicode case fold.
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

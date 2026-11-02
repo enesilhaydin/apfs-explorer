@@ -49,6 +49,11 @@ fn main() {
         unreachable!();
     }
 
+    if matches!(rest.first().map(|s| s.as_str()), Some("--version" | "-V")) {
+        println!("{}", version_line());
+        std::process::exit(0);
+    }
+
     // No subcommand matched - show help.
     if rest.first().map(|s| s.as_str()) == Some("--help")
         || rest.first().map(|s| s.as_str()) == Some("-h")
@@ -65,6 +70,24 @@ fn main() {
     winfsp_host::subcmd::print_subcmd_usage();
     std::process::exit(1);
 }
+
+/// `apfs-mount <version> (<commit>, built <date>)`, for `--version` and the
+/// log's start line, so a log says which build wrote it.
+fn version_line() -> String {
+    format!(
+        "apfs-mount {} ({})",
+        env!("APFS_PRODUCT_VERSION"),
+        env!("APFS_BUILD_ID")
+    )
+}
+
+/// How often a drive mount checks that its drive is still there.
+#[cfg(windows)]
+const PRESENCE_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Exit code of a mount that ended because its drive was pulled out.
+#[cfg(windows)]
+const EXIT_DRIVE_REMOVED: i32 = 3;
 
 #[cfg(windows)]
 fn main() {
@@ -106,6 +129,10 @@ fn run_mount(args: &[String]) {
         print_usage();
         return;
     }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("{}", version_line());
+        return;
+    }
 
     // Capture this process's stdout+stderr into a fresh log file before any
     // mount work. apfs-mount is normally launched detached + elevated by the
@@ -131,7 +158,8 @@ fn run_mount(args: &[String]) {
         )
         .try_init();
     println!(
-        "apfs-mount starting: argv={:?} (pid {})",
+        "{} starting: argv={:?} (pid {})",
+        version_line(),
         args,
         std::process::id()
     );
@@ -274,19 +302,44 @@ fn run_mount(args: &[String]) {
     // types, so a generic fn would need higher-ranked bounds across two
     // unrelated T params.  A macro avoids that while keeping the code DRY.
     //
-    // `$dirty` is the `Arc<AtomicBool>` returned alongside the host.
+    // `$dirty` is the `Arc<AtomicBool>` returned alongside the host;
+    // `$presence` the drive's `DrivePresence`, `None` for an image.
+    //
+    // A drive pulled out ends the mount: the drive letter goes, nothing is
+    // committed to a device that is no longer there (the volume keeps its
+    // last checkpoint), and the process exits with EXIT_DRIVE_REMOVED rather
+    // than waiting for a stop that may never come.
     macro_rules! run_host {
-        ($host:ident, $dirty:ident) => {{
+        ($host:ident, $dirty:ident, $presence:expr) => {{
+            let presence: Option<winfsp_host::winraw::DrivePresence> = $presence;
+            let drive_gone = || presence.as_ref().is_some_and(|p| !p.present());
+            macro_rules! end_after_removal {
+                () => {{
+                    $host.stop();
+                    $host.unmount();
+                    eprintln!(
+                        "the drive was removed; unmounted. Changes from its last \
+                         moments are lost; the volume stays consistent."
+                    );
+                    std::process::exit(EXIT_DRIVE_REMOVED);
+                }};
+            }
             println!(
                 "APFS mounted at {mount} ({}). Press Ctrl+C to unmount.",
                 if writable { "writable" } else { "read-only" }
             );
+            // However the process is stopped from outside (Ctrl+C, Ctrl+Break,
+            // the console closing), the open write group is committed first.
+            commit_on_console_stop();
             if wait_for_kill {
                 // Poll loop: write dirty status to a temp-file every 2 s so
                 // the tray process can display a dirty/clean indicator without
                 // a heavyweight IPC channel. The file is removed on exit.
                 let status_path = winfsp_host::mount::status_file_path(drive.unwrap_or(u32::MAX));
                 loop {
+                    if drive_gone() {
+                        end_after_removal!();
+                    }
                     let dirty = $dirty.load(std::sync::atomic::Ordering::Relaxed);
                     let _ = winfsp_host::mount::write_status_file(
                         &status_path,
@@ -316,7 +369,17 @@ fn run_mount(args: &[String]) {
                         let _ = tx_clone.send(());
                     });
                 }
-                let _ = rx.recv();
+                loop {
+                    match rx.recv_timeout(PRESENCE_TICK) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if drive_gone() {
+                                end_after_removal!();
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                winfsp_host::mount::commit_before_exit();
                 $host.stop();
                 $host.unmount();
                 println!("Unmounted.");
@@ -327,7 +390,7 @@ fn run_mount(args: &[String]) {
     if let Some(img_path) = image {
         // -- image mode --
         match winfsp_host::image_mount::mount_apfs_image(&img_path, writable, &mount, selector) {
-            Ok((mut host, dirty)) => run_host!(host, dirty),
+            Ok((mut host, dirty)) => run_host!(host, dirty, None),
             Err(e) => {
                 eprintln!("image mount failed: {e:?}");
                 std::process::exit(1);
@@ -336,7 +399,7 @@ fn run_mount(args: &[String]) {
     } else {
         // -- physical drive mode --
         match winfsp_host::mount::mount_apfs(drive, &mount, writable, selector) {
-            Ok((mut host, dirty)) => run_host!(host, dirty),
+            Ok((mut host, dirty, presence)) => run_host!(host, dirty, Some(presence)),
             Err(e) => {
                 eprintln!("mount failed: {e:?}");
                 std::process::exit(1);
@@ -399,8 +462,9 @@ EXAMPLES:
     winfsp_host::subcmd::print_subcmd_usage();
 }
 
-/// Redirect this process's stdout and stderr to a freshly-truncated
-/// `%PROGRAMDATA%\APFS Explorer\logs\apfs-mount.log`.
+/// Redirect this process's stdout and stderr to
+/// `%PROGRAMDATA%\APFS Explorer\logs\apfs-mount.log`, appending; a log past
+/// `LOG_ROTATE_BYTES` is first moved to `apfs-mount.log.1`.
 ///
 /// We set the Win32 std handles *before* the first `println!`/`eprintln!` so
 /// Rust's lazily-initialised `Stdout`/`Stderr` pick up the file handle (they
@@ -419,6 +483,14 @@ fn redirect_std_to_log() {
     .join("logs");
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("apfs-mount.log");
+    // Every run appends, so without a bound the log only grows. Another
+    // mount holding the file open makes the move fail; this run then appends
+    // and a later start rotates it. The console still shows the reason.
+    if let Err(e) =
+        winfsp_host::logfile::rotate_if_large(&path, winfsp_host::logfile::LOG_ROTATE_BYTES)
+    {
+        eprintln!("warning: could not rotate {}: {e}", path.display());
+    }
 
     // Append (not truncate) so a crash/restart keeps the prior run's diagnostics.
     // The GUI parses the LAST "APFS mounted at X:" line, so appending is safe.
@@ -439,6 +511,24 @@ fn redirect_std_to_log() {
         let _ = SetStdHandle(STD_ERROR_HANDLE, h);
     }
     std::mem::forget(file);
+}
+
+/// Commit the open write group on a console stop event, then let the
+/// default handling end the process.
+#[cfg(windows)]
+fn commit_on_console_stop() {
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+
+    unsafe extern "system" fn on_stop(_event: u32) -> BOOL {
+        winfsp_host::mount::commit_before_exit();
+        BOOL(0)
+    }
+    // SAFETY: `on_stop` is a plain function with the handler signature and
+    // lives for the whole process; registering it has no other effect.
+    if let Err(e) = unsafe { SetConsoleCtrlHandler(Some(on_stop), true) } {
+        eprintln!("warning: no commit on console stop: {e}");
+    }
 }
 
 // Minimal Ctrl+C handler: blocks on a stdin line so `echo | apfs-mount`

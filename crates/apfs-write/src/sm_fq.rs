@@ -52,6 +52,8 @@ const DATA_BASE: usize = 56;
 const FOOTER: usize = 40;
 /// Fixed TOC reserve = 576 bytes = 144 kvoff_t(u16 k_off, u16 v_off) entries.
 const TOC_RESERVE: usize = 576;
+/// One `kvoff_t` entry of the table of contents.
+const TOC_ENTRY_SIZE: usize = 4;
 /// Leaf entry key size: sfqk_xid (u64) + sfqk_paddr (u64).
 const KEY_SIZE: usize = 16;
 /// Leaf entry val size (count, or 0 when ghost): sfqv_count (u64).
@@ -372,7 +374,11 @@ pub fn parse_sm_fq_entries(node: &[u8], bsz: usize) -> Vec<(u64, u64, u64)> {
     let toc_len = rd_u16(node, 42) as usize;
     let kas = DATA_BASE + toc_len;
     let vae = val_area_end(node, bsz);
-    let mut out = Vec::with_capacity(nkeys);
+    // Cap the reservation by the node's physical table-of-contents capacity
+    // (DATA_BASE + 4 bytes per entry); a crafted nkeys (u32, up to ~4 billion)
+    // would otherwise reserve ~96 GB. The loop below is already bounded by the
+    // same TOC size, so a valid node reserves its real entry count.
+    let mut out = Vec::with_capacity(nkeys.min(bsz.saturating_sub(DATA_BASE) / 4));
     for i in 0..nkeys {
         let toc_off = DATA_BASE + i * 4;
         if toc_off + 4 > bsz {
@@ -414,7 +420,11 @@ pub fn parse_internal_entries(node: &[u8], bsz: usize) -> Vec<(u64, u64, u64)> {
     let toc_len = rd_u16(node, 42) as usize;
     let kas = DATA_BASE + toc_len;
     let vae = val_area_end(node, bsz);
-    let mut out = Vec::with_capacity(nkeys);
+    // Cap the reservation by the node's physical table-of-contents capacity
+    // (DATA_BASE + 4 bytes per entry); a crafted nkeys (u32, up to ~4 billion)
+    // would otherwise reserve ~96 GB. The loop below is already bounded by the
+    // same TOC size, so a valid node reserves its real entry count.
+    let mut out = Vec::with_capacity(nkeys.min(bsz.saturating_sub(DATA_BASE) / 4));
     for i in 0..nkeys {
         let toc_off = DATA_BASE + i * 4;
         if toc_off + 4 > bsz {
@@ -496,6 +506,10 @@ pub fn drain_sm_fq_upto(
     }
     let entries = parse_sm_fq_entries(node, bsz);
     let (drain, keep): (Vec<_>, Vec<_>) = entries.into_iter().partition(|&(x, _, _)| x <= upto_xid);
+    // Nothing due here: the node stays exactly as written, whoever wrote it.
+    if drain.is_empty() {
+        return Ok((node.to_vec(), drain));
+    }
     let new_node = write_leaf_node(node, &keep, bsz)?;
     Ok((new_node, drain))
 }
@@ -509,12 +523,17 @@ fn write_leaf_node(
     entries: &[(u64, u64, u64)],
     bsz: usize,
 ) -> Result<Vec<u8>, SmFqError> {
-    if entries.len() > smfq_max_keys(bsz) {
-        return Err(SmFqError::Full);
-    }
     let is_root = node_is_root(template);
     let vae = val_area_end(template, bsz);
     let kas = key_area_start();
+    // What this node can hold: a leaf below an internal root has no footer
+    // and takes more than `smfq_max_keys`, which macOS uses; the table of
+    // contents bounds both.
+    let capacity =
+        (TOC_RESERVE / TOC_ENTRY_SIZE).min(vae.saturating_sub(kas) / (KEY_SIZE + LEAF_VAL_SIZE));
+    if entries.len() > capacity {
+        return Err(SmFqError::Full);
+    }
     let mut buf = template.to_vec();
 
     // Preserve obj_phys (bytes 0..32) and btn_flags/btn_level (bytes 32..36).
@@ -524,6 +543,14 @@ fn write_leaf_node(
     let used_val = entries.len() * LEAF_VAL_SIZE;
     wr_u16(&mut buf, 44, used_key as u16);
     wr_u16(&mut buf, 46, (vae - kas - used_key - used_val) as u16);
+    // The key and value areas are repacked from scratch below, so any free-list
+    // head the template carried now describes space this node no longer has.
+    // A kernel-formatted queue node does carry one, and leaving it made fsck
+    // report "Space manager free queue trees are invalid".
+    wr_u16(&mut buf, 48, BTOFF_INVALID);
+    wr_u16(&mut buf, 50, 0);
+    wr_u16(&mut buf, 52, BTOFF_INVALID);
+    wr_u16(&mut buf, 54, 0);
 
     // Clear TOC and key/val regions before rewriting.
     for b in &mut buf[DATA_BASE..DATA_BASE + TOC_RESERVE] {
@@ -744,8 +771,9 @@ pub fn insert_multi_node(
             sep_paddr,
         } => {
             // Leaf split. Update the left child (in-place), add the right child,
-            // insert the separator into the internal root.
-            ephemerals[leaf_idx].1 = left_leaf;
+            // insert the separator into the internal root. The leaf's bytes
+            // are kept so a refusal below can put them back.
+            let original_leaf = std::mem::replace(&mut ephemerals[leaf_idx].1, left_leaf);
             ephemerals.push((right_oid, right_leaf));
 
             // Insert separator into the root.
@@ -761,10 +789,7 @@ pub fn insert_multi_node(
                 // simultaneously. This is extremely unlikely in practice.
                 // Pop the right child we just pushed to leave ephemerals unmodified.
                 ephemerals.pop();
-                ephemerals[leaf_idx].1 = parse_sm_fq_entries_raw_restore(
-                    &root_internal, // restore original leaf bytes
-                    bsz,
-                );
+                ephemerals[leaf_idx].1 = original_leaf;
                 return Err(SmFqError::Malformed(
                     "internal root overflow after leaf split; \
                      tree has >142 leaf children which is not yet supported",
@@ -863,11 +888,6 @@ pub fn insert_multi_node_2(
 // but by the time we detect overflow we've already modified them. We pass the root
 // (wrong type) as a placeholder here; the caller should do the rollback differently.
 // This function is intentionally left as a stub that returns empty - see rollback comment.
-fn parse_sm_fq_entries_raw_restore(_node: &[u8], _bsz: usize) -> Vec<u8> {
-    // Intentionally not used - see inline rollback comment in insert_multi_node.
-    Vec::new()
-}
-
 // ---------------------------------------------------------------------------
 // Leaf insert helper (called by insert_multi_node)
 // ---------------------------------------------------------------------------
@@ -1116,6 +1136,35 @@ mod tests {
 
     const BSZ: usize = 4096;
 
+    /// Draining repacks the key and value areas from scratch, so any free-list
+    /// head the old node carried now points into space the rewrite declared
+    /// free. A kernel-formatted queue node does carry one, and fsck rejects the
+    /// contradiction with "Space manager free queue trees are invalid".
+    #[test]
+    fn drain_clears_the_free_lists_it_invalidates() {
+        let entries = [(2u64, 428u64, 2u64), (3, 430, 3), (4, 439, 1)];
+        let mut node = build_sm_fq_leaf_node(0x40, 4, BSZ, true, &entries);
+        // What a kernel-written node looks like once it has recycled space.
+        wr_u16(&mut node, 48, 272);
+        wr_u16(&mut node, 50, 16);
+        wr_u16(&mut node, 52, 152);
+        wr_u16(&mut node, 54, 8);
+
+        let (drained_node, drained) = drain_sm_fq_upto(&node, 4, BSZ).expect("drain");
+        assert_eq!(drained.len(), 3, "every entry is at or below the xid");
+        assert_eq!(rd_u32(&drained_node, 36), 0, "node must be empty");
+        assert_eq!(
+            (rd_u16(&drained_node, 48), rd_u16(&drained_node, 50)),
+            (BTOFF_INVALID, 0),
+            "key free list must be empty after a full repack"
+        );
+        assert_eq!(
+            (rd_u16(&drained_node, 52), rd_u16(&drained_node, 54)),
+            (BTOFF_INVALID, 0),
+            "value free list must be empty after a full repack"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Existing single-node tests (preserved)
     // -----------------------------------------------------------------------
@@ -1137,6 +1186,17 @@ mod tests {
         assert_eq!(rd_u64(&node, BSZ - FOOTER + 24), 0); // key_count
         assert_eq!(rd_u64(&node, BSZ - FOOTER + 32), 1); // node_count
         assert!(parse_sm_fq_entries(&node, BSZ).is_empty());
+    }
+
+    #[test]
+    fn huge_nkeys_does_not_oom() {
+        // A crafted node header claiming ~4 billion keys must not reserve that
+        // many entries (~96 GB). The parse loop is bounded by the node's TOC, so
+        // the result stays small and no allocation abort occurs.
+        let mut node = build_empty_sm_fq_node(1, 1, BSZ);
+        node[36..40].copy_from_slice(&u32::MAX.to_le_bytes()); // nkeys = 0xFFFFFFFF
+        assert!(parse_sm_fq_entries(&node, BSZ).len() <= BSZ / 4);
+        assert!(parse_internal_entries(&node, BSZ).len() <= BSZ / 4);
     }
 
     #[test]
@@ -1191,6 +1251,31 @@ mod tests {
             Err(SmFqError::Full)
         );
         assert_eq!(parse_sm_fq_entries(&node, BSZ).len(), smfq_max_keys(BSZ));
+    }
+
+    /// A leaf below an internal root has no footer, so it holds more entries
+    /// than a root leaf, and macOS fills it that far. Draining such a leaf
+    /// must neither refuse it nor rewrite it when nothing in it is due.
+    #[test]
+    fn drain_a_full_non_root_leaf() {
+        let mut leaf = build_empty_sm_fq_node(100, 5, BSZ);
+        let flags = rd_u16(&leaf, 32) & !BTNODE_ROOT;
+        wr_u16(&mut leaf, 32, flags);
+        let cap = (BSZ - key_area_start()) / (KEY_SIZE + LEAF_VAL_SIZE);
+        assert!(cap > smfq_max_keys(BSZ));
+        let entries: Vec<(u64, u64, u64)> = (0..cap as u64)
+            .map(|i| (10 + i % 2, 0x1000 + i, 1))
+            .collect();
+        let full = write_leaf_node(&leaf, &entries, BSZ).expect("a non-root leaf holds this many");
+        assert_eq!(parse_sm_fq_entries(&full, BSZ).len(), cap);
+
+        let (same, drained) = drain_sm_fq_upto(&full, 5, BSZ).expect("nothing due");
+        assert!(drained.is_empty());
+        assert_eq!(same, full);
+
+        let (rest, drained) = drain_sm_fq_upto(&full, 10, BSZ).expect("drain");
+        assert_eq!(drained.len(), cap / 2);
+        assert_eq!(parse_sm_fq_entries(&rest, BSZ).len(), cap - cap / 2);
     }
 
     #[test]

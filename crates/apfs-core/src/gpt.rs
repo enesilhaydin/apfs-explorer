@@ -3,10 +3,23 @@
 //! Only the fields needed to locate the APFS container are read. Offsets
 //! are validated against the project plan's empirically-locked GPT layout.
 
-use apfs_core::block_device::{BlockDevice, BlockError};
+use crate::block_device::{BlockDevice, BlockError};
 
 /// APFS container GPT partition type GUID, canonical string form.
 pub const APFS_TYPE_GUID: &str = "7C3457EF-0000-11AA-AA11-00306543ECAC";
+
+/// Bounds on the partition entry array. The UEFI specification requires
+/// `SizeOfPartitionEntry` to be a power of two of at least 128 bytes, and
+/// real tables use exactly 128 with 128 entries; both fields come from the
+/// disk, so a crafted header must not size a buffer or a loop on its own.
+const MIN_PARTITION_ENTRY_SIZE: u64 = 128;
+const MAX_PARTITION_ENTRY_SIZE: u64 = 64 * 1024;
+const MAX_PARTITION_ENTRIES: u64 = 65_536;
+const MAX_PARTITION_TABLE_BYTES: u64 = 16 * 1024 * 1024;
+/// The part of an entry this parser reads: the type GUID (bytes 0..16) and
+/// the first/last LBA pair (bytes 32..48). A longer entry only carries
+/// vendor extensions past that, so the rest is never read.
+const PARTITION_ENTRY_READ_LEN: usize = 128;
 
 #[derive(Debug)]
 pub enum GptError {
@@ -91,19 +104,33 @@ pub fn find_apfs_container<D: BlockDevice>(
         return Err(GptError::NoGptHeader);
     }
     let part_lba = u64_le(&hdr, 72)?;
-    let num_parts = u32_le(&hdr, 80)?;
-    let part_size = u32_le(&hdr, 84)? as u64;
-    if part_size < 128 || num_parts == 0 || num_parts > 65_536 {
-        return Err(GptError::Malformed("gpt header fields"));
+    let num_parts = u64::from(u32_le(&hdr, 80)?);
+    let part_size = u64::from(u32_le(&hdr, 84)?);
+    if !(MIN_PARTITION_ENTRY_SIZE..=MAX_PARTITION_ENTRY_SIZE).contains(&part_size)
+        || !part_size.is_power_of_two()
+    {
+        return Err(GptError::Malformed("partition entry size"));
+    }
+    if num_parts == 0 || num_parts > MAX_PARTITION_ENTRIES {
+        return Err(GptError::Malformed("partition entry count"));
+    }
+    let table_bytes = num_parts
+        .checked_mul(part_size)
+        .ok_or(GptError::Malformed("partition table size overflow"))?;
+    if table_bytes > MAX_PARTITION_TABLE_BYTES {
+        return Err(GptError::Malformed("partition table too large"));
     }
 
     let table_base = part_lba
         .checked_mul(lba_size)
         .ok_or(GptError::Malformed("table base overflow"))?;
-    for i in 0..num_parts as u64 {
-        let mut ent = vec![0u8; part_size as usize];
-        let ent_off = table_base
-            .checked_add(i * part_size)
+    for i in 0..num_parts {
+        // Only the leading bytes of an entry are meaningful here; the entry
+        // size sets the stride between entries, not the amount read.
+        let mut ent = [0u8; PARTITION_ENTRY_READ_LEN];
+        let ent_off = i
+            .checked_mul(part_size)
+            .and_then(|o| table_base.checked_add(o))
             .ok_or(GptError::Malformed("entry offset overflow"))?;
         dev.read_at(ent_off, &mut ent)?;
         if guid_string(&ent)?.eq_ignore_ascii_case(APFS_TYPE_GUID) {
@@ -118,6 +145,18 @@ pub fn find_apfs_container<D: BlockDevice>(
             let length = (last_lba - first_lba + 1)
                 .checked_mul(lba_size)
                 .ok_or(GptError::Malformed("length overflow"))?;
+            // The table says where the partition is; nothing so far says the
+            // device is that big. A table describing a partition past the end
+            // of the medium would have every access inside it land outside.
+            let end = offset
+                .checked_add(length)
+                .ok_or(GptError::Malformed("range end overflow"))?;
+            let dev_size = dev.size();
+            if dev_size != 0 && end > dev_size {
+                return Err(GptError::Malformed(
+                    "partition extends past the end of the device",
+                ));
+            }
             return Ok(ContainerRange { offset, length });
         }
     }
@@ -158,21 +197,96 @@ mod tests {
     }
 
     fn build_disk(first_lba: u64, last_lba: u64) -> MemDisk {
+        build_disk_with_table(first_lba, last_lba, 128, 128, 0)
+    }
+
+    /// A disk whose GPT header declares `num_entries` entries of
+    /// `entry_size` bytes, with the APFS entry at `index` in the table.
+    fn build_disk_with_table(
+        first_lba: u64,
+        last_lba: u64,
+        entry_size: u32,
+        num_entries: u32,
+        index: usize,
+    ) -> MemDisk {
         let total = (last_lba as usize + 16) * 512;
         let mut d = vec![0u8; total];
         d[510] = 0x55;
         d[511] = 0xAA;
         d[512..520].copy_from_slice(b"EFI PART");
         d[512 + 72..512 + 80].copy_from_slice(&2u64.to_le_bytes()); // partLBA=2
-        d[512 + 80..512 + 84].copy_from_slice(&128u32.to_le_bytes()); // numParts
-        d[512 + 84..512 + 88].copy_from_slice(&128u32.to_le_bytes()); // partSize
-        let ent = 2 * 512;
+        d[512 + 80..512 + 84].copy_from_slice(&num_entries.to_le_bytes()); // numParts
+        d[512 + 84..512 + 88].copy_from_slice(&entry_size.to_le_bytes()); // partSize
+        let ent = 2 * 512 + index * entry_size as usize;
         d[ent..ent + 16].copy_from_slice(&apfs_type_bytes());
         d[ent + 32..ent + 40].copy_from_slice(&first_lba.to_le_bytes());
         d[ent + 40..ent + 48].copy_from_slice(&last_lba.to_le_bytes());
         let cont = first_lba as usize * 512;
         d[cont + 32..cont + 36].copy_from_slice(b"NXSB");
         MemDisk { data: d }
+    }
+
+    /// A header naming an entry size near `u32::MAX` must be refused up
+    /// front; sizing a buffer from it would ask for four gigabytes per entry.
+    #[test]
+    fn oversized_partition_entry_size_is_rejected() {
+        let mut disk = build_disk_with_table(40, 200, 0xFFFF_FF80, 1, 0);
+        let err = find_apfs_container(&mut disk, 512)
+            .expect_err("an entry size near u32::MAX must be refused");
+        assert!(
+            matches!(err, GptError::Malformed(m) if m.contains("entry size")),
+            "the error must name the entry size, got: {err:?}"
+        );
+    }
+
+    /// UEFI requires the entry size to be a power of two of at least 128.
+    #[test]
+    fn non_power_of_two_partition_entry_size_is_rejected() {
+        let mut disk = build_disk_with_table(40, 200, 192, 4, 0);
+        let err = find_apfs_container(&mut disk, 512)
+            .expect_err("an entry size that is not a power of two must be refused");
+        assert!(
+            matches!(err, GptError::Malformed(m) if m.contains("entry size")),
+            "got: {err:?}"
+        );
+    }
+
+    /// The table as a whole is bounded too: 65 536 entries of 512 bytes is a
+    /// 32 MiB table nothing writes.
+    #[test]
+    fn oversized_partition_table_is_rejected() {
+        let mut disk = build_disk_with_table(40, 200, 512, 65_536, 0);
+        let err = find_apfs_container(&mut disk, 512)
+            .expect_err("a 32 MiB partition table must be refused");
+        assert!(
+            matches!(err, GptError::Malformed(m) if m.contains("table")),
+            "got: {err:?}"
+        );
+    }
+
+    /// A legitimate table with 256-byte entries is still walked at the
+    /// right stride: the APFS entry at index 3 is found.
+    #[test]
+    fn larger_entry_size_keeps_the_entry_stride() {
+        let mut disk = build_disk_with_table(40, 200, 256, 8, 3);
+        let r = find_apfs_container(&mut disk, 512).expect("entry at index 3");
+        assert_eq!(r.offset, 40 * 512);
+        assert_eq!(r.length, (200 - 40 + 1) * 512);
+    }
+
+    /// A table that describes a partition running past the end of the medium
+    /// must be rejected, not turned into a range every access falls outside.
+    #[test]
+    fn partition_past_the_end_of_the_device_is_rejected() {
+        let mut disk = build_disk(40, 200);
+        // Keep the table, cut the disk short.
+        disk.data.truncate(100 * 512);
+        let err = find_apfs_container(&mut disk, 512)
+            .expect_err("a partition past the end must not be accepted");
+        assert!(
+            matches!(err, GptError::Malformed(m) if m.contains("past the end")),
+            "the error must say what is wrong, got: {err:?}"
+        );
     }
 
     #[test]

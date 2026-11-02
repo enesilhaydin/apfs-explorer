@@ -1,14 +1,18 @@
 //! omap_phys_t (object map) - parse + locate its B-tree root.
 //! Field offsets CONFIRMED (3 sources): ctx_search(source:"the APFS specification").
 use crate::block_device::BlockDevice;
-use crate::btree::BtreeNode;
+use crate::btree::{bad_level, BtreeNode};
 use crate::checksum::verify_block;
 use crate::container::ContainerError;
 use crate::endian::{u32_le, u64_le};
-use crate::obj::{ObjPhys, OBJECT_TYPE_BTREE, OBJECT_TYPE_OMAP};
+use crate::obj::{ObjPhys, OBJECT_TYPE_BTREE, OBJECT_TYPE_BTREE_NODE, OBJECT_TYPE_OMAP};
 
 /// omap_val_t flag: mapping is deleted (tombstone).
 pub const OMAP_VAL_DELETED: u32 = 0x0000_0001;
+/// omap_val_t flag: the object has no header (no checksum, oid, xid or
+/// type). A sealed volume's catalog nodes are mapped this way; their
+/// integrity is the seal's hash tree, not a Fletcher checksum.
+pub const OMAP_VAL_NOHEADER: u32 = 0x0000_0008;
 
 // OBJECT_TYPE_OMAP (0x0000_000b) is imported from obj.rs - already defined there from M1a.
 
@@ -19,7 +23,25 @@ pub struct OmapPhys {
     pub snap_count: u32,
     pub tree_type: u32,
     pub tree_oid: u64, // offset 48 (CONFIRMED: the APFS specification/Apple p44 + + impls)
+    /// The snapshot tree's type (offset 44) and root (offset 56); 0 without one.
+    pub snapshot_tree_type: u32,
+    pub snapshot_tree_oid: u64,
+    /// The newest snapshot's transaction (offset 64).
+    pub most_recent_snap: u64,
+    /// A revert that did not finish: mappings written between these two
+    /// transactions (inclusive, offsets 72 and 80) are being undone and must
+    /// not resolve. Both zero when no revert is pending.
+    pub pending_revert_min: u64,
+    pub pending_revert_max: u64,
 }
+
+/// Every flag an object map may carry: manually managed, encrypting,
+/// decrypting, key rolling, crypto generation.
+const OMAP_VALID_FLAGS: u32 = 0x1F;
+/// Storage bit of an object type: the object lives at its own block address.
+const OBJ_STORAGE_PHYSICAL: u32 = 0x4000_0000;
+/// The tree type an object map's trees carry: a B-tree stored physically.
+const OMAP_TREE_TYPE: u32 = OBJECT_TYPE_BTREE | OBJ_STORAGE_PHYSICAL;
 
 impl OmapPhys {
     pub fn parse(block: &[u8]) -> Result<Self, ContainerError> {
@@ -31,13 +53,51 @@ impl OmapPhys {
                 found: obj.object_type(),
             }));
         }
+        let flags = u32_le(block, 32)?;
+        if flags & !OMAP_VALID_FLAGS != 0 {
+            return Err(ContainerError::Parse(crate::endian::ParseError::BadMagic {
+                expected: OMAP_VALID_FLAGS,
+                found: flags,
+            }));
+        }
+        // The map's tree is a physical B-tree (measured on a macOS-formatted
+        // image: 0x40000002 for both trees); anything else is not a tree the
+        // resolver knows how to descend.
+        let tree_type = u32_le(block, 40)?;
+        if tree_type != OMAP_TREE_TYPE {
+            return Err(ContainerError::Parse(crate::endian::ParseError::BadMagic {
+                expected: OMAP_TREE_TYPE,
+                found: tree_type,
+            }));
+        }
+        let pending_revert_min = u64_le(block, 72)?;
+        let pending_revert_max = u64_le(block, 80)?;
+        if pending_revert_min > pending_revert_max {
+            return Err(ContainerError::Parse(crate::endian::ParseError::BadMagic {
+                expected: pending_revert_max as u32,
+                found: pending_revert_min as u32,
+            }));
+        }
         Ok(Self {
             obj,
-            flags: u32_le(block, 32)?,
+            flags,
             snap_count: u32_le(block, 36)?,
-            tree_type: u32_le(block, 40)?,
+            tree_type,
             tree_oid: u64_le(block, 48)?,
+            snapshot_tree_type: u32_le(block, 44)?,
+            snapshot_tree_oid: u64_le(block, 56)?,
+            most_recent_snap: u64_le(block, 64)?,
+            pending_revert_min,
+            pending_revert_max,
         })
+    }
+
+    /// Whether a mapping written under `xid` belongs to a revert that did
+    /// not finish, and so must not resolve.
+    pub fn is_being_reverted(&self, xid: u64) -> bool {
+        self.pending_revert_max != 0
+            && xid >= self.pending_revert_min
+            && xid <= self.pending_revert_max
     }
 }
 
@@ -77,6 +137,14 @@ impl Omap {
                 found: root.obj.object_type(),
             }));
         }
+        // The subtype names the tree a node belongs to; the root of an
+        // object map carries the object-map subtype like every node below it.
+        if root.obj.subtype != OBJECT_TYPE_OMAP {
+            return Err(ContainerError::Parse(crate::endian::ParseError::BadMagic {
+                expected: OBJECT_TYPE_OMAP,
+                found: root.obj.subtype,
+            }));
+        }
         Ok(Self { phys, root })
     }
 
@@ -97,6 +165,21 @@ impl Omap {
         xid: u64,
         block_size: u32,
     ) -> Result<Option<u64>, ContainerError> {
+        Ok(self
+            .resolve_with_flags(dev, oid, xid, block_size)?
+            .map(|(paddr, _)| paddr))
+    }
+
+    /// [`Omap::resolve`], also returning the mapping's `ov_flags`: a caller
+    /// reading the object needs [`OMAP_VAL_NOHEADER`] to know whether the
+    /// block starts with an object header to verify.
+    pub fn resolve_with_flags<D: BlockDevice>(
+        &self,
+        dev: &mut D,
+        oid: u64,
+        xid: u64,
+        block_size: u32,
+    ) -> Result<Option<(u64, u32)>, ContainerError> {
         let bsz = block_size as usize;
         let mut node = self.root.clone();
 
@@ -104,6 +187,11 @@ impl Omap {
         // Cap at 32 to handle corrupt data gracefully - no panic, just None.
         for _ in 0..32 {
             let is_leaf = node.is_leaf();
+            // The leaf flag and a level of zero say the same thing; a node
+            // where they disagree is corrupt, not a node to read either way.
+            if is_leaf != (node.level == 0) {
+                return Err(bad_level(node.level).into());
+            }
             // FIXED_KV: key=omap_key(16B). Non-leaf val=oid_t(8B); leaf val=omap_val(16B).
             let vsz: usize = if is_leaf { 16 } else { 8 };
 
@@ -125,8 +213,9 @@ impl Omap {
 
                 if is_leaf {
                     // Leaf: match only entries with ok_oid == oid and ok_xid <= xid;
-                    // keep the one with the largest ok_xid seen so far.
-                    if k_oid == oid && k_xid <= xid {
+                    // keep the one with the largest ok_xid seen so far. A
+                    // mapping a pending revert is undoing is not a candidate.
+                    if k_oid == oid && k_xid <= xid && !self.phys.is_being_reverted(k_xid) {
                         match best {
                             Some((_, bx, _)) if bx >= k_xid => {}
                             _ => best = Some((k_oid, k_xid, i)),
@@ -159,13 +248,24 @@ impl Omap {
                 if flags & OMAP_VAL_DELETED != 0 {
                     return Ok(None);
                 }
+                // Every object reached through an object map here is one
+                // block (B-tree nodes, volume superblocks); a mapping that
+                // says otherwise would be read one block short in silence.
+                let size =
+                    u32::from_le_bytes(v.get(4..8).ok_or_else(oor)?.try_into().map_err(|_| oor())?);
+                if size != block_size {
+                    return Err(ContainerError::Parse(crate::endian::ParseError::BadMagic {
+                        expected: block_size,
+                        found: size,
+                    }));
+                }
                 let paddr = i64::from_le_bytes(
                     v.get(8..16)
                         .ok_or_else(oor)?
                         .try_into()
                         .map_err(|_| oor())?,
                 );
-                return Ok(Some(paddr as u64));
+                return Ok(Some((paddr as u64, flags)));
             }
 
             // Non-leaf: child is a physical block address (BTREE_PHYSICAL).
@@ -176,12 +276,128 @@ impl Omap {
                 child.checked_mul(block_size as u64).ok_or_else(oor)?,
                 &mut buf,
             )?;
-            node = BtreeNode::parse(&buf)?;
+            let child_node = BtreeNode::parse(&buf)?;
+            // A child pointer lands on a B-tree node of this object map one
+            // level down. Anything else is a pointer into unrelated data,
+            // however plausible its bytes look as a node; apfsprogs checks
+            // the same three things (type, subtype, level) on every node.
+            if child_node.obj.object_type() != OBJECT_TYPE_BTREE_NODE {
+                return Err(ContainerError::Parse(crate::endian::ParseError::BadMagic {
+                    expected: OBJECT_TYPE_BTREE_NODE,
+                    found: child_node.obj.object_type(),
+                }));
+            }
+            if child_node.obj.subtype != OBJECT_TYPE_OMAP {
+                return Err(ContainerError::Parse(crate::endian::ParseError::BadMagic {
+                    expected: OBJECT_TYPE_OMAP,
+                    found: child_node.obj.subtype,
+                }));
+            }
+            if child_node.level.checked_add(1) != Some(node.level) {
+                return Err(bad_level(child_node.level).into());
+            }
+            node = child_node;
         }
 
         // Exceeded descent bound - corrupt tree, return None gracefully.
         Ok(None)
     }
+
+    /// Every mapping of the tree, leaf by leaf, as
+    /// `(oid, xid, flags, size, paddr)` in key order. Tombstones are included
+    /// with their flag set; the caller decides what a mapping means.
+    pub fn entries<D: BlockDevice>(
+        &self,
+        dev: &mut D,
+        block_size: u32,
+    ) -> Result<Vec<OmapEntry>, ContainerError> {
+        let mut out = Vec::new();
+        let mut stack: Vec<(BtreeNode, u32)> = vec![(self.root.clone(), 0)];
+        while let Some((node, depth)) = stack.pop() {
+            if depth > OMAP_MAX_DEPTH {
+                return Err(bad_level(node.level).into());
+            }
+            let is_leaf = node.is_leaf();
+            if is_leaf != (node.level == 0) {
+                return Err(bad_level(node.level).into());
+            }
+            let vsz: usize = if is_leaf { 16 } else { 8 };
+            // Children are pushed last-first so they are visited in key order.
+            let mut children = Vec::new();
+            for i in 0..node.nkeys {
+                let (k, v) = node.fixed_kv(i, 16, vsz)?;
+                let oid =
+                    u64::from_le_bytes(k.get(0..8).ok_or_else(oor)?.try_into().map_err(|_| oor())?);
+                let xid = u64::from_le_bytes(
+                    k.get(8..16)
+                        .ok_or_else(oor)?
+                        .try_into()
+                        .map_err(|_| oor())?,
+                );
+                if is_leaf {
+                    let flags = u32::from_le_bytes(
+                        v.get(0..4).ok_or_else(oor)?.try_into().map_err(|_| oor())?,
+                    );
+                    let size = u32::from_le_bytes(
+                        v.get(4..8).ok_or_else(oor)?.try_into().map_err(|_| oor())?,
+                    );
+                    let paddr = u64::from_le_bytes(
+                        v.get(8..16)
+                            .ok_or_else(oor)?
+                            .try_into()
+                            .map_err(|_| oor())?,
+                    );
+                    out.push(OmapEntry {
+                        oid,
+                        xid,
+                        flags,
+                        size,
+                        paddr,
+                    });
+                } else {
+                    children.push(u64::from_le_bytes(
+                        v.get(0..8).ok_or_else(oor)?.try_into().map_err(|_| oor())?,
+                    ));
+                }
+            }
+            for child in children.into_iter().rev() {
+                let mut buf = vec![0u8; block_size as usize];
+                dev.read_at(
+                    child.checked_mul(block_size as u64).ok_or_else(oor)?,
+                    &mut buf,
+                )?;
+                let child_node = BtreeNode::parse(&buf)?;
+                if child_node.obj.object_type() != OBJECT_TYPE_BTREE_NODE
+                    || child_node.obj.subtype != OBJECT_TYPE_OMAP
+                {
+                    return Err(ContainerError::Parse(crate::endian::ParseError::BadMagic {
+                        expected: OBJECT_TYPE_BTREE_NODE,
+                        found: child_node.obj.object_type(),
+                    }));
+                }
+                if child_node.level.checked_add(1) != Some(node.level) {
+                    return Err(bad_level(child_node.level).into());
+                }
+                stack.push((child_node, depth + 1));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Deepest object-map tree walked; real trees are a few levels.
+const OMAP_MAX_DEPTH: u32 = 32;
+
+/// One mapping of an object map as stored: the object's id and the
+/// transaction it was written under, the value's flags and size, and the
+/// block the version lives at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OmapEntry {
+    pub oid: u64,
+    pub xid: u64,
+    pub flags: u32,
+    pub size: u32,
+    pub paddr: u64,
 }
 
 fn oor() -> ContainerError {
@@ -245,7 +461,9 @@ mod parse_tests {
         b[8..16].copy_from_slice(&1u64.to_le_bytes()); // oid
         b[16..24].copy_from_slice(&1u64.to_le_bytes()); // xid
         b[24..28].copy_from_slice(&OBJECT_TYPE_OMAP.to_le_bytes()); // o_type
-                                                                    // flags=0, snap_count=0, tree_type=0 already zero
+                                                                    // flags=0, snap_count=0; the trees are physical B-trees (measured).
+        b[40..44].copy_from_slice(&OMAP_TREE_TYPE.to_le_bytes());
+        b[44..48].copy_from_slice(&OMAP_TREE_TYPE.to_le_bytes());
         b[48..56].copy_from_slice(&tree_oid.to_le_bytes()); // tree_oid at off 48
         let ck = fletcher64(&b);
         b[0..8].copy_from_slice(&ck.to_le_bytes());
@@ -257,12 +475,110 @@ mod parse_tests {
         b[8..16].copy_from_slice(&2u64.to_le_bytes()); // oid
         b[16..24].copy_from_slice(&1u64.to_le_bytes()); // xid
         b[24..28].copy_from_slice(&OBJECT_TYPE_BTREE.to_le_bytes());
+        b[28..32].copy_from_slice(&OBJECT_TYPE_OMAP.to_le_bytes()); // o_subtype
         let flags = BTNODE_LEAF | BTNODE_FIXED_KV_SIZE | BTNODE_ROOT;
         b[32..34].copy_from_slice(&flags.to_le_bytes());
         // nkeys=0
         let ck = fletcher64(&b);
         b[0..8].copy_from_slice(&ck.to_le_bytes());
         b
+    }
+
+    /// A root leaf holding `records` as `(oid, xid, size, paddr)`, laid out
+    /// the way macOS lays one out (a 448-byte table, keys packed after it,
+    /// values packed up from the tree description).
+    fn make_btree_leaf(records: &[(u64, u64, u32, u64)]) -> Vec<u8> {
+        let bsz = 4096usize;
+        let mut b = vec![0u8; bsz];
+        b[8..16].copy_from_slice(&2u64.to_le_bytes());
+        b[16..24].copy_from_slice(&1u64.to_le_bytes());
+        b[24..28].copy_from_slice(&OBJECT_TYPE_BTREE.to_le_bytes());
+        b[28..32].copy_from_slice(&OBJECT_TYPE_OMAP.to_le_bytes());
+        let flags = BTNODE_LEAF | BTNODE_FIXED_KV_SIZE | BTNODE_ROOT;
+        b[32..34].copy_from_slice(&flags.to_le_bytes());
+        b[36..40].copy_from_slice(&(records.len() as u32).to_le_bytes());
+        b[42..44].copy_from_slice(&448u16.to_le_bytes());
+        let key_area = 56 + 448;
+        let val_end = bsz - 40;
+        for (i, &(oid, xid, size, paddr)) in records.iter().enumerate() {
+            let toc = 56 + i * 4;
+            b[toc..toc + 2].copy_from_slice(&((i * 16) as u16).to_le_bytes());
+            b[toc + 2..toc + 4].copy_from_slice(&(((i + 1) * 16) as u16).to_le_bytes());
+            let k = key_area + i * 16;
+            b[k..k + 8].copy_from_slice(&oid.to_le_bytes());
+            b[k + 8..k + 16].copy_from_slice(&xid.to_le_bytes());
+            let v = val_end - (i + 1) * 16;
+            b[v + 4..v + 8].copy_from_slice(&size.to_le_bytes());
+            b[v + 8..v + 16].copy_from_slice(&paddr.to_le_bytes());
+        }
+        b[val_end + 8..val_end + 12].copy_from_slice(&16u32.to_le_bytes());
+        b[val_end + 12..val_end + 16].copy_from_slice(&16u32.to_le_bytes());
+        b[val_end + 24..val_end + 32].copy_from_slice(&(records.len() as u64).to_le_bytes());
+        b[val_end + 32..val_end + 40].copy_from_slice(&1u64.to_le_bytes());
+        let ck = fletcher64(&b);
+        b[0..8].copy_from_slice(&ck.to_le_bytes());
+        b
+    }
+
+    /// `make_omap_block` with the given flags, tree type and pending revert
+    /// window.
+    fn make_omap_block_with(
+        tree_oid: u64,
+        flags: u32,
+        tree_type: u32,
+        revert: (u64, u64),
+    ) -> Vec<u8> {
+        let mut b = make_omap_block(tree_oid);
+        b[32..36].copy_from_slice(&flags.to_le_bytes());
+        b[40..44].copy_from_slice(&tree_type.to_le_bytes());
+        b[72..80].copy_from_slice(&revert.0.to_le_bytes());
+        b[80..88].copy_from_slice(&revert.1.to_le_bytes());
+        let ck = fletcher64(&b);
+        b[0..8].copy_from_slice(&ck.to_le_bytes());
+        b
+    }
+
+    // A flag the format does not define, or a tree that is not a physical
+    // B-tree, is not an object map this resolver can read.
+    #[test]
+    fn omap_phys_parse_rejects_unknown_flags_and_tree_types() {
+        assert!(OmapPhys::parse(&make_omap_block_with(2, 0x1, OMAP_TREE_TYPE, (0, 0))).is_ok());
+        assert!(OmapPhys::parse(&make_omap_block_with(2, 0x20, OMAP_TREE_TYPE, (0, 0))).is_err());
+        assert!(OmapPhys::parse(&make_omap_block_with(2, 0x1, OBJECT_TYPE_BTREE, (0, 0))).is_err());
+        assert!(OmapPhys::parse(&make_omap_block_with(2, 0x1, 0x4000_0003, (0, 0))).is_err());
+        assert!(OmapPhys::parse(&make_omap_block_with(2, 0x1, OMAP_TREE_TYPE, (9, 5))).is_err());
+    }
+
+    // A mapping written inside a pending revert's window is not a candidate:
+    // the version before the window resolves instead.
+    #[test]
+    fn resolve_skips_the_versions_a_pending_revert_is_undoing() {
+        let leaf = make_btree_leaf(&[(100, 3, 4096, 700), (100, 6, 4096, 800)]);
+        let mut dev = MemDev::new(4096);
+        dev.insert(2, leaf);
+        dev.insert(1, make_omap_block_with(2, 0x1, OMAP_TREE_TYPE, (0, 0)));
+        let omap = Omap::open(&mut dev, 1, 4096).unwrap();
+        assert_eq!(omap.resolve(&mut dev, 100, 9, 4096).unwrap(), Some(800));
+
+        dev.insert(1, make_omap_block_with(2, 0x1, OMAP_TREE_TYPE, (5, 7)));
+        let omap = Omap::open(&mut dev, 1, 4096).unwrap();
+        assert_eq!(omap.resolve(&mut dev, 100, 9, 4096).unwrap(), Some(700));
+        assert_eq!(omap.resolve(&mut dev, 100, 2, 4096).unwrap(), None);
+    }
+
+    // A mapping to an object of more than one block would be read one block
+    // short; it is an error rather than a silent truncation.
+    #[test]
+    fn resolve_refuses_a_mapping_of_more_than_one_block() {
+        let leaf = make_btree_leaf(&[(100, 3, 8192, 700)]);
+        let mut dev = MemDev::new(4096);
+        dev.insert(2, leaf);
+        dev.insert(1, make_omap_block(2));
+        let omap = Omap::open(&mut dev, 1, 4096).unwrap();
+        assert!(omap.resolve(&mut dev, 100, 9, 4096).is_err());
+        let entries = omap.entries(&mut dev, 4096).unwrap();
+        assert_eq!(entries.len(), 1, "the walk reports the mapping as stored");
+        assert_eq!(entries[0].size, 8192);
     }
 
     #[test]
@@ -348,6 +664,7 @@ mod parse_tests {
         let flags = BTNODE_LEAF | BTNODE_FIXED_KV_SIZE | BTNODE_ROOT;
         b[32..34].copy_from_slice(&flags.to_le_bytes());
         b[36..40].copy_from_slice(&1u32.to_le_bytes()); // nkeys=1
+        b[42..44].copy_from_slice(&4u16.to_le_bytes()); // toc_len=4 (one kvoff_t)
                                                         // toc at DATA_BASE: kvoff_t { k_off=0, v_off=16 }
         b[DATA_BASE..DATA_BASE + 2].copy_from_slice(&0u16.to_le_bytes());
         b[DATA_BASE + 2..DATA_BASE + 4].copy_from_slice(&16u16.to_le_bytes());
@@ -373,8 +690,13 @@ mod parse_tests {
                 },
                 flags: 0,
                 snap_count: 0,
-                tree_type: 0,
+                tree_type: OMAP_TREE_TYPE,
                 tree_oid: 1,
+                snapshot_tree_type: 0,
+                snapshot_tree_oid: 0,
+                most_recent_snap: 0,
+                pending_revert_min: 0,
+                pending_revert_max: 0,
             },
             root,
         };
@@ -402,8 +724,13 @@ mod parse_tests {
                 },
                 flags: 0,
                 snap_count: 0,
-                tree_type: 0,
+                tree_type: OMAP_TREE_TYPE,
                 tree_oid: 1,
+                snapshot_tree_type: 0,
+                snapshot_tree_oid: 0,
+                most_recent_snap: 0,
+                pending_revert_min: 0,
+                pending_revert_max: 0,
             },
             root,
         };
@@ -635,15 +962,17 @@ mod resolve_tests {
     }
 
     /// Build a FIXED_KV LEAF node (level=0, flags=LEAF|FIXED_KV, NOT root)
-    /// with the given (key16, val16) pairs.
+    /// with the given (key16, val16) pairs. A non-root node of the object
+    /// map carries `OBJECT_TYPE_BTREE_NODE` with the omap subtype.
     fn make_leaf_node(oid: u64, entries: &[([u8; 16], [u8; 16])]) -> [u8; BSZ] {
         let n = entries.len();
         let mut b = [0u8; BSZ];
         // obj header
         w64(&mut b, 8, oid); // oid
         w64(&mut b, 16, 1u64); // xid
-        w32(&mut b, 24, OBJECT_TYPE_BTREE); // o_type
-                                            // btn header
+        w32(&mut b, 24, OBJECT_TYPE_BTREE_NODE); // o_type
+        w32(&mut b, 28, OBJECT_TYPE_OMAP); // o_subtype
+                                           // btn header
         w16(&mut b, 32, BTNODE_LEAF | BTNODE_FIXED_KV_SIZE); // flags: LEAF | FIXED_KV
         w16(&mut b, 34, 0u16); // level = 0
         w32(&mut b, 36, n as u32); // nkeys
@@ -692,7 +1021,8 @@ mod resolve_tests {
         w64(&mut b, 8, oid);
         w64(&mut b, 16, 1u64); // xid
         w32(&mut b, 24, OBJECT_TYPE_BTREE);
-        // btn header - ROOT | FIXED_KV (NOT LEAF, level=1)
+        w32(&mut b, 28, OBJECT_TYPE_OMAP); // o_subtype
+                                           // btn header - ROOT | FIXED_KV (NOT LEAF, level=1)
         w16(&mut b, 32, BTNODE_ROOT | BTNODE_FIXED_KV_SIZE);
         w16(&mut b, 34, 1u16); // level = 1
         w32(&mut b, 36, n as u32); // nkeys
@@ -724,6 +1054,126 @@ mod resolve_tests {
         let c = fletcher64(&b);
         b[0..8].copy_from_slice(&c.to_le_bytes());
         b
+    }
+
+    /// An object map over `root` whose `phys` is not consulted by `resolve`.
+    fn omap_over(root: &[u8; BSZ]) -> Omap {
+        Omap {
+            phys: OmapPhys {
+                obj: ObjPhys {
+                    cksum: 0,
+                    oid: 0,
+                    xid: 0,
+                    o_type: OBJECT_TYPE_OMAP,
+                    subtype: 0,
+                },
+                flags: 0,
+                snap_count: 0,
+                tree_type: OMAP_TREE_TYPE,
+                tree_oid: 1,
+                snapshot_tree_type: 0,
+                snapshot_tree_oid: 0,
+                most_recent_snap: 0,
+                pending_revert_min: 0,
+                pending_revert_max: 0,
+            },
+            root: BtreeNode::parse(root).expect("root parses"),
+        }
+    }
+
+    /// Reseal a hand-patched block.
+    fn reseal(b: &mut [u8]) {
+        let c = fletcher64(b);
+        b[0..8].copy_from_slice(&c.to_le_bytes());
+    }
+
+    /// A child pointer of an object-map node has to land on a B-tree node
+    /// of the object map: a block of another object type is followed by
+    /// nothing, whatever key bytes it happens to hold.
+    #[test]
+    fn resolve_rejects_a_child_that_is_not_a_btree_node() {
+        let root = make_index_root(1, &[(omap_key_bytes(10, 1), 2)]);
+        let mut leaf = make_leaf_node(2, &[(omap_key_bytes(10, 5), omap_val_bytes(0xAAAA))]);
+        w32(&mut leaf, 24, OBJECT_TYPE_OMAP); // an omap header, not a node
+        reseal(&mut leaf);
+        let mut dev = MemDev::new(BSZ);
+        dev.insert(2, leaf.to_vec());
+        let err = omap_over(&root)
+            .resolve(&mut dev, 10, 9, BSZ as u32)
+            .expect_err("a child of the wrong object type must be refused");
+        assert!(
+            matches!(
+                err,
+                ContainerError::Parse(crate::endian::ParseError::BadMagic {
+                    expected: OBJECT_TYPE_BTREE_NODE,
+                    ..
+                })
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    /// The subtype says which tree a node belongs to; a node of another tree
+    /// (a catalog node, say) is not an object-map child.
+    #[test]
+    fn resolve_rejects_a_child_of_another_tree() {
+        let root = make_index_root(1, &[(omap_key_bytes(10, 1), 2)]);
+        let mut leaf = make_leaf_node(2, &[(omap_key_bytes(10, 5), omap_val_bytes(0xAAAA))]);
+        w32(&mut leaf, 28, 0x0e); // OBJECT_TYPE_FSTREE
+        reseal(&mut leaf);
+        let mut dev = MemDev::new(BSZ);
+        dev.insert(2, leaf.to_vec());
+        assert!(
+            omap_over(&root)
+                .resolve(&mut dev, 10, 9, BSZ as u32)
+                .is_err(),
+            "a child with another tree's subtype must be refused"
+        );
+    }
+
+    /// A child sits exactly one level below its parent; a leaf directly
+    /// under a level-2 node means the pointers do not describe one tree.
+    #[test]
+    fn resolve_rejects_a_child_not_one_level_below_its_parent() {
+        let mut root = make_index_root(1, &[(omap_key_bytes(10, 1), 2)]);
+        w16(&mut root, 34, 2); // level 2, child is level 0
+        reseal(&mut root);
+        let leaf = make_leaf_node(2, &[(omap_key_bytes(10, 5), omap_val_bytes(0xAAAA))]);
+        let mut dev = MemDev::new(BSZ);
+        dev.insert(2, leaf.to_vec());
+        let err = omap_over(&root)
+            .resolve(&mut dev, 10, 9, BSZ as u32)
+            .expect_err("a mis-levelled child must be refused");
+        assert!(
+            matches!(
+                err,
+                ContainerError::Parse(crate::endian::ParseError::BadField {
+                    field: "btn_level",
+                    value: 0
+                })
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    /// The leaf flag and a level of zero say the same thing; a node where
+    /// they disagree is corrupt, not a node to interpret one way or the other.
+    #[test]
+    fn resolve_rejects_a_leaf_flag_that_disagrees_with_the_level() {
+        let mut root = make_index_root(1, &[(omap_key_bytes(10, 1), 2)]);
+        w16(
+            &mut root,
+            32,
+            BTNODE_ROOT | BTNODE_LEAF | BTNODE_FIXED_KV_SIZE,
+        ); // leaf flag, level 1
+        reseal(&mut root);
+        let mut dev = MemDev::new(BSZ);
+        assert!(
+            omap_over(&root)
+                .resolve(&mut dev, 10, 9, BSZ as u32)
+                .is_err(),
+            "a leaf flag on a level-1 node must be refused"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -789,8 +1239,13 @@ mod resolve_tests {
                 },
                 flags: 0,
                 snap_count: 0,
-                tree_type: 0,
+                tree_type: OMAP_TREE_TYPE,
                 tree_oid: 1,
+                snapshot_tree_type: 0,
+                snapshot_tree_oid: 0,
+                most_recent_snap: 0,
+                pending_revert_min: 0,
+                pending_revert_max: 0,
             },
             root: root_node,
         };
@@ -848,8 +1303,13 @@ mod resolve_tests {
                 },
                 flags: 0,
                 snap_count: 0,
-                tree_type: 0,
+                tree_type: OMAP_TREE_TYPE,
                 tree_oid: 1,
+                snapshot_tree_type: 0,
+                snapshot_tree_oid: 0,
+                most_recent_snap: 0,
+                pending_revert_min: 0,
+                pending_revert_max: 0,
             },
             root: root_node,
         };
@@ -909,8 +1369,13 @@ mod resolve_tests {
                 },
                 flags: 0,
                 snap_count: 0,
-                tree_type: 0,
+                tree_type: OMAP_TREE_TYPE,
                 tree_oid: 1,
+                snapshot_tree_type: 0,
+                snapshot_tree_oid: 0,
+                most_recent_snap: 0,
+                pending_revert_min: 0,
+                pending_revert_max: 0,
             },
             root: root_node,
         };
@@ -957,8 +1422,13 @@ mod resolve_tests {
                 },
                 flags: 0,
                 snap_count: 0,
-                tree_type: 0,
+                tree_type: OMAP_TREE_TYPE,
                 tree_oid: 1,
+                snapshot_tree_type: 0,
+                snapshot_tree_oid: 0,
+                most_recent_snap: 0,
+                pending_revert_min: 0,
+                pending_revert_max: 0,
             },
             root: root_node,
         };

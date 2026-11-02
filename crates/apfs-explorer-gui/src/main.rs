@@ -1,10 +1,10 @@
 //! APFS Explorer - Tauri 2 single-EXE GUI.
 //!
-//! Replaces the previous LocalSystem service + tray architecture.  The GUI
-//! runs as the interactive user (no UAC at launch); on Mount click it
-//! spawns `apfs-mount.exe` elevated via `ShellExecuteEx("runas")` so the
-//! drive letter is created in the user's own session and Explorer sees it.
-//! Unmount signals the elevated child via a named Win32 event.
+//! Replaces the previous LocalSystem service + tray architecture. The app
+//! asks for elevation once when it opens (app.manifest): mounts are started
+//! and stopped through the WinFsp launcher (see `mount`), whose apfs-mount
+//! classes only Administrators may use. The launcher creates the drive
+//! letter globally, so the normal, non-elevated Explorer sees it.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -16,18 +16,28 @@ mod logging;
 mod mount;
 
 fn main() {
-    logging::init();
-    tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
-        "apfs-explorer GUI starting"
-    );
+    let log_dir = logging::init();
 
-    let builder = tauri::Builder::default().invoke_handler(tauri::generate_handler![
-        commands::list_drives,
-        commands::mount_drive,
-        commands::unmount_drive,
-        commands::open_drive_letter,
-    ]);
+    let builder = tauri::Builder::default()
+        .setup(move |app| {
+            tracing::info!(
+                version = %app.package_info().version,
+                build = env!("APFS_BUILD_ID"),
+                log_dir = %log_dir.as_ref().map_or_else(
+                    |e| format!("none: {e}"),
+                    |d| d.display().to_string()
+                ),
+                "apfs-explorer GUI starting"
+            );
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::list_drives,
+            commands::mount_drive,
+            commands::unmount_drive,
+            commands::open_drive_letter,
+            commands::app_version,
+        ]);
 
     if let Err(e) = builder.run(tauri::generate_context!()) {
         tracing::error!("tauri::run failed: {e}");

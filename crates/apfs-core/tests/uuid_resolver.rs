@@ -136,10 +136,10 @@ fn volume_role_from_raw_all_known_values() {
         (0x0020, Installer),
         (0x0040, Data),
         (0x0080, Baseband),
-        (0x0100, Update),
-        (0x0200, Xart),
-        (0x0400, Hardware),
-        (0x0800, Backup),
+        (0x00C0, Update),
+        (0x0100, Xart),
+        (0x0140, Hardware),
+        (0x0180, Backup),
         (0x9999, Other(0x9999)),
     ];
     for &(raw, expected) in table {

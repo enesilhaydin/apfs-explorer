@@ -53,7 +53,10 @@ pub async fn mount_drive(drive: u32, writable: bool) -> Result<String, String> {
     }
     #[cfg(windows)]
     {
-        crate::mount::mount(drive, writable).map_err(|e| e.to_string())
+        crate::mount::mount(drive, writable).map_err(|e| {
+            tracing::error!(drive, writable, "mount failed: {e}");
+            e.to_string()
+        })
     }
     #[cfg(not(windows))]
     {
@@ -66,13 +69,29 @@ pub async fn mount_drive(drive: u32, writable: bool) -> Result<String, String> {
 pub async fn unmount_drive(drive: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
-        crate::mount::unmount(drive).map_err(|e| e.to_string())
+        crate::mount::unmount(drive)
+            .map(|()| tracing::info!(drive, "unmounted"))
+            .map_err(|e| {
+                tracing::error!(drive, "unmount failed: {e}");
+                e.to_string()
+            })
     }
     #[cfg(not(windows))]
     {
         let _ = drive;
         Err("unmount is only supported on Windows".into())
     }
+}
+
+/// `APFS Explorer <version> (<commit>, built <date>)`, shown in the window
+/// so a report can say which build it came from.
+#[tauri::command]
+pub fn app_version(app: tauri::AppHandle) -> String {
+    format!(
+        "APFS Explorer {} ({})",
+        app.package_info().version,
+        env!("APFS_BUILD_ID")
+    )
 }
 
 /// Open `<letter>:\` in Explorer.  Used by the "Open" button.

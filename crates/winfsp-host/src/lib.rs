@@ -6,12 +6,15 @@
 //! winfsp callbacks.
 
 pub mod align;
-pub mod batch;
 pub mod cache;
 pub mod drive;
-pub mod gpt;
+pub use apfs_core::gpt;
+pub mod group;
 pub mod image_mount;
+pub mod logfile;
 pub mod offset_dev;
+pub mod ops;
+pub mod stats;
 pub mod subcmd;
 
 #[cfg(windows)]

@@ -22,6 +22,17 @@ validation, and fuzzing.
 - **(b) Real hardware:** the user's **real APFS USB drive**, on a Windows machine
   accessible via SSH. On every M4+ release: mount a real Mac disk, compare contents
   against a known reference. This is the **release gate**.
+- **(c) Real hardware under macOS:** `crates/apfs-write/tests/real_usb.rs` writes to
+  the raw node of a removable USB drive's APFS partition (`APFS_USB_DEV=/dev/rdiskNsM`,
+  volume named `APFSUSB`; everything on it is overwritten, and the node must be
+  writable by the user running the test). macOS writes a tree, the writer adds and
+  edits files, macOS reads every file back and writes more, the reader reads that,
+  with fsck (through `diskutil verifyVolume`) between every step. The commit barrier
+  uses `DKIOCSYNCHRONIZE`: `F_FULLFSYNC` fails on device nodes.
+- **(d) macOS after the writer:** `crates/apfs-write/tests/macos_after_us.rs` lets
+  macOS remove what the writer wrote and runs fsck again. A volume can pass fsck
+  right after our commit and still be left in a state macOS mishandles (counters it
+  adjusts, node layouts it edits).
 
 ## Differential oracle (guards against silent corruption)
 

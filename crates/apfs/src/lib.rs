@@ -3,7 +3,7 @@
 //! OS-agnostic layer a mount host (winfsp-host / FUSE) delegates to.
 use std::collections::HashMap;
 
-pub mod case_fold;
+pub use apfs_core::case_fold;
 
 use apfs_core::block_device::BlockDevice;
 use apfs_core::catalog::{Catalog, DirEntry, InodeStat};
@@ -24,7 +24,8 @@ pub enum VolumeSelector {
     /// the first non-system volume (skips Preboot/Recovery/VM/Installer/Baseband).
     #[default]
     Default,
-    /// 0-based index into the container's `fs_oids` array (raw, unfiltered).
+    /// 0-based slot in the container's `nx_fs_oid` array (raw, unfiltered:
+    /// a volume after a deleted one keeps its slot).
     Index(usize),
     /// First volume whose raw `apfs_role` bitfield equals this value.
     Role(u16),
@@ -41,12 +42,27 @@ pub enum FsError {
     Block(apfs_core::block_device::BlockError),
     #[error("no user volume in container")]
     NoVolume,
+    /// The selected volume's file data is encrypted (FileVault). Encryption is
+    /// a non-goal; refusing here is what keeps callers from receiving
+    /// ciphertext that looks like a successful read.
+    #[error("volume {name:?} is encrypted (FileVault); encrypted volumes are not supported")]
+    Encrypted { name: String, role: u16 },
+    /// The path names nothing in the volume.
+    #[error("no such path: {0}")]
+    NotFound(String),
 }
 
 impl From<ContainerError> for FsError {
     fn from(e: ContainerError) -> Self {
         FsError::Container(e)
     }
+}
+
+/// The two attributes that hold a compressed file's content. macOS hides
+/// both from every caller but its own decompressor while the file is
+/// compressed.
+fn is_compressed_storage(name: &str) -> bool {
+    name == "com.apple.decmpfs" || name == "com.apple.ResourceFork"
 }
 
 impl From<apfs_core::block_device::BlockError> for FsError {
@@ -61,6 +77,9 @@ pub struct Attr {
     pub inode: u64,
     pub size: u64,
     pub is_dir: bool,
+    /// The u32 APFS keeps at inode offset 56: a directory's child count, or a
+    /// file's hard-link count. A host filesystem reports the latter as nlink.
+    pub nchildren_or_nlink: u32,
     /// POSIX mode (S_IFREG | rwx). Lets WinFsp / FUSE callers map the
     /// write-permission bits to FILE_ATTRIBUTE_READONLY without an extra
     /// catalog read.
@@ -81,12 +100,21 @@ pub struct Attr {
 /// A read-only filesystem view of the first user volume of an APFS container.
 /// Owns the block device; memoizes path->inode and inode->listing (the volume
 /// is read-only, so caches never need invalidation).
+/// How many resolved paths and listed directories a view keeps before it
+/// starts over: enough for a large tree, bounded for a mount that walks
+/// millions of paths over its lifetime.
+const PATH_CACHE_LIMIT: usize = 65_536;
+const DIR_CACHE_LIMIT: usize = 4_096;
+
 pub struct FsView<D: BlockDevice> {
     dev: D,
     catalog: Catalog,
     names_hashed: bool,
+    /// Whether names that differ only in case are the same name. A hashed
+    /// volume is not necessarily case-insensitive (see APFSX).
+    case_insensitive: bool,
     path_cache: HashMap<String, u64>,
-    dir_cache: HashMap<u64, Vec<DirEntry>>,
+    dir_cache: HashMap<u64, DirListing>,
     /// Volume superblock paddr - needed by the WinFsp write path to fetch
     /// vsb_raw bytes for apfs-write API calls (Transaction::begin + write_file
     /// + create_file + unlink + rename all take a `vsb_raw: &[u8]` argument).
@@ -98,6 +126,67 @@ pub struct FsView<D: BlockDevice> {
     /// for the SAME volume afterward (`reopen`) instead of re-running the
     /// Default heuristic, which could otherwise drift to another volume.
     selector: VolumeSelector,
+}
+
+/// A directory's entries as listed, with each name's comparison key mapped
+/// to the first entry carrying it, so a name lookup is one hash probe
+/// instead of a fold of every entry.
+struct DirListing {
+    /// Sorted by name, byte for byte: the order a listing is paged in.
+    entries: Vec<DirEntry>,
+    /// Index into `entries` by the key the volume compares names by.
+    by_key: HashMap<String, usize>,
+}
+
+/// How names compare on a volume: folded (case-insensitive), normalized
+/// only (hashed but case-sensitive), or byte for byte.
+#[derive(Clone, Copy)]
+enum NameMatch {
+    Folded,
+    Normalized,
+    Exact,
+}
+
+impl NameMatch {
+    /// The key a stored name is compared by.
+    fn key(self, name: &str) -> String {
+        match self {
+            NameMatch::Folded => case_fold::apfs_case_fold(name),
+            NameMatch::Normalized => case_fold::apfs_normalize(name),
+            NameMatch::Exact => name.to_string(),
+        }
+    }
+    /// The key a looked-up name is compared by: the needle is folded (or
+    /// normalized) once to its canonical form and then compared the way a
+    /// stored name is, which keys it twice.
+    fn needle_key(self, name: &str) -> String {
+        match self {
+            NameMatch::Folded | NameMatch::Normalized => self.key(&self.key(name)),
+            NameMatch::Exact => name.to_string(),
+        }
+    }
+}
+
+impl DirListing {
+    fn new(mut entries: Vec<DirEntry>, how: NameMatch) -> Self {
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut by_key = HashMap::with_capacity(entries.len());
+        for (i, e) in entries.iter().enumerate() {
+            by_key.entry(how.key(&e.name)).or_insert(i);
+        }
+        Self { entries, by_key }
+    }
+}
+
+/// `apfs_superblock_t`: `apfs_fs_quota_block_count` (a volume's block quota,
+/// zero when it has none) and `apfs_fs_alloc_count` (blocks the volume holds).
+const VSB_QUOTA_BLOCK_COUNT: usize = 0x50;
+const VSB_ALLOC_COUNT: usize = 0x58;
+
+/// Up to `max` of `entries` (sorted by name) that sort after `after`.
+fn page_after(entries: &[DirEntry], after: Option<&str>, max: usize) -> Vec<DirEntry> {
+    let start = after.map_or(0, |a| entries.partition_point(|e| e.name.as_str() <= a));
+    entries.iter().skip(start).take(max).cloned().collect()
 }
 
 /// Normalize a path into non-empty components (leading/trailing/duplicate
@@ -118,28 +207,37 @@ impl<D: BlockDevice> FsView<D> {
     }
 
     /// Reported volume size + free bytes for WinFsp `get_volume_info` and any
-    /// Explorer/dir consumer. `total` is the underlying block device size
-    /// (close to what newfs_apfs reports - the container fills its partition);
-    /// `free` is derived from the volume superblock's `apfs_fs_alloc_count`
-    /// counter (allocated blocks across data + metadata, kept in sync by
-    /// every COW commit). Conservative - a precise free-block tally requires
-    /// the full spaceman bitmap walk, which is M8 polish.
+    /// Explorer/dir consumer, as macOS reports them through statfs: the total
+    /// is the container's block count and the free space is the space
+    /// manager's free-block count, both in bytes, so every volume of the
+    /// container and its own metadata are accounted for. A volume with a
+    /// quota reports the quota as its total and what is left of it as free,
+    /// since the quota, not the container, bounds what can be written to it.
+    /// Measured against `statvfs` on macOS 26.
     pub fn volume_size(&mut self) -> Result<(u64, u64), FsError> {
-        let total = self.dev.size();
+        let container = apfs_core::container::Container::open(&mut self.dev)?;
+        let bsz = self.bsz as u64;
         let mut vsb = vec![0u8; self.bsz];
-        let vsb_off = self.vol_paddr * self.bsz as u64;
+        let vsb_off = self.vol_paddr * bsz;
         self.dev
             .read_at(vsb_off, &mut vsb)
             .map_err(FsError::Block)?;
-        // apfs_fs_alloc_count @ offset 0x58 (the APFS specification,
-        // linux-apfs-rw apfs_raw.h apfs_superblock_t).
-        let alloc_blocks = u64::from_le_bytes(
-            vsb.get(0x58..0x60)
+        let field = |at: usize| -> u64 {
+            vsb.get(at..at + 8)
                 .and_then(|s| s.try_into().ok())
-                .unwrap_or([0; 8]),
-        );
-        let used = alloc_blocks.saturating_mul(self.bsz as u64);
-        let free = total.saturating_sub(used);
+                .map(u64::from_le_bytes)
+                .unwrap_or(0)
+        };
+        let quota_blocks = field(VSB_QUOTA_BLOCK_COUNT);
+        let alloc_blocks = field(VSB_ALLOC_COUNT);
+        if quota_blocks != 0 {
+            let left = quota_blocks.saturating_sub(alloc_blocks);
+            return Ok((quota_blocks.saturating_mul(bsz), left.saturating_mul(bsz)));
+        }
+        let total = container.superblock.block_count.saturating_mul(bsz);
+        let free = container
+            .free_block_count(&mut self.dev)?
+            .saturating_mul(bsz);
         Ok((total, free))
     }
 
@@ -185,6 +283,54 @@ impl<D: BlockDevice> FsView<D> {
         Self::open_selected(dev, VolumeSelector::Default)
     }
 
+    /// The device this view reads, for a caller that writes through it (an
+    /// open write transaction). Cached lookups may be stale after a write;
+    /// [`Self::rebind`] drops them.
+    pub fn dev_mut(&mut self) -> &mut D {
+        &mut self.dev
+    }
+
+    /// Bind this view to the volume superblock at `vol_paddr` and drop every
+    /// cached lookup. A host that keeps a write transaction open reads
+    /// through it, and after each operation rebinds to the superblock the
+    /// transaction last staged, so lookups see the operation's changes
+    /// before they are committed.
+    pub fn rebind(&mut self, vol_paddr: u64) -> Result<(), FsError> {
+        self.rebind_to(vol_paddr)?;
+        self.path_cache.clear();
+        self.dir_cache.clear();
+        Ok(())
+    }
+
+    /// [`Self::rebind`] after an operation that changed no name: no entry
+    /// added, removed or renamed (a write, a resize, new times or
+    /// attributes, an extended attribute). Every cached path and listing
+    /// still holds, and keeping them spares the next lookups a walk from
+    /// the root: a file copied in took five operations and some fifteen
+    /// such walks.
+    pub fn rebind_keeping_names(&mut self, vol_paddr: u64) -> Result<(), FsError> {
+        self.rebind_to(vol_paddr)
+    }
+
+    fn rebind_to(&mut self, vol_paddr: u64) -> Result<(), FsError> {
+        use apfs_core::volume::VolumeSuperblock;
+        let mut raw = vec![0u8; self.bsz];
+        self.dev
+            .read_at(vol_paddr.saturating_mul(self.bsz as u64), &mut raw)?;
+        let vol = VolumeSuperblock::parse(&raw)?;
+        if vol.is_encrypted() {
+            return Err(FsError::Encrypted {
+                name: vol.name.clone(),
+                role: vol.role,
+            });
+        }
+        self.catalog = Catalog::open(&mut self.dev, &vol, self.bsz as u32)?;
+        self.names_hashed = vol.names_are_hashed();
+        self.case_insensitive = vol.is_case_insensitive();
+        self.vol_paddr = vol_paddr;
+        Ok(())
+    }
+
     /// The selector this view was opened with.
     pub fn selector(&self) -> VolumeSelector {
         self.selector
@@ -209,10 +355,10 @@ impl<D: BlockDevice> FsView<D> {
         let block_size = c.superblock.block_size;
         let xid = c.superblock.obj.xid;
         let omap_oid = c.superblock.omap_oid;
-        let fs_oids: Vec<u64> = c.superblock.fs_oids.to_vec();
+        let fs_slots: Vec<(u32, u64)> = c.superblock.fs_slots.to_vec();
         drop(c);
 
-        if fs_oids.is_empty() {
+        if fs_slots.is_empty() {
             return Err(FsError::NoVolume);
         }
 
@@ -224,8 +370,9 @@ impl<D: BlockDevice> FsView<D> {
             paddr: u64,
             vsb: VolumeSuperblock,
         }
-        let mut cands: Vec<Cand> = Vec::with_capacity(fs_oids.len());
-        for (index, &oid) in fs_oids.iter().enumerate() {
+        let mut cands: Vec<Cand> = Vec::with_capacity(fs_slots.len());
+        for &(slot, oid) in &fs_slots {
+            let index = slot as usize;
             let paddr = match omap.resolve(&mut dev, oid, xid, block_size)? {
                 Some(p) => p,
                 None => continue,
@@ -278,12 +425,29 @@ impl<D: BlockDevice> FsView<D> {
             "selected APFS volume"
         );
 
+        // A FileVault volume stores ciphertext in its file extents. We hold no
+        // keybag material, so every read would return garbage that is
+        // indistinguishable from real content. Refuse the mount instead.
+        if vol.is_encrypted() {
+            tracing::warn!(
+                name = %vol.name,
+                role = ?vol.volume_role(),
+                "refusing encrypted volume: file data would be served as ciphertext"
+            );
+            return Err(FsError::Encrypted {
+                name: vol.name.clone(),
+                role: vol.role,
+            });
+        }
+
         let names_hashed = vol.names_are_hashed();
+        let case_insensitive = vol.is_case_insensitive();
         let catalog = Catalog::open(&mut dev, &vol, block_size)?;
         Ok(Self {
             dev,
             catalog,
             names_hashed,
+            case_insensitive,
             path_cache: HashMap::with_capacity(64),
             dir_cache: HashMap::with_capacity(16),
             vol_paddr,
@@ -316,15 +480,88 @@ impl<D: BlockDevice> FsView<D> {
         Ok((vsb_raw, omap_raw))
     }
 
+    /// Every mapping of the volume's object map as stored, in key order.
+    pub fn volume_omap_entries(&mut self) -> Result<Vec<apfs_core::omap::OmapEntry>, FsError> {
+        let (vsb_raw, _) = self.read_vsb_omap_raw()?;
+        let omap_paddr = u64::from_le_bytes(
+            vsb_raw
+                .get(0x80..0x88)
+                .ok_or(FsError::NoVolume)?
+                .try_into()
+                .map_err(|_| FsError::NoVolume)?,
+        );
+        let omap = apfs_core::omap::Omap::open(&mut self.dev, omap_paddr, self.bsz as u32)?;
+        Ok(omap.entries(&mut self.dev, self.bsz as u32)?)
+    }
+
     fn listing(&mut self, ino: u64) -> Result<&[DirEntry], FsError> {
         use std::collections::hash_map::Entry;
+        if self.dir_cache.len() >= DIR_CACHE_LIMIT && !self.dir_cache.contains_key(&ino) {
+            self.dir_cache.clear();
+        }
+        let how = self.name_match();
         if let Entry::Vacant(e) = self.dir_cache.entry(ino) {
             let v = self
                 .catalog
                 .list_dir(&mut self.dev, ino, self.names_hashed)?;
-            e.insert(v);
+            e.insert(DirListing::new(v, how));
         }
-        Ok(self.dir_cache.get(&ino).map(Vec::as_slice).unwrap_or(&[]))
+        Ok(self
+            .dir_cache
+            .get(&ino)
+            .map(|l| l.entries.as_slice())
+            .unwrap_or(&[]))
+    }
+
+    /// How names compare on this volume.
+    fn name_match(&self) -> NameMatch {
+        match (self.names_hashed, self.case_insensitive) {
+            (true, true) => NameMatch::Folded,
+            (true, false) => NameMatch::Normalized,
+            (false, _) => NameMatch::Exact,
+        }
+    }
+
+    /// The inode the entry `name` of directory `ino` names, if any.
+    fn child(&mut self, ino: u64, name: &str) -> Result<Option<u64>, FsError> {
+        Ok(self.child_entry(ino, name)?.map(|e| e.file_id))
+    }
+
+    /// The entry of directory `ino` that `name` names, compared the way the
+    /// volume compares names. A directory already listed is looked up in
+    /// its listing; otherwise, on a volume that hashes names, the few
+    /// records with the name's hash are read instead of the whole directory
+    /// (after a write the listings are gone, and listing a large directory
+    /// for every lookup made each operation cost its size).
+    fn child_entry(&mut self, ino: u64, name: &str) -> Result<Option<DirEntry>, FsError> {
+        let how = self.name_match();
+        if self.names_hashed && !self.dir_cache.contains_key(&ino) {
+            let (fold, normalize) = (matches!(how, NameMatch::Folded), true);
+            let hash = case_fold::apfs_name_hash(name, fold, normalize);
+            let found = self.catalog.find_dir_entries(&mut self.dev, ino, hash)?;
+            let wanted = how.needle_key(name);
+            return Ok(found.into_iter().find(|e| how.key(&e.name) == wanted));
+        }
+        self.listing(ino)?;
+        let key = how.needle_key(name);
+        Ok(self.dir_cache.get(&ino).and_then(|l| {
+            let i = l.by_key.get(&key).copied()?;
+            l.entries.get(i).cloned()
+        }))
+    }
+
+    /// The entry `path` names: its directory's inode and the name as the
+    /// volume stores it, which may differ from `path`'s in case or
+    /// normalization. `Ok(None)` when the directory or the entry is absent.
+    pub fn entry(&mut self, path: &str) -> Result<Option<(u64, DirEntry)>, FsError> {
+        let comps = components(path);
+        let Some((last, dirs)) = comps.split_last() else {
+            return Ok(None);
+        };
+        let Some(dir) = self.lookup(&format!("/{}", dirs.join("/")))? else {
+            return Ok(None);
+        };
+        Ok(self.child_entry(dir, last)?.map(|e| (dir, e)))
     }
 
     /// Resolve a path to its inode number (cached). Empty/"/" -> root inode.
@@ -343,47 +580,57 @@ impl<D: BlockDevice> FsView<D> {
         if let Some(&i) = self.path_cache.get(&key) {
             return Ok(Some(i));
         }
-        let names_hashed = self.names_hashed;
+        // Start below the longest prefix already resolved. Each component is
+        // then one probe of its directory's name index: on a hashed volume
+        // the needle is folded (case-insensitive) or only normalized
+        // (case-sensitive: README and readme stay two files) exactly as each
+        // stored name is, so NFC and NFD spellings from Finder / AFP meet.
+        let mut start = 0;
         let mut ino = ROOT_DIR_INO_NUM;
-        for comp in &comps {
-            // For hashed (case-insensitive) volumes fold the needle to its
-            // Unicode canonical form (NFD + lowercase) before comparison.
-            // Both the needle and each catalog entry name are folded so that
-            // NFC vs NFD variant inputs from Finder / AFP are unified.
-            // For exact-match volumes we compare raw UTF-8 - no allocation.
-            let needle_owned: String;
-            let needle: &str = if names_hashed {
-                needle_owned = case_fold::apfs_case_fold(comp);
-                &needle_owned
-            } else {
-                comp
-            };
-            let next = self
-                .listing(ino)?
-                .iter()
-                .find(|e| {
-                    if names_hashed {
-                        case_fold::apfs_names_match(&e.name, needle)
-                    } else {
-                        e.name == needle
-                    }
-                })
-                .map(|e| e.file_id);
-            match next {
+        for n in (1..comps.len()).rev() {
+            let prefix = format!("/{}", comps[..n].join("/"));
+            if let Some(&i) = self.path_cache.get(&prefix) {
+                start = n;
+                ino = i;
+                break;
+            }
+        }
+        for (n, comp) in comps.iter().enumerate().skip(start) {
+            match self.child(ino, comp)? {
                 Some(i) => ino = i,
                 None => return Ok(None),
             }
+            if self.path_cache.len() >= PATH_CACHE_LIMIT {
+                self.path_cache.clear();
+            }
+            self.path_cache
+                .insert(format!("/{}", comps[..=n].join("/")), ino);
         }
-        self.path_cache.insert(key, ino);
         Ok(Some(ino))
     }
 
-    /// List a directory's entries (cached).
+    /// List a directory's entries (cached), sorted by name byte for byte.
     pub fn read_dir(&mut self, path: &str) -> Result<Vec<DirEntry>, FsError> {
         match self.lookup(path)? {
             Some(ino) => Ok(self.listing(ino)?.to_vec()),
-            None => Ok(Vec::new()),
+            None => Err(FsError::NotFound(path.to_string())),
         }
+    }
+
+    /// Up to `max` entries of a directory that sort after `after` (from the
+    /// first with `None`), in the order of [`read_dir`](Self::read_dir). A
+    /// caller paging through a large directory copies only each page, not
+    /// the whole listing every time.
+    pub fn read_dir_after(
+        &mut self,
+        path: &str,
+        after: Option<&str>,
+        max: usize,
+    ) -> Result<Vec<DirEntry>, FsError> {
+        let Some(ino) = self.lookup(path)? else {
+            return Err(FsError::NotFound(path.to_string()));
+        };
+        Ok(page_after(self.listing(ino)?, after, max))
     }
 
     /// Stat a path (size + is_dir + inode). `Ok(None)` if the path is absent.
@@ -394,6 +641,7 @@ impl<D: BlockDevice> FsView<D> {
                 let InodeStat {
                     size,
                     is_dir,
+                    nchildren_or_nlink,
                     mode,
                     bsd_flags,
                     create_time,
@@ -405,6 +653,7 @@ impl<D: BlockDevice> FsView<D> {
                     inode,
                     size,
                     is_dir,
+                    nchildren_or_nlink,
                     mode,
                     bsd_flags,
                     create_time,
@@ -418,46 +667,135 @@ impl<D: BlockDevice> FsView<D> {
 
     /// Read up to `len` bytes of a regular file at `path` from byte `offset`.
     /// Transparently decompresses decmpfs. `Ok(vec![])` past EOF / absent.
+    /// Only what the range touches is read: the extents it covers, or for a
+    /// compressed file the chunks, so a read of a large file costs the read.
     pub fn read(&mut self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
         let ino = match self.lookup(path)? {
             Some(i) => i,
-            None => return Ok(Vec::new()),
+            None => return Err(FsError::NotFound(path.to_string())),
         };
-        let content = self.catalog.read_file_decompressed(&mut self.dev, ino)?;
-        let off = offset as usize;
-        if off >= content.len() {
+        let Ok(offset) = usize::try_from(offset) else {
             return Ok(Vec::new());
-        }
-        let end = off.saturating_add(len).min(content.len());
-        Ok(content.get(off..end).unwrap_or(&[]).to_vec())
+        };
+        Ok(self
+            .catalog
+            .read_file_decompressed_range(&mut self.dev, ino, offset, len)?)
     }
 
-    /// Return a list of all extended attribute names for the file at `path`.
-    /// Filters out internal Apple system-owned attributes (those with flag
-    /// `XATTR_FILE_SYSTEM_OWNED = 0x0004`) so Windows EA consumers only see
-    /// user-visible attributes. Returns `Ok(vec![])` when the file has no
-    /// user xattrs or the path is absent.
+    /// Return a list of all extended attribute names for the file at `path`,
+    /// as macOS shows them to an ordinary caller: internal Apple system-owned
+    /// attributes (flag `XATTR_FILE_SYSTEM_OWNED = 0x0004`) are left out, and
+    /// so are a compressed file's `com.apple.decmpfs` and
+    /// `com.apple.ResourceFork`, which hold its content rather than describe
+    /// it (on a file that is not compressed they are ordinary attributes).
+    /// Returns `Ok(vec![])` when the file has no user xattrs or the path is
+    /// absent.
     pub fn list_xattrs(&mut self, path: &str) -> Result<Vec<String>, FsError> {
         use apfs_core::xattr::XATTR_FILE_SYSTEM_OWNED;
         let ino = match self.lookup(path)? {
             Some(i) => i,
             None => return Ok(Vec::new()),
         };
+        let compressed = self.is_compressed(ino)?;
         let entries = self.catalog.list_xattrs(&mut self.dev, ino)?;
         Ok(entries
             .into_iter()
             .filter(|e| e.flags & XATTR_FILE_SYSTEM_OWNED == 0)
+            .filter(|e| !(compressed && is_compressed_storage(&e.name)))
             .map(|e| e.name)
             .collect())
     }
 
+    /// Whether the inode stores its content compressed (`UF_COMPRESSED`).
+    fn is_compressed(&mut self, ino: u64) -> Result<bool, FsError> {
+        Ok(self
+            .catalog
+            .inode_record(&mut self.dev, ino)?
+            .is_some_and(|inode| inode.is_compressed()))
+    }
+
+    /// Every name the file at `path` is reachable through.
+    ///
+    /// A file with a single name carries no sibling-link records, so the result
+    /// is empty; that is not the same as the file being absent, which also
+    /// gives an empty result. Ordered by sibling id, oldest first.
+    pub fn sibling_links(
+        &mut self,
+        path: &str,
+    ) -> Result<Vec<apfs_core::catalog::SiblingLink>, FsError> {
+        let ino = match self.lookup(path)? {
+            Some(i) => i,
+            None => return Ok(Vec::new()),
+        };
+        Ok(self.catalog.sibling_links(&mut self.dev, ino)?)
+    }
+
+    /// Every data-stream-id record of the volume as `(stream id, reference count)`.
+    pub fn dstream_ids(&mut self) -> Result<Vec<(u64, u32)>, FsError> {
+        Ok(self.catalog.dstream_ids(&mut self.dev)?)
+    }
+
+    /// Every sibling-map record of the volume as `(sibling id, inode number)`.
+    pub fn sibling_maps(&mut self) -> Result<Vec<(u64, u64)>, FsError> {
+        Ok(self.catalog.sibling_maps(&mut self.dev)?)
+    }
+
+    /// The parsed inode record at `path`, or `Ok(None)` when the path is absent.
+    pub fn inode_record(&mut self, path: &str) -> Result<Option<apfs_core::inode::Inode>, FsError> {
+        let ino = match self.lookup(path)? {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        Ok(self.catalog.inode_record(&mut self.dev, ino)?)
+    }
+
+    /// The data-stream extents of the file at `path`, in logical order; empty
+    /// when the path is absent or the file has no stream.
+    pub fn file_extents(
+        &mut self,
+        path: &str,
+    ) -> Result<Vec<apfs_core::catalog::FileExtent>, FsError> {
+        let ino = match self.lookup(path)? {
+            Some(i) => i,
+            None => return Ok(Vec::new()),
+        };
+        Ok(self.catalog.file_extents(&mut self.dev, ino)?)
+    }
+
+    /// The parent directory and name the inode at `path` records for itself.
+    /// Returns `Ok(None)` when the path is absent.
+    pub fn primary_link(
+        &mut self,
+        path: &str,
+    ) -> Result<Option<apfs_core::catalog::PrimaryLink>, FsError> {
+        let ino = match self.lookup(path)? {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        Ok(self.catalog.primary_link(&mut self.dev, ino)?)
+    }
+
     /// Read the raw bytes of one extended attribute by name. Returns
-    /// `Ok(None)` when the path is absent or the attribute does not exist.
+    /// `Ok(None)` when the path is absent, the attribute does not exist, or
+    /// it is the storage of a compressed file (see [`FsView::list_xattrs`]).
+    /// The stored flags of attribute `name` at `path` (data stream, embedded,
+    /// file-system owned), `Ok(None)` when the path or the attribute is absent.
+    pub fn xattr_flags(&mut self, path: &str, name: &str) -> Result<Option<u16>, FsError> {
+        let ino = match self.lookup(path)? {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        Ok(self.catalog.xattr_flags(&mut self.dev, ino, name)?)
+    }
+
     pub fn get_xattr(&mut self, path: &str, name: &str) -> Result<Option<Vec<u8>>, FsError> {
         let ino = match self.lookup(path)? {
             Some(i) => i,
             None => return Ok(None),
         };
+        if is_compressed_storage(name) && self.is_compressed(ino)? {
+            return Ok(None);
+        }
         Ok(self.catalog.get_xattr(&mut self.dev, ino, name)?)
     }
 
@@ -475,9 +813,18 @@ impl<D: BlockDevice> FsView<D> {
         if stat.mode & 0o170000 != 0o120000 {
             return Ok(None);
         }
+        // APFS stores the target NUL-terminated; the target is the value
+        // length minus that terminator. Strip it here so every consumer sees
+        // the path itself rather than each of them guessing.
         Ok(self
             .catalog
-            .get_xattr(&mut self.dev, ino, "com.apple.fs.symlink")?)
+            .get_xattr(&mut self.dev, ino, "com.apple.fs.symlink")?
+            .map(|mut v| {
+                if v.last() == Some(&0) {
+                    v.pop();
+                }
+                v
+            }))
     }
 }
 
@@ -535,5 +882,51 @@ mod tests {
     fn components_preserves_extension_dots() {
         assert_eq!(components("/hello.txt"), vec!["hello.txt"]);
         assert_eq!(components("/dir/file.tar.gz"), vec!["dir", "file.tar.gz"]);
+    }
+
+    // --- listings ---
+
+    use super::{page_after, DirEntry, DirListing, NameMatch};
+
+    fn entry(name: &str, id: u64) -> DirEntry {
+        DirEntry {
+            name: name.to_string(),
+            file_id: id,
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn a_listing_is_sorted_and_found_by_key() {
+        let names = ["b.txt", "A.txt", "café", "a.txt", "Z", "10", "9"];
+        let l = DirListing::new(
+            names.iter().zip(1..).map(|(n, i)| entry(n, i)).collect(),
+            NameMatch::Exact,
+        );
+        let got: Vec<&str> = l.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(got, ["10", "9", "A.txt", "Z", "a.txt", "b.txt", "café"]);
+        let i = l.by_key["café"];
+        assert_eq!(l.entries[i].file_id, 3);
+    }
+
+    #[test]
+    fn pages_cover_a_listing_once_in_order() {
+        let mut v: Vec<DirEntry> = (0..1000).map(|i| entry(&format!("f{i}"), i)).collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let page = page_after(&v, after.as_deref(), 64);
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().map(|e| e.name.clone());
+            seen.extend(page.into_iter().map(|e| e.name));
+        }
+        let want: Vec<String> = v.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(seen, want);
+        // A marker that is not itself a name resumes after where it sorts.
+        let page = page_after(&v, Some("f5000"), 2);
+        assert_eq!(page[0].name, "f501");
     }
 }

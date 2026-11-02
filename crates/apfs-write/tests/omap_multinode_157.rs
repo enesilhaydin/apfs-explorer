@@ -37,7 +37,10 @@ mod r157 {
     use apfs_core::container::Container;
     use apfs_core::omap::Omap;
     use apfs_core::volume::VolumeSuperblock;
-    use apfs_write::file::{create_file, rename, unlink, verify_fsroot};
+    use apfs_write::file::{
+        create_file, mkdir, move_entry, rename, unlink, verify_fsroot, write_file,
+    };
+    use apfs_write::snapshot::{create_snapshot, delete_snapshot, revert_to_snapshot};
     use apfs_write::txn::Transaction;
     use std::process::Command;
 
@@ -54,6 +57,19 @@ mod r157 {
     ];
     const SECTOR: u64 = 512;
 
+    /// The first line of an fsck report worth acting on, for stage-by-stage
+    /// output: without it a late failure gives no hint which step introduced it.
+    fn first_complaint(out: &str) -> Vec<&str> {
+        out.lines()
+            .filter(|l| {
+                l.contains("corrupt")
+                    || l.contains("invalid")
+                    || l.contains("overallocation")
+                    || l.contains("is not valid")
+            })
+            .take(2)
+            .collect()
+    }
     fn check_gate() -> bool {
         std::env::var("APFS_WRITE_SCRATCH").as_deref() == Ok("1")
     }
@@ -476,6 +492,339 @@ mod r157 {
             "#157: multi-node-omap workload left the volume fsck-DIRTY: {verdict:?}"
         );
         println!("#157 PASS: writes on a multi-node volume omap stay fsck-clean");
+    }
+
+    /// `move_entry` (cross-directory move) keeps its own copy of the volume-omap
+    /// rebuild, which the multi-node work never reached: it decodes only the
+    /// omap ROOT and writes the result back through the single-node builder. On
+    /// a volume whose omap has split, that reads an index root as if it were a
+    /// leaf and emits one node in place of the whole tree, orphaning every real
+    /// leaf. The rename path above proves the shared rebuild handles this shape;
+    /// this proves the move path does too.
+    #[test]
+    #[ignore = "fsck-gated; slow (macOS populate of a multi-node-omap volume + fsck)"]
+    fn move_entry_on_multinode_omap_stays_fsck_clean() {
+        if !check_gate() {
+            println!("#157-move: APFS_WRITE_SCRATCH not set - skip");
+            return;
+        }
+        gen_scratch();
+        macos_populate(N_FILES);
+        let (ok0, _) = verify();
+        assert!(
+            ok0,
+            "#157-move precondition: populated volume must be clean"
+        );
+
+        let omap_level = vol_omap_tree_level();
+        assert!(
+            omap_level > 0,
+            "#157-move: volume omap is single-node (level {omap_level}) - test would be vacuous"
+        );
+
+        let mut fails: Vec<String> = Vec::new();
+
+        // Destination directory for the moves.
+        {
+            let (vsb, om) = read_vsb_omap();
+            let mut txn = open_txn();
+            match mkdir(&mut txn, &vsb, &om, 2, "moved") {
+                Ok(_) => txn
+                    .commit()
+                    .map(|_| ())
+                    .unwrap_or_else(|e| fails.push(format!("mkdir COMMIT-ERR {e}"))),
+                Err(e) => {
+                    let _ = txn.abort();
+                    fails.push(format!("mkdir OP-ERR {e}"));
+                }
+            }
+        }
+        let dst_ino = {
+            let raw = std::fs::read(IMG).expect("read img");
+            let (base, len) = find_apfs_range(&raw);
+            let inner = FileBlockDeviceRw::open_rw(IMG).expect("open rw");
+            let dev = WritableOffsetBlockDevice::new(inner, base, len);
+            let mut fs = apfs::FsView::open(dev).expect("FsView::open");
+            fs.lookup("/moved").expect("lookup").expect("moved dir")
+        };
+
+        // Move a batch of the macOS-authored files into it, one op per commit.
+        for i in 0..20 {
+            let (vsb, om) = read_vsb_omap();
+            let mut txn = open_txn();
+            let name = mac_name(i);
+            match move_entry(&mut txn, &vsb, &om, 2, &name, dst_ino, &name, false) {
+                Ok(()) => txn
+                    .commit()
+                    .map(|_| ())
+                    .unwrap_or_else(|e| fails.push(format!("move {name} COMMIT-ERR {e}"))),
+                Err(e) => {
+                    let _ = txn.abort();
+                    fails.push(format!("move {name} OP-ERR {e}"));
+                }
+            }
+        }
+
+        let (ok, out) = verify();
+        let verdict: Vec<&str> = out
+            .lines()
+            .filter(|l| {
+                l.contains("corrupt")
+                    || l.contains("invalid")
+                    || l.contains("overallocation")
+                    || l.contains("is not valid")
+            })
+            .collect();
+        println!("[#157-move] fsck_clean={ok} {verdict:?} op_fails={fails:?}");
+        assert!(
+            fails.is_empty(),
+            "#157-move: move_entry failed on a multi-node-omap volume:\n  {}",
+            fails.join("\n  ")
+        );
+        assert!(
+            ok,
+            "#157-move: move_entry left the volume fsck-DIRTY: {verdict:?}"
+        );
+        println!("#157-move PASS: move_entry on a multi-node volume omap stays fsck-clean");
+    }
+
+    /// Snapshots carried their own copy of the volume-omap rebuild, and it was
+    /// the last one still written for a single node: it decoded the omap root
+    /// as a leaf, so on a split omap it would emit one node in place of the
+    /// whole tree and orphan every real leaf. Rather than corrupt the volume it
+    /// refused outright, which left a volume of this size unable to take a
+    /// snapshot at all.
+    ///
+    /// Deleting the snapshot afterwards is deliberately NOT asserted here - see
+    /// `delete_snapshot_on_a_populated_volume_is_fsck_clean`.
+    #[test]
+    #[ignore = "fsck-gated; slow (macOS populate of a multi-node-omap volume + fsck)"]
+    fn snapshot_and_write_on_multinode_omap_stay_fsck_clean() {
+        if !check_gate() {
+            println!("#157-snap: APFS_WRITE_SCRATCH not set - skip");
+            return;
+        }
+        gen_scratch();
+        macos_populate(N_FILES);
+        let (ok0, _) = verify();
+        assert!(
+            ok0,
+            "#157-snap precondition: populated volume must be clean"
+        );
+
+        let omap_level = vol_omap_tree_level();
+        assert!(
+            omap_level > 0,
+            "#157-snap: volume omap is single-node (level {omap_level}) - test would be vacuous"
+        );
+
+        {
+            let (vsb, om) = read_vsb_omap();
+            let mut txn = open_txn();
+            create_snapshot(&mut txn, &vsb, &om, "snap-157").expect("create_snapshot");
+            txn.commit().expect("commit snapshot");
+        }
+        {
+            let (ok, out) = verify();
+            assert!(
+                ok,
+                "#157-snap: create_snapshot alone left the volume dirty: {:?}",
+                first_complaint(&out)
+            );
+        }
+        // A write under the snapshot, so the delete has copied-away blocks to
+        // reclaim rather than an untouched volume.
+        let body = vec![0xA7u8; 40 * 1024];
+        {
+            let (vsb, om) = read_vsb_omap();
+            let mut txn = open_txn();
+            write_file(&mut txn, &vsb, &om, 2, "snap_157_file.bin", &body).expect("write");
+            txn.commit().expect("commit write");
+        }
+        {
+            let (ok, out) = verify();
+            assert!(
+                ok,
+                "#157-snap: writing under the snapshot left the volume dirty: {:?}",
+                first_complaint(&out)
+            );
+        }
+        // The file written under the snapshot must read back.
+        {
+            let raw = std::fs::read(IMG).expect("read img");
+            let (base, len) = find_apfs_range(&raw);
+            let inner = FileBlockDeviceRw::open_rw(IMG).expect("open rw");
+            let dev = WritableOffsetBlockDevice::new(inner, base, len);
+            let mut fs = apfs::FsView::open(dev).expect("FsView::open");
+            let got = fs.read("/snap_157_file.bin", 0, body.len()).expect("read");
+            assert!(got == body, "#157-snap: content changed under the snapshot");
+        }
+        println!("#157-snap PASS: snapshot + write on a multi-node volume omap are clean");
+    }
+
+    /// Writing under a snapshot and then deleting it is where three separate
+    /// faults met, none of them reachable on a volume without history: the
+    /// delete walked a b-tree root it had staged but not written and freed the
+    /// file data it found there instead of nodes, and the object map kept the
+    /// versions the snapshot had pinned, both as superseded copies and as nodes
+    /// the live catalog no longer names.
+    ///
+    /// Set `APFS_STAGE_COPY=1` to keep a copy of the image after the populate
+    /// and after the write; comparing an allocation bitmap across those and the
+    /// final state is what localised the first of the three.
+    #[test]
+    #[ignore = "fsck-gated; slow (macOS populate of a multi-node-omap volume + fsck)"]
+    fn write_under_snapshot_then_delete_is_fsck_clean() {
+        if !check_gate() {
+            println!("#157-del: APFS_WRITE_SCRATCH not set - skip");
+            return;
+        }
+        gen_scratch();
+        macos_populate(N_FILES);
+        let (ok0, _) = verify();
+        assert!(ok0, "#157-del precondition: populated volume must be clean");
+        if std::env::var("APFS_STAGE_COPY").is_ok() {
+            std::fs::copy(IMG, "/tmp/stage-after-populate.img").unwrap();
+        }
+
+        let snap_xid = {
+            let (vsb, om) = read_vsb_omap();
+            let mut txn = open_txn();
+            let xid =
+                create_snapshot(&mut txn, &vsb, &om, "snap-157-del").expect("create_snapshot");
+            txn.commit().expect("commit snapshot");
+            xid
+        };
+        {
+            let (vsb, om) = read_vsb_omap();
+            let mut txn = open_txn();
+            write_file(
+                &mut txn,
+                &vsb,
+                &om,
+                2,
+                "under_snap.bin",
+                &[0xB4u8; 40 * 1024],
+            )
+            .expect("write under snapshot");
+            txn.commit().expect("commit write");
+        }
+        {
+            let (ok, out) = verify();
+            assert!(
+                ok,
+                "#157-del: the write under the snapshot is itself clean: {:?}",
+                first_complaint(&out)
+            );
+        }
+        if std::env::var("APFS_STAGE_COPY").is_ok() {
+            std::fs::copy(IMG, "/tmp/stage-after-write.img").unwrap();
+        }
+        {
+            let (vsb, om) = read_vsb_omap();
+            let mut txn = open_txn();
+            delete_snapshot(&mut txn, &vsb, &om, snap_xid).expect("delete_snapshot");
+            txn.commit().expect("commit delete");
+        }
+
+        let (ok, out) = verify();
+        let verdict = first_complaint(&out);
+        assert!(
+            ok && verdict.is_empty(),
+            "#157-del: delete after a write under the snapshot left the volume \
+             fsck-DIRTY: {verdict:?}"
+        );
+        println!("#157-del PASS: write under a snapshot then delete is clean");
+    }
+
+    /// The revert path shared the same single-node assumption and refused a
+    /// split omap outright. Asserted twice over: the rebuilt map must still
+    /// describe the whole catalog, and fsck must accept the result.
+    #[test]
+    #[ignore = "fsck-gated; slow (macOS populate of a multi-node-omap volume)"]
+    fn revert_on_multinode_omap_rebuilds_the_whole_map() {
+        if !check_gate() {
+            println!("#157-revert: APFS_WRITE_SCRATCH not set - skip");
+            return;
+        }
+        gen_scratch();
+        macos_populate(N_FILES);
+        let (ok0, _) = verify();
+        assert!(
+            ok0,
+            "#157-revert precondition: populated volume must be clean"
+        );
+        assert!(
+            vol_omap_tree_level() > 0,
+            "#157-revert: volume omap is single-node - test would be vacuous"
+        );
+
+        let snap_xid = {
+            let (vsb, om) = read_vsb_omap();
+            let mut txn = open_txn();
+            let xid =
+                create_snapshot(&mut txn, &vsb, &om, "snap-157-rev").expect("create_snapshot");
+            txn.commit().expect("commit snapshot");
+            xid
+        };
+        {
+            let (vsb, om) = read_vsb_omap();
+            let mut txn = open_txn();
+            create_file(&mut txn, &vsb, &om, 2, "after_snap.txt").expect("create after snap");
+            txn.commit().expect("commit create");
+        }
+        {
+            let (vsb, om) = read_vsb_omap();
+            let mut txn = open_txn();
+            revert_to_snapshot(&mut txn, &vsb, &om, snap_xid).expect("revert_to_snapshot");
+            txn.commit().expect("commit revert");
+        }
+
+        // Reverting undoes the post-snapshot create.
+        {
+            let raw = std::fs::read(IMG).expect("read img");
+            let (base, len) = find_apfs_range(&raw);
+            let inner = FileBlockDeviceRw::open_rw(IMG).expect("open rw");
+            let dev = WritableOffsetBlockDevice::new(inner, base, len);
+            let mut fs = apfs::FsView::open(dev).expect("FsView::open");
+            assert!(
+                fs.lookup("/after_snap.txt").expect("lookup").is_none(),
+                "#157-revert: the file created after the snapshot must be gone"
+            );
+        }
+
+        // The object map must still describe the whole catalog: a rebuild that
+        // collapsed the tree to one node would orphan most of it, which the
+        // fsroot walk detects immediately.
+        {
+            let (vsb, om) = read_vsb_omap();
+            let bsz = vsb.len();
+            let mut txn = open_txn();
+            let stats = verify_fsroot(&mut txn, &vsb, &om, bsz)
+                .unwrap_or_else(|e| panic!("#157-revert: fsroot unreachable after revert: {e}"));
+            assert!(
+                stats.nodes > 1 && stats.records > N_FILES as u64,
+                "#157-revert: catalog shrank to {} nodes / {} records - the omap \
+                 rebuild dropped most of the map",
+                stats.nodes,
+                stats.records
+            );
+            println!(
+                "[#157-revert] catalog after revert: {} nodes, {} records",
+                stats.nodes, stats.records
+            );
+        }
+        assert!(
+            vol_omap_tree_level() > 0,
+            "#157-revert: the rebuilt omap collapsed to a single node"
+        );
+        let (ok, out) = verify();
+        let verdict = first_complaint(&out);
+        assert!(
+            ok && verdict.is_empty(),
+            "#157-revert: revert left the volume fsck-DIRTY: {verdict:?}"
+        );
+        println!("#157-revert PASS: revert rebuilds the whole multi-node volume omap");
     }
 
     /// Proves `verify_fsroot` actually DETECTS the #156-class drift (not a no-op

@@ -21,6 +21,11 @@ unicode-normalization.workspace = true
 apfs-core = { path = "../apfs-core" }
 apfs = { path = "../apfs" }
 
+# The real-USB test flushes a raw macOS disk node's write cache with an
+# ioctl (F_FULLFSYNC, which std uses, is not supported on device nodes).
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+libc = "0.2"
+
 [[test]]
 name = "snapshot_scratch"
 path = "tests/snapshot_scratch.rs"
@@ -68,3 +73,11 @@ path = "tests/integration_fsview.rs"
 [[test]]
 name = "integration_snapshot_revert"
 path = "tests/integration_snapshot_revert.rs"
+
+[[test]]
+name = "write_guards"
+path = "tests/write_guards.rs"
+
+[[test]]
+name = "symlink_target"
+path = "tests/symlink_target.rs"

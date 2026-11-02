@@ -50,21 +50,21 @@ pub enum DriveError {
 /// Tauri's webview thread has initialised on the calling thread.  The thread
 /// joins quickly (~50 ms) so blocking the async handler is fine.
 pub fn list() -> Result<Vec<DriveInfo>, DriveError> {
-    tracing::info!("list_drives: entering");
+    tracing::debug!("list_drives: entering");
     // Re-discover drives still mounted by the launcher (e.g. after a GUI
     // restart) and prune any unmounted out-of-band, before reading MOUNTED.
     crate::mount::reconcile();
     let join = std::thread::spawn(|| {
-        tracing::info!("list_drives: WMI worker thread start");
+        tracing::debug!("list_drives: WMI worker thread start");
         let r = wmi_query_disk_drives();
-        tracing::info!("list_drives: WMI worker returned ok={}", r.is_ok());
+        tracing::debug!("list_drives: WMI worker returned ok={}", r.is_ok());
         r
     });
     let (raw, apfs) = match join.join() {
         Ok(r) => r?,
         Err(_) => return Err(DriveError::Query("WMI worker thread panicked".into())),
     };
-    tracing::info!(
+    tracing::debug!(
         "list_drives: got {} raw drives, apfs detection={}",
         raw.len(),
         apfs.as_ref()
@@ -93,7 +93,7 @@ pub fn list() -> Result<Vec<DriveInfo>, DriveError> {
             }
         })
         .collect::<Vec<_>>();
-    tracing::info!("list_drives: returning {} drives", drives.len());
+    tracing::debug!("list_drives: returning {} drives", drives.len());
     Ok(drives)
 }
 
@@ -109,18 +109,18 @@ struct RawDrive {
 /// surface for hardware enumeration on Windows.
 fn wmi_query_disk_drives() -> Result<(Vec<RawDrive>, Option<HashSet<u32>>), DriveError> {
     unsafe {
-        tracing::info!("wmi: CoInitializeEx(MTA)");
+        tracing::debug!("wmi: CoInitializeEx(MTA)");
         let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
-        tracing::info!("wmi: CoInitializeEx returned hr={:#x}", hr.0);
+        tracing::debug!("wmi: CoInitializeEx returned hr={:#x}", hr.0);
         // -2147417850 == RPC_E_CHANGED_MODE: COM already initialised on
         // this thread (shouldn't happen on a fresh std::thread, but be
         // defensive in case).  We continue either way and only uninit at
         // the end when we performed the init ourselves.
         let owns_com_init = hr.is_ok();
 
-        tracing::info!("wmi: entering inner");
+        tracing::debug!("wmi: entering inner");
         let drives = wmi_query_inner();
-        tracing::info!("wmi: inner returned ok={}", drives.is_ok());
+        tracing::debug!("wmi: inner returned ok={}", drives.is_ok());
 
         // APFS detection is best-effort: query the Storage namespace for
         // partition GptTypes. On ANY failure return None (fail open) rather
@@ -202,10 +202,10 @@ unsafe fn wmi_apfs_inner() -> Result<HashSet<u32>, DriveError> {
 }
 
 unsafe fn wmi_query_inner() -> Result<Vec<RawDrive>, DriveError> {
-    tracing::info!("wmi: CoCreateInstance(WbemLocator)");
+    tracing::debug!("wmi: CoCreateInstance(WbemLocator)");
     let locator: IWbemLocator = CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER)
         .map_err(|e| DriveError::Init(format!("CoCreateInstance(WbemLocator): {e}")))?;
-    tracing::info!("wmi: ConnectServer(ROOT\\CIMV2)");
+    tracing::debug!("wmi: ConnectServer(ROOT\\CIMV2)");
 
     let services = locator
         .ConnectServer(
@@ -219,7 +219,7 @@ unsafe fn wmi_query_inner() -> Result<Vec<RawDrive>, DriveError> {
         )
         .map_err(|e| DriveError::Init(format!("ConnectServer: {e}")))?;
 
-    tracing::info!("wmi: CoSetProxyBlanket");
+    tracing::debug!("wmi: CoSetProxyBlanket");
     CoSetProxyBlanket(
         &services,
         RPC_C_AUTHN_WINNT,
@@ -232,7 +232,7 @@ unsafe fn wmi_query_inner() -> Result<Vec<RawDrive>, DriveError> {
     )
     .map_err(|e| DriveError::Init(format!("CoSetProxyBlanket: {e}")))?;
 
-    tracing::info!("wmi: ExecQuery");
+    tracing::debug!("wmi: ExecQuery");
     let query = services
         .ExecQuery(
             &BSTR::from("WQL"),
@@ -241,7 +241,7 @@ unsafe fn wmi_query_inner() -> Result<Vec<RawDrive>, DriveError> {
             None,
         )
         .map_err(|e| DriveError::Query(format!("ExecQuery: {e}")))?;
-    tracing::info!("wmi: ExecQuery ok, iterating");
+    tracing::debug!("wmi: ExecQuery ok, iterating");
 
     let mut drives: Vec<RawDrive> = Vec::new();
     let mut iters = 0u32;
@@ -254,7 +254,7 @@ unsafe fn wmi_query_inner() -> Result<Vec<RawDrive>, DriveError> {
         // closed cleanly.  After the timeout we treat the iteration as
         // done.
         let hr = query.Next(2_000, &mut row, &mut returned);
-        tracing::info!("wmi: Next iter={iters} hr={:#x} returned={returned}", hr.0);
+        tracing::debug!("wmi: Next iter={iters} hr={:#x} returned={returned}", hr.0);
         if hr.is_err() || returned == 0 {
             break;
         }

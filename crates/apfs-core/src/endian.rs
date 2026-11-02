@@ -9,6 +9,13 @@ pub enum ParseError {
     BadMagic { expected: u32, found: u32 },
     #[error("checksum mismatch: stored {stored:#018x}, computed {computed:#018x}")]
     BadChecksum { stored: u64, computed: u64 },
+    #[error("unsupported block size {0}: only 4096-byte blocks are supported")]
+    BadBlockSize(u32),
+    /// A field that parsed fine but names something the on-disk format does
+    /// not allow (an object id that must be fixed, an area outside the
+    /// container, a tree node at the wrong level).
+    #[error("invalid {field}: {value:#x}")]
+    BadField { field: &'static str, value: u64 },
 }
 
 fn slice(buf: &[u8], at: usize, need: usize) -> Result<&[u8], ParseError> {

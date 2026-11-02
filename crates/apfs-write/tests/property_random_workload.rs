@@ -497,6 +497,7 @@ mod prop_random_tests {
                             2,
                             name,
                             target.as_bytes(),
+                            false,
                         );
                         if r.is_ok() {
                             txn.commit().expect("commit symlink");

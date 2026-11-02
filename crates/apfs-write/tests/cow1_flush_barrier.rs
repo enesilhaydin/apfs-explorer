@@ -89,9 +89,12 @@ mod cow1 {
     /// Ordered device event for commit barrier assertions.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Ev {
-        Write { block: u64 },
+        Write { block: u64, nxsb: bool },
         Flush,
     }
+
+    /// Bytes 32..36 of a container superblock: its magic.
+    const NXSB_MAGIC: &[u8; 4] = b"NXSB";
 
     /// Records every `write_at` (block-relative) and `flush_data` so the test
     /// can assert the COW-1 ordering. Delegates all I/O to the inner device.
@@ -124,6 +127,7 @@ mod cow1 {
             if r.is_ok() {
                 self.events.push(Ev::Write {
                     block: offset / 4096,
+                    nxsb: buf.get(32..36) == Some(&NXSB_MAGIC[..]),
                 });
             }
             r
@@ -140,8 +144,8 @@ mod cow1 {
         }
     }
 
-    /// The NX superblock is written to container-relative block 0 (and to a ring
-    /// slot). Block 0 is the unambiguous commit-point marker.
+    /// The NX superblock goes to its descriptor-ring slot first - the commit
+    /// point every reader mounts - and then to block 0, the bootstrap copy.
     #[test]
     fn cow1_commit_flushes_around_nxsb_write() {
         if !check_gate() {
@@ -163,23 +167,41 @@ mod cow1 {
         let ev = rec_back.events;
 
         let total_flushes = ev.iter().filter(|e| **e == Ev::Flush).count();
-        let first_nxsb = ev
+        let ring = ev
             .iter()
-            .position(|e| *e == Ev::Write { block: 0 })
-            .expect("commit must write the NX superblock to block 0");
-
-        // Barrier #1: at least one flush BEFORE the NXSB write - every block the
-        // new checkpoint references is durable before the commit point.
+            .position(|e| matches!(e, Ev::Write { block, nxsb: true } if *block != 0))
+            .expect("commit must write the NX superblock to its ring slot");
+        let block0 = ev
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    Ev::Write {
+                        block: 0,
+                        nxsb: true
+                    }
+                )
+            })
+            .expect("commit must refresh the bootstrap copy at block 0");
         assert!(
-            ev[..first_nxsb].iter().any(|e| *e == Ev::Flush),
-            "COW-1: no flush_data before the NXSB write (block 0). Events: {ev:?}"
+            ring < block0,
+            "the ring slot is the commit point and goes before block 0. Events: {ev:?}"
         );
 
-        // Barrier #2: at least one flush AFTER the NXSB write - the commit point
-        // is durable before Phase B reclaim clears any allocation bits.
+        // Barrier #1: at least one flush BEFORE the ring slot - every block the
+        // new checkpoint references is durable before the commit point.
         assert!(
-            ev[first_nxsb + 1..].iter().any(|e| *e == Ev::Flush),
-            "COW-1: no flush_data after the NXSB write (block 0). Events: {ev:?}"
+            ev[..ring].contains(&Ev::Flush),
+            "COW-1: no flush_data before the NXSB ring write. Events: {ev:?}"
+        );
+
+        // Barrier #2: a flush right AFTER the ring slot, before any other write
+        // - the commit point is durable before Phase B reclaim clears any
+        // allocation bits (and before the bootstrap copy).
+        assert_eq!(
+            ev.get(ring + 1),
+            Some(&Ev::Flush),
+            "COW-1: the NXSB ring write is not followed by a flush. Events: {ev:?}"
         );
 
         assert!(

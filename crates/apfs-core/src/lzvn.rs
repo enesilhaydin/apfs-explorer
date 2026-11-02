@@ -12,6 +12,12 @@
 
 use crate::endian::ParseError;
 
+/// Upper bound for an up-front `Vec::with_capacity` reservation driven by an
+/// untrusted on-disk "uncompressed size". The output still grows naturally as
+/// real data is produced, so this caps only the speculative reservation and
+/// never truncates a legitimate file.
+pub const MAX_DECODE_RESERVE: usize = 16 * 1024 * 1024;
+
 /// Decode an LZVN-compressed byte slice.
 ///
 /// Returns the decompressed bytes.  Decoding stops when either:
@@ -33,7 +39,7 @@ pub fn lzvn_decode(src: &[u8], expected_len: usize) -> Result<Vec<u8>, ParseErro
     // `pos` is the read cursor into `src`.
     let mut pos: usize = 0;
     // `out` is the write buffer; we push into it (never index for writing).
-    let mut out: Vec<u8> = Vec::with_capacity(expected_len);
+    let mut out: Vec<u8> = Vec::with_capacity(expected_len.min(MAX_DECODE_RESERVE));
     // `d_prev` is the last match distance, carried across opcodes.
     let mut d_prev: usize = 0;
 
@@ -79,17 +85,18 @@ pub fn lzvn_decode(src: &[u8], expected_len: usize) -> Result<Vec<u8>, ParseErro
         //
         //   0x00..=0x6F (excl. specific slots): sml_d / lrg_d / pre_d
         //   0x70..=0x7F: udef (all 16 slots - rows 14-15 of opc_tbl)
-        //   0x80..=0xBF (excl. specific slots): sml_d / lrg_d / pre_d
+        //   0x80..=0x9F (excl. specific slots): sml_d / lrg_d / pre_d
         //   0xA0..=0xBF: med_d
-        //   0xC0..=0xCF: sml_d / lrg_d (not udef - corrected)
-        //   0xD0..=0xDF: sml_d / lrg_d / pre_d
+        //   0xC0..=0xCF: sml_d / lrg_d / pre_d
+        //   0xD0..=0xDF: udef (all 16 slots - rows 26-27 of opc_tbl)
         //   0xE0:        lrg_l
         //   0xE1..=0xEF: sml_l
         //   0xF0:        lrg_m
         //   0xF1..=0xFF: sml_m
         //   0x06:        eos
         //   0x0E, 0x16:  nop
-        //   udef slots: {0x1E,0x26,0x2E,0x36,0x3E} ∪ {0x70..=0x7F} = 21 total
+        //   udef slots: {0x1E,0x26,0x2E,0x36,0x3E} ∪ {0x70..=0x7F} ∪ {0xD0..=0xDF}
+        //   = 37 total (counted in the table itself, not taken from a comment)
         //
         // Rather than listing every special slot we use a match that mirrors
         // the C table exactly.
@@ -219,13 +226,13 @@ pub fn lzvn_decode(src: &[u8], expected_len: usize) -> Result<Vec<u8>, ParseErro
 
             // ---- udef (undefined) ------------------------------------------
             // Per Apple lzvn_decode_base.c opc_tbl[256]: five scattered slots
-            // (column 6 of rows 3-7) plus the full 0x70..=0x7F block (rows
-            // 14-15, all 16 entries &&udef). 0xC0..=0xCD are sml_d (corrected
-            // from Task 1 - those rows contain sml_d/lrg_d, not udef).
-            // Real macOS samples (moose-outdated, uuidgen) happen to contain no
-            // 0x70-0x7F opcode bytes, so empirical tests cannot catch this; the
-            // authoritative 256-entry table is ground truth.
-            0x1E | 0x26 | 0x2E | 0x36 | 0x3E | 0x70..=0x7F => {
+            // (column 6 of rows 3-7) plus the full 0x70..=0x7F and
+            // 0xD0..=0xDF blocks (16 entries each). 0xC0..=0xCF are
+            // sml_d/pre_d/lrg_d. An encoder never emits these, so streams
+            // Apple wrote cannot show the difference; the 256-entry table is
+            // ground truth, and reaching one of these means the stream is
+            // corrupt, not that it decodes as a small-distance match.
+            0x1E | 0x26 | 0x2E | 0x36 | 0x3E | 0x70..=0x7F | 0xD0..=0xDF => {
                 return Err(short(&out));
             }
 
@@ -686,5 +693,29 @@ mod tests {
         eos(&mut s);
         let out = lzvn_decode(&s, 4).unwrap();
         assert_eq!(out, b"zzzz");
+    }
+
+    // Apple's 256-entry opcode table leaves 37 slots undefined: five
+    // scattered ones, 0x70..=0x7F and 0xD0..=0xDF. A stream that reaches one
+    // is corrupt and must be refused; decoding it as a small-distance match
+    // hands back invented bytes with no error.
+    #[test]
+    fn undefined_opcodes_are_refused() {
+        let undefined: Vec<u8> = [0x1E, 0x26, 0x2E, 0x36, 0x3E]
+            .into_iter()
+            .chain(0x70..=0x7F)
+            .chain(0xD0..=0xDF)
+            .collect();
+        assert_eq!(undefined.len(), 37);
+        for opc in undefined {
+            // Enough trailing bytes for any opcode's operands, and prior
+            // output for a match to copy from, so only the table decides.
+            let mut s = vec![0xE3, b'a', b'b', b'c', opc, 0x01, 0x02, 0x03, 0x04];
+            eos(&mut s);
+            assert!(
+                lzvn_decode(&s, 64).is_err(),
+                "opcode {opc:#04x} is undefined and must not decode"
+            );
+        }
     }
 }

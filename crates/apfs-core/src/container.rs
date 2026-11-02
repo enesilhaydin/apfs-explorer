@@ -13,8 +13,9 @@ use crate::volume::VolumeRole;
 /// `list_volumes` returns.
 #[derive(Debug, Clone)]
 pub struct VolumeInfo {
-    /// Position of this volume's `fs_oid` in the container superblock's
-    /// `fs_oids` array (0-based).
+    /// Slot of this volume's oid in the container superblock's `nx_fs_oid`
+    /// array (0-based). Empty slots count: a volume after a deleted one keeps
+    /// its slot.
     pub index: u32,
     /// Volume UUID (`apfs_vol_uuid` at offset 0xF0 in the VSB).
     pub uuid: [u8; 16],
@@ -39,7 +40,36 @@ const fn oor() -> ContainerError {
 pub enum ContainerError {
     Io(BlockError),
     Parse(ParseError),
+    /// The container declares an on-disk feature this implementation does not
+    /// support (currently: Fusion two-device addressing). Refusing is
+    /// deliberate - reading such a container would resolve tier-2 addresses
+    /// against the wrong device.
+    UnsupportedContainer {
+        incompatible_features: u64,
+    },
+    /// A compressed file's content or size could not be produced from its
+    /// decmpfs state. The cause is kept: a host decides differently for a
+    /// dataless file, an encoding it cannot decode and a damaged one.
+    Decmpfs(crate::decmpfs::DecmpfsError),
+    /// The checkpoint names no block for an ephemeral object the container
+    /// superblock refers to (the space manager, for one).
+    MissingEphemeral {
+        oid: u64,
+    },
 }
+
+/// `spaceman_phys_t`: after the 32-byte object header and four u32 sizes
+/// (block size, blocks per chunk, chunks per chunk-info block, chunk-info
+/// blocks per address block) come the per-device records, 48 bytes each; the
+/// main device's free-block count is its fourth field, at byte 24 of the
+/// record.
+const SPACEMAN_MAIN_FREE_COUNT: usize = 48 + 24;
+/// The three free queues (internal pool, main device, second tier) follow at
+/// byte 200, 40 bytes each, opening with `sfq_count`: blocks whose release is
+/// queued until the transactions that could still read them are gone. macOS
+/// counts the main device's queue as free space (measured: `statvfs`
+/// `f_bavail` equals `sm_free_count` plus this count, on two images).
+const SPACEMAN_MAIN_FREE_QUEUE_COUNT: usize = 200 + 40;
 impl From<BlockError> for ContainerError {
     fn from(e: BlockError) -> Self {
         Self::Io(e)
@@ -48,6 +78,11 @@ impl From<BlockError> for ContainerError {
 impl From<ParseError> for ContainerError {
     fn from(e: ParseError) -> Self {
         Self::Parse(e)
+    }
+}
+impl From<crate::decmpfs::DecmpfsError> for ContainerError {
+    fn from(e: crate::decmpfs::DecmpfsError) -> Self {
+        Self::Decmpfs(e)
     }
 }
 
@@ -65,12 +100,66 @@ impl Container {
         // block 0 may be a stale copy; the authoritative superblock is the
         // newest valid one in the checkpoint descriptor ring (M1b).
         let superblock = crate::checkpoint::latest_superblock(dev, &bootstrap)?;
+        // A Fusion container tags tier-2 block addresses with the high bit and
+        // resolves them against the second device. We implement neither, so
+        // every such address would silently read the wrong block. Refuse the
+        // container rather than mis-address it.
+        if superblock.is_fusion() {
+            return Err(ContainerError::UnsupportedContainer {
+                incompatible_features: superblock.incompatible_features,
+            });
+        }
+        // The block count bounds every address the container can name. A
+        // device shorter than that holds only part of the container and every
+        // access past its end would fail one by one, so the container is
+        // refused now; a larger device (an image with slack) is fine, and a
+        // device that cannot report its size (0) is bounded by its own reads.
+        let container_bytes = superblock
+            .block_count
+            .checked_mul(u64::from(superblock.block_size))
+            .ok_or(ParseError::BadField {
+                field: "nx_block_count",
+                value: superblock.block_count,
+            })?;
+        let dev_size = dev.size();
+        if dev_size != 0 && container_bytes > dev_size {
+            return Err(ContainerError::Parse(ParseError::BadField {
+                field: "nx_block_count",
+                value: superblock.block_count,
+            }));
+        }
         Ok(Self { superblock })
     }
 
     /// Return the container UUID (`nx_uuid` from the container superblock).
     pub fn container_uuid(&self) -> [u8; 16] {
         self.superblock.uuid
+    }
+
+    /// Free blocks on the main device as macOS reports them through statfs:
+    /// the space manager's free count (`sm_dev[MAIN].sm_free_count`) plus the
+    /// blocks queued for release on the main free queue, which the next
+    /// transaction hands back. The space manager is an ephemeral object of
+    /// the current checkpoint, reached through its checkpoint map.
+    pub fn free_block_count<D: BlockDevice>(&self, dev: &mut D) -> Result<u64, ContainerError> {
+        let nx = &self.superblock;
+        let paddr = crate::checkpoint::ephemeral_paddr(dev, nx, nx.spaceman_oid)?.ok_or(
+            ContainerError::MissingEphemeral {
+                oid: nx.spaceman_oid,
+            },
+        )?;
+        let bsz = nx.block_size as usize;
+        let off = paddr
+            .checked_mul(bsz as u64)
+            .ok_or(ContainerError::MissingEphemeral {
+                oid: nx.spaceman_oid,
+            })?;
+        let mut buf = vec![0u8; bsz];
+        dev.read_at(off, &mut buf)?;
+        crate::checksum::verify_block(&buf)?;
+        let free = crate::endian::u64_le(&buf, SPACEMAN_MAIN_FREE_COUNT)?;
+        let queued = crate::endian::u64_le(&buf, SPACEMAN_MAIN_FREE_QUEUE_COUNT)?;
+        Ok(free.saturating_add(queued))
     }
 
     /// Resolve every container `fs_oid` via the container object map and return
@@ -114,7 +203,7 @@ impl Container {
             crate::omap::Omap::open(dev, self.superblock.omap_oid, self.superblock.block_size)?;
         let xid = self.superblock.obj.xid;
         let mut out = Vec::new();
-        for (idx, &fs_oid) in self.superblock.fs_oids.iter().enumerate() {
+        for &(slot, fs_oid) in &self.superblock.fs_slots {
             if let Some(paddr) = omap.resolve(dev, fs_oid, xid, self.superblock.block_size)? {
                 let bsz = self.superblock.block_size as usize;
                 let mut buf = vec![0u8; bsz];
@@ -127,7 +216,7 @@ impl Container {
                 if let Ok(v) = crate::volume::VolumeSuperblock::parse(&buf) {
                     let role = v.volume_role();
                     out.push(VolumeInfo {
-                        index: idx as u32,
+                        index: slot,
                         uuid: v.uuid,
                         name: v.name,
                         role,
@@ -290,10 +379,38 @@ mod tests {
         // xp_desc_blocks @104 = 2 (contiguous), xp_desc_base @112 = 1
         b[104..108].copy_from_slice(&2u32.to_le_bytes());
         b[112..120].copy_from_slice(&1i64.to_le_bytes());
+        // xp_data_blocks @108 = 4, xp_data_base @120 = 3
+        b[108..112].copy_from_slice(&4u32.to_le_bytes());
+        b[120..128].copy_from_slice(&3i64.to_le_bytes());
         // omap_oid @160 = 0 (points nowhere, but open() won't reach list_user_volumes)
         let ck = fletcher64(&b);
         b[0..8].copy_from_slice(&ck.to_le_bytes());
         b
+    }
+
+    /// A superblock that declares more blocks than the device holds
+    /// describes a container that is not there; every address past the
+    /// device would fail, so the container is refused up front.
+    #[test]
+    fn open_rejects_a_container_larger_than_its_device() {
+        let boot = make_nx_block(5);
+        // 64 blocks declared, 4 present.
+        let mut data = vec![0u8; 4096 * 4];
+        data[..4096].copy_from_slice(&boot);
+        let mut dev = MemDev(data);
+        let err = Container::open(&mut dev)
+            .err()
+            .expect("a container larger than the device must be refused");
+        assert!(
+            matches!(
+                err,
+                ContainerError::Parse(ParseError::BadField {
+                    field: "nx_block_count",
+                    value: 64
+                })
+            ),
+            "the error must name the block count, got: {err:?}"
+        );
     }
 
     #[test]
@@ -528,6 +645,8 @@ mod tests {
             b[40..48].copy_from_slice(&64u64.to_le_bytes()); // block_count
             b[104..108].copy_from_slice(&2u32.to_le_bytes()); // xp_desc_blocks=2
             b[112..120].copy_from_slice(&1i64.to_le_bytes()); // xp_desc_base=1
+            b[108..112].copy_from_slice(&4u32.to_le_bytes()); // xp_data_blocks=4
+            b[120..128].copy_from_slice(&8i64.to_le_bytes()); // xp_data_base=8 (blocks 8..12)
             b[160..168].copy_from_slice(&4u64.to_le_bytes()); // omap_oid=4 (physical)
             b[180..184].copy_from_slice(&1u32.to_le_bytes()); // max_file_systems=1
             b[184..192].copy_from_slice(&6u64.to_le_bytes()); // fs_oids[0]=6
@@ -543,6 +662,7 @@ mod tests {
         omap_raw[8..16].copy_from_slice(&4u64.to_le_bytes());
         omap_raw[16..24].copy_from_slice(&1u64.to_le_bytes());
         omap_raw[24..28].copy_from_slice(&OBJECT_TYPE_OMAP.to_le_bytes());
+        omap_raw[40..44].copy_from_slice(&(OBJECT_TYPE_BTREE | 0x4000_0000).to_le_bytes());
         omap_raw[48..56].copy_from_slice(&5u64.to_le_bytes()); // tree_oid=5
         let ck2 = fletcher64(&omap_raw);
         omap_raw[0..8].copy_from_slice(&ck2.to_le_bytes());
@@ -556,6 +676,7 @@ mod tests {
         root[8..16].copy_from_slice(&5u64.to_le_bytes());
         root[16..24].copy_from_slice(&1u64.to_le_bytes());
         root[24..28].copy_from_slice(&OBJECT_TYPE_BTREE.to_le_bytes());
+        root[28..32].copy_from_slice(&OBJECT_TYPE_OMAP.to_le_bytes()); // o_subtype
         let flags = BTNODE_LEAF | BTNODE_FIXED_KV_SIZE | BTNODE_ROOT;
         root[32..34].copy_from_slice(&flags.to_le_bytes());
         root[36..40].copy_from_slice(&1u32.to_le_bytes()); // nkeys=1
@@ -680,7 +801,7 @@ mod tests {
         // Container::open must select xid=9 via latest_superblock.
         let boot = make_nx_block(5);
         let newer = make_nx_block(9);
-        let mut data = vec![0u8; 4096 * 4];
+        let mut data = vec![0u8; 4096 * 64];
         data[..4096].copy_from_slice(&boot); // block 0 = bootstrap (xid=5)
         data[4096..8192].copy_from_slice(&newer); // block 1 = descriptor ring slot (xid=9)
         let mut dev = MemDev(data);
@@ -748,7 +869,7 @@ mod tests {
         // Container::open must select xid=7.
         let boot = make_nx_block(3);
         let newer = make_nx_block(7);
-        let mut data = vec![0u8; 4096 * 4];
+        let mut data = vec![0u8; 4096 * 64];
         data[..4096].copy_from_slice(&boot);
         data[4096..8192].copy_from_slice(&newer);
         let mut dev = MemDev(data);

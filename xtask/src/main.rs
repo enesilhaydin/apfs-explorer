@@ -648,6 +648,39 @@ fn gen_scratch(path: &str, size_mb: u64) -> Result<String, String> {
     ))
 }
 
+/// Detach a device macOS may still be busy with.
+///
+/// A volume mounted moments ago is still being looked at by Spotlight and
+/// friends, and `hdiutil detach` answers "Resource busy" while they hold it.
+/// That is not a property of the image: the same image detaches on the next
+/// try. So wait a little and try again, and only as a last resort force it.
+fn detach_with_retry(parent_dev: &str) -> Result<(), String> {
+    const ATTEMPTS: u32 = 8;
+    let mut last_err = String::new();
+    for attempt in 0..ATTEMPTS {
+        let det = Command::new("hdiutil")
+            .args(["detach", parent_dev])
+            .output()
+            .map_err(|e| format!("hdiutil detach spawn: {e}"))?;
+        if det.status.success() {
+            return Ok(());
+        }
+        last_err = String::from_utf8_lossy(&det.stderr).trim().to_string();
+        std::thread::sleep(std::time::Duration::from_millis(250 * (attempt as u64 + 1)));
+    }
+    let forced = Command::new("hdiutil")
+        .args(["detach", "-force", parent_dev])
+        .output()
+        .map_err(|e| format!("hdiutil detach -force spawn: {e}"))?;
+    if forced.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "hdiutil detach {parent_dev}: {last_err} (and -force failed: {})",
+        String::from_utf8_lossy(&forced.stderr).trim()
+    ))
+}
+
 /// Attach a scratch image read-only, run `fsck_apfs -n`, list snapshots,
 /// then detach - cleaning up even on error so no /dev/diskN is leaked.
 ///
@@ -767,16 +800,9 @@ fn verify_scratch(path: &str) -> Result<String, String> {
     };
 
     // --- Detach (always, even on fsck dirty) ---
-    let det = Command::new("hdiutil")
-        .args(["detach", &parent_dev])
-        .output()
-        .map_err(|e| format!("hdiutil detach spawn: {e}"))?;
-    if !det.status.success() {
-        return Err(format!(
-            "hdiutil detach {parent_dev}: {}",
-            String::from_utf8_lossy(&det.stderr)
-        ));
-    }
+    // The fsck verdict is already in hand; a detach that needs a retry must
+    // not turn a clean container into a reported failure.
+    detach_with_retry(&parent_dev)?;
 
     if !fsck_clean {
         return Err(format!(

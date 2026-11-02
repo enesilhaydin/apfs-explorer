@@ -30,7 +30,11 @@ mod clone_tests {
     use apfs_core::container::Container;
     use apfs_core::omap::Omap;
     use apfs_core::volume::VolumeSuperblock;
-    use apfs_write::file::{clone_file, overwrite_existing_file, unlink, write_file};
+    use apfs_write::file::{
+        clone_file, overwrite_existing_file, truncate_file_fast, unlink, write_file,
+        TruncateOutcome,
+    };
+    use apfs_write::snapshot::create_snapshot;
     use apfs_write::txn::Transaction;
     use std::process::Command;
 
@@ -147,12 +151,47 @@ mod clone_tests {
     }
 
     fn run_fsck(img: &str) {
-        // Mount via hdiutil to trigger fsck, or run fsck_apfs directly.
-        let status = Command::new("hdiutil")
-            .args(["verify", img])
-            .status()
-            .expect("hdiutil verify");
-        assert!(status.success(), "hdiutil verify failed (image corrupt)");
+        // Attach the raw image WITHOUT mounting and run Apple's fsck_apfs against
+        // the APFS container partition - the authoritative on-disk consistency
+        // oracle. (hdiutil verify only validates a UDIF checksum, which a raw .img
+        // does not have, so it is not a corruption check at all.)
+        let out = Command::new("hdiutil")
+            .args([
+                "attach",
+                "-nomount",
+                "-imagekey",
+                "diskimage-class=CRawDiskImage",
+                img,
+            ])
+            .output()
+            .expect("hdiutil attach");
+        assert!(out.status.success(), "hdiutil attach failed");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        let mut apfs_dev: Option<String> = None;
+        let mut parent_dev: Option<String> = None;
+        for line in stdout.lines() {
+            let dev = line.split_whitespace().next().unwrap_or("");
+            if !dev.starts_with("/dev/disk") {
+                continue;
+            }
+            let tail = dev.trim_start_matches("/dev/disk");
+            if parent_dev.is_none() && !tail.contains('s') {
+                parent_dev = Some(dev.to_string()); // whole-disk node, for detach
+            }
+            if apfs_dev.is_none() && line.contains("Apple_APFS") {
+                apfs_dev = Some(dev.to_string()); // the APFS container partition
+            }
+        }
+        let parent = parent_dev.expect("no whole-disk node in hdiutil attach output");
+        let apfs = apfs_dev.expect("no Apple_APFS partition in hdiutil attach output");
+        let rdev = apfs.replacen("/dev/disk", "/dev/rdisk", 1);
+
+        let fsck = Command::new("fsck_apfs").args(["-n", &rdev]).status();
+        // Always detach, even if fsck failed, so we never leak an attachment.
+        let _ = Command::new("hdiutil").args(["detach", &parent]).status();
+        let fsck = fsck.expect("fsck_apfs spawn");
+        assert!(fsck.success(), "fsck_apfs reported corruption on {rdev}");
     }
 
     // -----------------------------------------------------------------------
@@ -433,5 +472,185 @@ mod clone_tests {
         assert!(result.is_err(), "C7: clone to existing name should fail");
 
         println!("C7 PASS: duplicate dst name rejected");
+    }
+
+    // -----------------------------------------------------------------------
+    // C8: clone THEN snapshot - the image must stay fsck-clean. Real-disk repro
+    // of the omap key-order corruption found on a USB.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn c8_clone_then_snapshot_fsck_clean() {
+        if !check_gate() {
+            println!("C8: APFS_WRITE_SCRATCH not set - skip");
+            return;
+        }
+        gen_scratch();
+        let content = vec![0x88u8; 80 * 1024];
+        {
+            let (vsb, omap) = read_vsb_omap_raw(IMG);
+            let mut txn = open_txn(IMG);
+            write_file(&mut txn, &vsb, &omap, 2, "c8_src.bin", &content).expect("write");
+            txn.commit().expect("commit write");
+        }
+        {
+            let (vsb, omap) = read_vsb_omap_raw(IMG);
+            let mut txn = open_txn(IMG);
+            clone_file(&mut txn, &vsb, &omap, 2, "c8_src.bin", 2, "c8_dst.bin").expect("clone");
+            txn.commit().expect("commit clone");
+        }
+        {
+            let (vsb, omap) = read_vsb_omap_raw(IMG);
+            let mut txn = open_txn(IMG);
+            create_snapshot(&mut txn, &vsb, &omap, "c8-snap").expect("snapshot");
+            txn.commit().expect("commit snapshot");
+        }
+        run_fsck(IMG);
+        println!("C8 PASS: clone + snapshot stays fsck-clean");
+    }
+
+    // -----------------------------------------------------------------------
+    // C9: snapshot WITHOUT a preceding clone - control that isolates whether the
+    // corruption is snapshot-alone or the clone+snapshot interaction.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn c9_snapshot_only_fsck_clean() {
+        if !check_gate() {
+            println!("C9: APFS_WRITE_SCRATCH not set - skip");
+            return;
+        }
+        gen_scratch();
+        let content = vec![0x99u8; 80 * 1024];
+        {
+            let (vsb, omap) = read_vsb_omap_raw(IMG);
+            let mut txn = open_txn(IMG);
+            write_file(&mut txn, &vsb, &omap, 2, "c9_src.bin", &content).expect("write");
+            txn.commit().expect("commit write");
+        }
+        {
+            let (vsb, omap) = read_vsb_omap_raw(IMG);
+            let mut txn = open_txn(IMG);
+            create_snapshot(&mut txn, &vsb, &omap, "c9-snap").expect("snapshot");
+            txn.commit().expect("commit snapshot");
+        }
+        run_fsck(IMG);
+        println!("C9 PASS: snapshot-only stays fsck-clean");
+    }
+
+    // -----------------------------------------------------------------------
+    // C10: truncate src to 0 - clone still readable (refcnt protects shared
+    // blocks). Regression: truncate_file_fast freed clone-shared blocks without
+    // consulting the extref refcnt that clone_file bumps, unlike unlink/overwrite.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn c10_truncate_src_clone_survives() {
+        if !check_gate() {
+            println!("C10: APFS_WRITE_SCRATCH not set - skip");
+            return;
+        }
+        gen_scratch();
+
+        let content = vec![0xC1u8; 100 * 1024]; // 100 KiB, multi-extent
+
+        // Write source.
+        {
+            let (vsb, omap) = read_vsb_omap_raw(IMG);
+            let mut txn = open_txn(IMG);
+            write_file(&mut txn, &vsb, &omap, 2, "c10_src.bin", &content).expect("write");
+            txn.commit().expect("commit");
+        }
+        // Clone to dst (shares src's physical extents via refcnt).
+        {
+            let (vsb, omap) = read_vsb_omap_raw(IMG);
+            let mut txn = open_txn(IMG);
+            clone_file(&mut txn, &vsb, &omap, 2, "c10_src.bin", 2, "c10_dst.bin").expect("clone");
+            txn.commit().expect("commit clone");
+        }
+        // Truncate the source to 0 - drops every extent. The blocks are still
+        // referenced by the clone, so they must be refcnt-decremented, not freed.
+        {
+            let (vsb, omap) = read_vsb_omap_raw(IMG);
+            let mut txn = open_txn(IMG);
+            let outcome = truncate_file_fast(
+                &mut txn,
+                &vsb,
+                &omap,
+                2,
+                "c10_src.bin",
+                0,
+                content.len() as u64,
+            )
+            .expect("truncate_file_fast");
+            assert!(
+                matches!(outcome, TruncateOutcome::Applied),
+                "C10: truncate-to-0 should take the fast path (whole-extent drops), got {outcome:?}"
+            );
+            txn.commit().expect("commit truncate");
+        }
+
+        // The clone must still read its full original content.
+        let clone_data = read_file(IMG, "/c10_dst.bin").expect("C10: clone should still exist");
+        assert_eq!(
+            clone_data, content,
+            "C10: clone content corrupted after truncating the source (clone-shared blocks freed)"
+        );
+
+        run_fsck(IMG);
+        println!("C10 PASS: clone survives truncate-to-zero of source");
+    }
+
+    // -----------------------------------------------------------------------
+    // C11: snapshot THEN clone THEN delete source. With a snapshot pinning the
+    // extents, clone_file records the shared reference as a KIND_UPDATE(+1)
+    // extentref instead of bumping a KIND_NEW refcount. A free path that reads
+    // the refcnt field of an UPDATE record as if it were an absolute count
+    // sees 1, removes the record and frees blocks that both the snapshot and
+    // the surviving clone still reference.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn c11_snapshot_clone_delete_source_keeps_data() {
+        if !check_gate() {
+            println!("C11: APFS_WRITE_SCRATCH not set - skip");
+            return;
+        }
+        gen_scratch();
+
+        let content = vec![0xD1u8; 100 * 1024];
+
+        {
+            let (vsb, omap) = read_vsb_omap_raw(IMG);
+            let mut txn = open_txn(IMG);
+            write_file(&mut txn, &vsb, &omap, 2, "c11_src.bin", &content).expect("write");
+            txn.commit().expect("commit write");
+        }
+        // Snapshot pins the current extents; the live extentref tree no longer
+        // carries a KIND_NEW record for them.
+        {
+            let (vsb, omap) = read_vsb_omap_raw(IMG);
+            let mut txn = open_txn(IMG);
+            create_snapshot(&mut txn, &vsb, &omap, "c11-snap").expect("snapshot");
+            txn.commit().expect("commit snapshot");
+        }
+        {
+            let (vsb, omap) = read_vsb_omap_raw(IMG);
+            let mut txn = open_txn(IMG);
+            clone_file(&mut txn, &vsb, &omap, 2, "c11_src.bin", 2, "c11_dst.bin").expect("clone");
+            txn.commit().expect("commit clone");
+        }
+        {
+            let (vsb, omap) = read_vsb_omap_raw(IMG);
+            let mut txn = open_txn(IMG);
+            unlink(&mut txn, &vsb, &omap, 2, "c11_src.bin").expect("unlink src");
+            txn.commit().expect("commit unlink");
+        }
+
+        assert!(!file_exists(IMG, "/c11_src.bin"), "C11: src should be gone");
+        let clone_data = read_file(IMG, "/c11_dst.bin").expect("C11: clone should still exist");
+        assert_eq!(
+            clone_data, content,
+            "C11: clone content corrupted after deleting the source of a snapshot-pinned clone"
+        );
+
+        run_fsck(IMG);
+        println!("C11 PASS: snapshot + clone + delete source keeps data and stays fsck-clean");
     }
 }

@@ -7,9 +7,10 @@
 //!   mounted by an elevated child in the user's session is NOT visible to the
 //!   non-elevated Explorer (separate logon session), which is why the old
 //!   approach "mounted" but nothing appeared in This PC.
-//! * No per-mount **UAC** prompt: the launcher is already privileged and its
-//!   service class is ACL'd (`Security=D:P(A;;RPWPLC;;;WD)`) to let any user
-//!   start/stop, so the non-elevated GUI just asks it over the launcher pipe.
+//! * No per-mount **UAC** prompt: the launcher is already privileged, and its
+//!   service classes let Administrators and SYSTEM start and stop them
+//!   (`Security=D:P(A;;RPWPLC;;;BA)(A;;RPWPLC;;;SY)`); the app itself is
+//!   elevated once when it opens (app.manifest), so it can ask.
 //! * Clean, structured **start/stop** via `launchctl` - the GUI picks the drive
 //!   letter itself and passes it in, so there is nothing to scrape back out of a
 //!   log file (the old `find("APFS mounted at ")` returned a stale letter).

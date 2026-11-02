@@ -96,7 +96,7 @@ xtask/CLAUDE.md
 .claude/
 
 # Dev-internal documentation + tooling kept local-only (never published).
-/docs/superpowers/
+# (The design-notes directory is excluded through .git/info/exclude.)
 /docs/ROADMAP.md
 /docs/icon-prompts.md
 /docs/RESUME-*.md

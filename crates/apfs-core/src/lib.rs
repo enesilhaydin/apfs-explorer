@@ -8,6 +8,8 @@ pub use block_device::{
     BlockDevice, BlockError, FileBlockDeviceRw, WritableBlockDevice, WritableOffsetBlockDevice,
 };
 
+pub mod gpt;
+
 pub mod endian;
 pub use endian::ParseError;
 
@@ -48,5 +50,11 @@ pub use xattr::{XattrDstream, XattrEntry};
 pub mod lzvn;
 pub use lzvn::lzvn_decode;
 
+pub mod lzbitmap;
+pub use lzbitmap::lzbitmap_decode;
+
+/// Name normalization and case folding the way APFS compares and hashes
+/// names on case-insensitive and normalization-insensitive volumes.
+pub mod case_fold;
 pub mod decmpfs;
 pub use decmpfs::{decompress as decmpfs_decompress, DecmpfsError, DecmpfsHeader};

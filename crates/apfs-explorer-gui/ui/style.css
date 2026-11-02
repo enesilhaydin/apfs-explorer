@@ -70,6 +70,18 @@ body {
   letter-spacing: -0.01em;
 }
 
+.app-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.app-version {
+  font-size: 11px;
+  color: hsl(var(--muted-foreground));
+  user-select: text;
+}
+
 /* ---------- layout ---------- */
 .content {
   flex: 1;

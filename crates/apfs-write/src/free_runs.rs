@@ -73,6 +73,49 @@ impl ChunkFreeRuns {
         Some((p, n))
     }
 
+    /// Take up to `n` bits starting exactly at `bit`, when `bit` is free.
+    /// Returns the start (`bit`) and how many were free from there, at most
+    /// `n`. What lies before `bit` in its run stays free.
+    pub fn alloc_at(&mut self, bit: u32, n: u32) -> Option<(u32, u32)> {
+        if n == 0 {
+            return None;
+        }
+        let (&p, &c) = self.by_addr.range(..=bit).next_back()?;
+        let end = p.checked_add(c)?;
+        if bit >= end {
+            return None;
+        }
+        let take = n.min(end - bit);
+        self.by_size.remove(&(c, p));
+        self.by_addr.remove(&p);
+        if bit > p {
+            self.by_size.insert((bit - p, p));
+            self.by_addr.insert(p, bit - p);
+        }
+        let after = bit + take;
+        if after < end {
+            self.by_size.insert((end - after, after));
+            self.by_addr.insert(after, end - after);
+        }
+        Some((bit, take))
+    }
+
+    /// Take `n` bits from the start of the smallest run of at least `room`
+    /// bits (`room` >= `n`), so the allocations after it can continue in
+    /// the same run.
+    pub fn alloc_in_room(&mut self, room: u32, n: u32) -> Option<(u32, u32)> {
+        if n == 0 || room < n {
+            return None;
+        }
+        let &(c, p) = self.by_size.range((room, 0u32)..).next()?;
+        self.alloc_at(p, n).filter(|_| c >= room)
+    }
+
+    /// Length of the longest free run, 0 when none.
+    pub fn longest(&self) -> u32 {
+        self.by_size.iter().next_back().map_or(0, |&(c, _)| c)
+    }
+
     /// Largest available run, capped at `cap`. Used when no run of length
     /// ≥ requested exists; caller may loop for the rest.
     pub fn alloc_largest(&mut self, cap: u32) -> Option<(u32, u32)> {
@@ -159,6 +202,39 @@ mod tests {
         let r = ChunkFreeRuns::from_bitmap(&bm, 128);
         assert_eq!(r.run_count(), 0);
         assert_eq!(r.total_free(), 0);
+    }
+
+    /// Free runs at 0..1, 3..4 and 10..74 of a 128-bit chunk.
+    fn holes_and_room() -> ChunkFreeRuns {
+        let mut bm = vec![0xFFu8; 16];
+        for bit in [0usize, 3].into_iter().chain(10..74) {
+            bm[bit / 8] &= !(1u8 << (bit % 8));
+        }
+        ChunkFreeRuns::from_bitmap(&bm, 128)
+    }
+
+    #[test]
+    fn alloc_at_takes_from_the_given_bit_only() {
+        let mut r = holes_and_room();
+        // Inside the run 10..74: from bit 20, as much as asked.
+        assert_eq!(r.alloc_at(20, 5), Some((20, 5)));
+        // The run is now 10..20 and 25..74; the next bit continues it.
+        assert_eq!(r.alloc_at(25, 100), Some((25, 49)));
+        assert_eq!(r.alloc_at(74, 1), None, "an allocated bit is no start");
+        assert_eq!(r.alloc_at(1, 1), None);
+        assert_eq!(r.alloc_at(10, 10), Some((10, 10)));
+        assert_eq!(r.total_free(), 2);
+    }
+
+    #[test]
+    fn alloc_in_room_skips_runs_too_short_for_it() {
+        let mut r = holes_and_room();
+        // Best fit for one block would take bit 0; asking for room of 16
+        // takes the start of the run that has it.
+        assert_eq!(r.alloc_in_room(16, 1), Some((10, 1)));
+        assert_eq!(r.alloc_in_room(16, 3), Some((11, 3)));
+        assert_eq!(r.alloc_in_room(100, 1), None);
+        assert_eq!(r.total_free(), 2 + 64 - 4);
     }
 
     #[test]

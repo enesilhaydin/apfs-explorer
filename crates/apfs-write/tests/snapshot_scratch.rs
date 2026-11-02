@@ -2440,7 +2440,7 @@ mod usb_tests {
             }
         };
 
-        if std::env::var("APFS_WRITE_USB_ROUND2_CIB_COW_READY").as_deref() != Ok("1") {
+        if std::env::var("APFS_WRITE_USB_CIB_COW_READY").as_deref() != Ok("1") {
             panic!(
                 "SAFETY ABORT: APFS_WRITE_USB real-device mutation is disabled. \
                  that spaceman CIB/bitmap updates must be copy-on-write, \
@@ -2647,10 +2647,8 @@ mod usb_tests {
                 return;
             }
         };
-        if std::env::var("APFS_WRITE_USB_ROUND2_CIB_COW_READY").as_deref() != Ok("1") {
-            panic!(
-                "SAFETY ABORT: set APFS_WRITE_USB_ROUND2_CIB_COW_READY=1 to enable real writes."
-            );
+        if std::env::var("APFS_WRITE_USB_CIB_COW_READY").as_deref() != Ok("1") {
+            panic!("SAFETY ABORT: set APFS_WRITE_USB_CIB_COW_READY=1 to enable real writes.");
         }
 
         println!("[safety] asserting {dev} is Apple_APFS on external disk …");
@@ -2729,7 +2727,7 @@ mod usb_tests {
     // and a full cleanup. fsck must stay CLEAN on the container at every step.
     //
     // Same gating + safety guard as decisive_file_write_on_real_usb:
-    //   sudo env APFS_WRITE_USB=/dev/diskXs2 APFS_WRITE_USB_ROUND2_CIB_COW_READY=1 \
+    //   sudo env APFS_WRITE_USB=/dev/diskXs2 APFS_WRITE_USB_CIB_COW_READY=1 \
     //     <binary> usb_tests::decisive_faz_a_on_real_usb --nocapture --exact
     //
     // STATUS: 4 of 5 stages (mkdir + multi-block write + duplicate-Err +
@@ -2753,10 +2751,8 @@ mod usb_tests {
                 return;
             }
         };
-        if std::env::var("APFS_WRITE_USB_ROUND2_CIB_COW_READY").as_deref() != Ok("1") {
-            panic!(
-                "SAFETY ABORT: set APFS_WRITE_USB_ROUND2_CIB_COW_READY=1 to enable real writes."
-            );
+        if std::env::var("APFS_WRITE_USB_CIB_COW_READY").as_deref() != Ok("1") {
+            panic!("SAFETY ABORT: set APFS_WRITE_USB_CIB_COW_READY=1 to enable real writes.");
         }
         println!("[safety] asserting {dev} is Apple_APFS on external disk …");
         let (whole_disk, dev_size, label) = assert_external_apfs(&dev);

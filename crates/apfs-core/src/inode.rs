@@ -130,12 +130,18 @@ pub struct Inode {
     pub parent_id: u64,
     pub private_id: u64,
     pub internal_flags: u64,
+    /// The u32 at offset 56, which APFS uses for two different things: a
+    /// directory's child count, and a file's hard-link count.
+    pub nchildren_or_nlink: u32,
     /// mode_t (u16) @ j_inode_val_t byte offset 80 (the APFS specification).
     pub mode: u16,
     /// BSD file flags (u32) @ offset 68. Carries UF_HIDDEN (0x8000),
     /// UF_IMMUTABLE (0x2), UF_APPEND (0x4), SF_RESTRICTED (0x80000), etc.
     /// Round-trips Windows FILE_ATTRIBUTE_HIDDEN ↔ UF_HIDDEN.
     pub bsd_flags: u32,
+    /// The u32 at offset 64: a counter the kernel steps whenever the inode or
+    /// its content changes.
+    pub write_generation_counter: u32,
     /// File creation time (btime) - APFS ns since UNIX epoch, offset 16.
     pub create_time: u64,
     /// File modification time (mtime) - APFS ns since UNIX epoch, offset 24.
@@ -145,7 +151,34 @@ pub struct Inode {
     /// Last access time (atime) - APFS ns since UNIX epoch, offset 40.
     pub access_time: u64,
     pub dstream: Option<JDstream>,
+    /// The name recorded in the inode itself (the `INO_EXT_TYPE_NAME` xfield).
+    /// Together with `parent_id` it describes the primary link: the file's
+    /// only name, or - when it has several - the one with the lowest sibling
+    /// id. A directory entry is what a lookup goes through; this is what the
+    /// inode says about itself, and the two have to agree.
+    pub name: Option<String>,
+    /// Bytes of the data stream covered by holes rather than blocks (the
+    /// `INO_EXT_TYPE_SPARSE_BYTES` xfield). Present exactly when the inode
+    /// carries the sparse flag.
+    pub sparse_bytes: Option<u64>,
+    /// The logical size of a compressed file as the kernel recorded it in the
+    /// inode (u64 @ offset 84). Meaningful only while
+    /// `INODE_HAS_UNCOMPRESSED_SIZE` is set in `internal_flags`; see
+    /// [`Inode::recorded_uncompressed_size`].
+    pub uncompressed_size: u64,
 }
+
+/// `INO_EXT_TYPE_SPARSE_BYTES`: the xfield counting a sparse file's hole bytes.
+pub const INO_EXT_TYPE_SPARSE_BYTES: u8 = 13;
+
+/// BSD flag: the file's content is stored compressed (decmpfs). This bit, not
+/// the presence of the com.apple.decmpfs attribute, is what decides how the
+/// file is read: with it clear the data stream is served, attribute or not.
+pub const UF_COMPRESSED: u32 = 0x20;
+
+/// `internal_flags` bit: `uncompressed_size` holds the compressed file's
+/// logical size, so it can be reported without reading the attribute.
+pub const INODE_HAS_UNCOMPRESSED_SIZE: u64 = 0x0004_0000;
 
 #[inline]
 fn round_up8(n: usize) -> usize {
@@ -166,9 +199,14 @@ impl Inode {
         let change_time = u64_le(val, 32)?;
         let access_time = u64_le(val, 40)?;
         let internal_flags = u64_le(val, 48)?;
+        let nchildren_or_nlink = u32_le(val, 56)?;
+        let write_generation_counter = u32_le(val, 64)?;
         let bsd_flags = u32_le(val, 68)?;
         let mode = u16_le(val, 80)?;
+        let uncompressed_size = u64_le(val, 84)?;
         let mut dstream = None;
+        let mut name: Option<String> = None;
+        let mut sparse_bytes: Option<u64> = None;
         if val.len() > INODE_XFIELDS_OFFSET {
             let num = u16_le(val, INODE_XFIELDS_OFFSET)? as usize;
             // xf_used_data is val[94..96]; not needed for the walk.
@@ -193,7 +231,10 @@ impl Inode {
                     len: val.len(),
                 })?;
                 let x_size = u16_le(val, ent + 2)? as usize;
-                if x_type == INO_EXT_TYPE_DSTREAM {
+                if x_type == INO_EXT_TYPE_DSTREAM
+                    || x_type == INO_EXT_TYPE_NAME
+                    || x_type == INO_EXT_TYPE_SPARSE_BYTES
+                {
                     let start = data0.checked_add(cur).ok_or(ParseError::Short {
                         at: data0,
                         need: cur,
@@ -204,8 +245,15 @@ impl Inode {
                         need: x_size,
                         len: val.len(),
                     })?;
-                    dstream = Some(JDstream::parse(field)?);
-                    break;
+                    if x_type == INO_EXT_TYPE_DSTREAM {
+                        dstream = Some(JDstream::parse(field)?);
+                    } else if x_type == INO_EXT_TYPE_SPARSE_BYTES {
+                        sparse_bytes = Some(u64_le(field, 0)?);
+                    } else {
+                        // NUL-terminated; the size counts the terminator.
+                        let bytes = field.split(|&b| b == 0).next().unwrap_or(field);
+                        name = Some(String::from_utf8_lossy(bytes).into_owned());
+                    }
                 }
                 cur = cur
                     .checked_add(round_up8(x_size))
@@ -217,17 +265,33 @@ impl Inode {
             }
         }
         Ok(Self {
+            name,
+            sparse_bytes,
             parent_id,
             private_id,
             internal_flags,
+            nchildren_or_nlink,
             bsd_flags,
+            write_generation_counter,
             create_time,
             mod_time,
             change_time,
             access_time,
             mode,
             dstream,
+            uncompressed_size,
         })
+    }
+
+    /// Whether the content is stored compressed (`UF_COMPRESSED`).
+    pub fn is_compressed(&self) -> bool {
+        self.bsd_flags & UF_COMPRESSED != 0
+    }
+
+    /// The compressed file's logical size, when the kernel recorded it in
+    /// the inode; `None` means the decmpfs header has to be consulted.
+    pub fn recorded_uncompressed_size(&self) -> Option<u64> {
+        (self.internal_flags & INODE_HAS_UNCOMPRESSED_SIZE != 0).then_some(self.uncompressed_size)
     }
 }
 

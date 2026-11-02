@@ -75,11 +75,12 @@ mod volume_size_macos {
         let parent = stdout
             .lines()
             .filter_map(|l| l.split_whitespace().next())
-            .find(|d| {
-                d.starts_with("/dev/disk") && !d.trim_start_matches("/dev/disk").contains('s')
-            })
-            .expect("no whole-disk node")
-            .to_string();
+            .filter_map(|d| d.strip_prefix("/dev/disk"))
+            .filter(|n| !n.contains('s'))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .min()
+            .map(|n| format!("/dev/disk{n}"))
+            .expect("no whole-disk node");
         let reported: Vec<(u64, u64)> = mounts.iter().map(|m| macos_statfs(m)).collect();
         let st = Command::new("hdiutil")
             .args(["detach", &parent])
@@ -148,11 +149,12 @@ mod volume_size_macos {
         let parent = stdout
             .lines()
             .filter_map(|l| l.split_whitespace().next())
-            .find(|d| {
-                d.starts_with("/dev/disk") && !d.trim_start_matches("/dev/disk").contains('s')
-            })
-            .expect("no whole-disk node")
-            .to_string();
+            .filter_map(|d| d.strip_prefix("/dev/disk"))
+            .filter(|n| !n.contains('s'))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .min()
+            .map(|n| format!("/dev/disk{n}"))
+            .expect("no whole-disk node");
 
         let filler: Vec<u8> = (0..10 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
         std::fs::write(format!("{mount}/filler.bin"), filler).expect("write filler");
@@ -208,11 +210,12 @@ mod volume_size_macos {
         let parent = stdout
             .lines()
             .filter_map(|l| l.split_whitespace().next())
-            .find(|d| {
-                d.starts_with("/dev/disk") && !d.trim_start_matches("/dev/disk").contains('s')
-            })
-            .expect("no whole-disk node")
-            .to_string();
+            .filter_map(|d| d.strip_prefix("/dev/disk"))
+            .filter(|n| !n.contains('s'))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .min()
+            .map(|n| format!("/dev/disk{n}"))
+            .expect("no whole-disk node");
         let container = stdout
             .lines()
             .find(|l| l.contains("EF57347C"))

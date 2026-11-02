@@ -127,11 +127,12 @@ mod truncate_extend {
         let parent = String::from_utf8_lossy(&out.stdout)
             .lines()
             .filter_map(|l| l.split_whitespace().next())
-            .find(|d| {
-                d.starts_with("/dev/disk") && !d.trim_start_matches("/dev/disk").contains('s')
-            })
-            .expect("no whole-disk node")
-            .to_string();
+            .filter_map(|d| d.strip_prefix("/dev/disk"))
+            .filter(|n| !n.contains('s'))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .min()
+            .map(|n| format!("/dev/disk{n}"))
+            .expect("no whole-disk node");
         let rdev = format!("{parent}s1").replacen("/dev/disk", "/dev/rdisk", 1);
         let fsck = Command::new("fsck_apfs").args(["-n", &rdev]).output();
         let _ = Command::new("hdiutil").args(["detach", &parent]).status();
@@ -292,11 +293,12 @@ mod truncate_extend {
         let parent = stdout
             .lines()
             .filter_map(|l| l.split_whitespace().next())
-            .find(|d| {
-                d.starts_with("/dev/disk") && !d.trim_start_matches("/dev/disk").contains('s')
-            })
-            .expect("whole disk")
-            .to_string();
+            .filter_map(|d| d.strip_prefix("/dev/disk"))
+            .filter(|n| !n.contains('s'))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .min()
+            .map(|n| format!("/dev/disk{n}"))
+            .expect("whole disk");
         std::fs::write(format!("{mount}/grown.bin"), vec![0x5Au8; 10_000]).expect("write");
         std::fs::write(format!("{mount}/preallocated.bin"), b"").expect("create");
         for (name, size) in [("grown.bin", "100000"), ("preallocated.bin", "65536")] {

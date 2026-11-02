@@ -70,16 +70,16 @@ commits its last group; NTFS flushed). "Cold" reads come after a remount
 
 | Workload | APFS Explorer | NTFS |
 |---|---:|---:|
-| Copy 300 files of 4 KiB into a folder | 1.6 s | 4.6 s |
-| Rename those 300 files | 231 ms | 1.8 s |
-| Delete 150 of them | 123 ms | 531 ms |
-| Copy 2000 files of 4 KiB into a folder | 6.3 s | 31.2 s |
-| Copy a 256 MiB file | 19.8 s | 15.8 s |
-| Copy a 1 GiB file | 85 s | 72 s |
-| 1000 scattered 4 KiB writes into the 256 MiB file | 1.8 s | 3.7 s |
-| List a 2000-file folder, cold / warm | 142 / 48 ms | 68 / 33 ms |
-| Read the edited 256 MiB file in 4 KiB requests, cold / warm | 6.2 / 6.0 s | 2.2 / 0.27 s |
-| Read 1 GiB in 1 MiB requests, cold | 6.7 s | 5.3 s |
+| Copy 300 files of 4 KiB into a folder | 1.7 s | 4.6 s |
+| Rename those 300 files | 233 ms | 1.8 s |
+| Delete 150 of them | 118 ms | 531 ms |
+| Copy 2000 files of 4 KiB into a folder | 4.8 s | 31.2 s |
+| Copy a 256 MiB file | 18.3 s | 15.8 s |
+| Copy a 1 GiB file | 79 s | 72 s |
+| 1000 scattered 4 KiB writes into the 256 MiB file | 1.9 s | 3.7 s |
+| List a 2000-file folder, cold / warm | 135 / 46 ms | 68 / 33 ms |
+| Read the edited 256 MiB file in 4 KiB requests, cold / warm | 3.5 / 3.6 s | 2.2 / 0.27 s |
+| Read 1 GiB in 1 MiB requests, cold | 6.6 s | 5.3 s |
 | Hash 2000 small files, cold | 4.9 s | 3.8 s |
 
 Why it goes both ways:
@@ -90,7 +90,7 @@ Why it goes both ways:
   about a second after its last operation (and when you unmount), so many
   small operations share one write to the drive.
 - Large files: every write and read crosses from the kernel to the
-  user-space process and back, and a 1 GiB copy writes about 15% slower
+  user-space process and back, and a 1 GiB copy writes about 10% slower
   than NTFS.
 - APFS writes an edit to new blocks (copy-on-write), so a file edited in
   many places is read from several places on the drive; NTFS edits in

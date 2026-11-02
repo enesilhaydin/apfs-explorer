@@ -132,10 +132,12 @@ function Set-Online([bool]$online) {
     Start-Sleep -Seconds 2
 }
 
-# Source files the copies use: 200 small files and one of 128 MiB.
+# Source files the copies use: 200 small files and one of 128 MiB. Made
+# again when any is missing: a run stopped while making them left the
+# folder empty, and every copy after it copied nothing.
 $src = Join-Path $work "src"
-if (-not (Test-Path $src)) {
-    New-Item -ItemType Directory $src | Out-Null
+if (@(Get-ChildItem $src -File -ErrorAction SilentlyContinue).Count -ne 201) {
+    New-Item -ItemType Directory -Force $src | Out-Null
     for ($i = 0; $i -lt 200; $i++) {
         $b = New-Object byte[] (4096 + $i * 37)
         for ($j = 0; $j -lt $b.Length; $j += 61) { $b[$j] = [byte](($i + $j) % 251) }

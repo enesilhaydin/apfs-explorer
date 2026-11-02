@@ -174,7 +174,13 @@ mod snapshot_tests {
                 continue;
             }
             let tail = dev.trim_start_matches("/dev/disk");
-            if parent_dev.is_none() && !tail.contains('s') {
+            // hdiutil can list disk10 before disk9: the image's own node is the
+            // lowest-numbered whole disk (shorter name, then smaller).
+            if !tail.contains('s')
+                && parent_dev
+                    .as_deref()
+                    .is_none_or(|p: &str| (p.len(), p) > (dev.len(), dev))
+            {
                 parent_dev = Some(dev.to_string());
             }
             if apfs_dev.is_none() && line.contains("Apple_APFS") {

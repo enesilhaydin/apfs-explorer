@@ -7,7 +7,7 @@ use crate::container::ContainerError;
 use crate::decmpfs::{DecmpfsError, DecmpfsHeader};
 use crate::endian::{u16_le, u32_le, ParseError};
 use crate::inode::Inode;
-use crate::jkey::{JKey, APFS_TYPE_DIR_REC};
+use crate::jkey::{JKey, APFS_TYPE_DIR_REC, APFS_TYPE_FILE_EXTENT};
 use crate::obj::{OBJECT_TYPE_BTREE, OBJECT_TYPE_BTREE_NODE, OBJECT_TYPE_FEXT_TREE};
 
 /// Deeper than any catalog tree macOS writes (a few levels at most); a chain
@@ -140,10 +140,12 @@ pub struct DirEntry {
 }
 
 /// Where a catalog key sorts, as far as a range walk needs: object id,
-/// record type, and the name hash of a hashed directory record (0 for any
-/// other key). Keys are ordered by object id, then type, then - for hashed
-/// directory records - hash and name, so positions order like the keys.
-type KeyPos = (u64, u8, u32);
+/// record type, and then the name hash of a hashed directory record or the
+/// logical address of a file extent (0 for any other key). Keys are ordered
+/// by object id, then type, then - for hashed directory records - hash and
+/// name, or - for file extents - logical address, so positions order like
+/// the keys.
+type KeyPos = (u64, u8, u64);
 
 /// The position of catalog key `k`. The hash is read only from a directory
 /// record long enough to carry one; on a volume that does not hash names
@@ -151,12 +153,17 @@ type KeyPos = (u64, u8, u32);
 /// an object (which look at id and type alone) are made there.
 fn key_pos(k: &[u8]) -> Result<KeyPos, ContainerError> {
     let jk = JKey::parse(k)?;
-    let hash = if jk.obj_type == APFS_TYPE_DIR_REC && k.len() >= 12 {
-        u32_le(k, 8)? >> 10
+    let third = if jk.obj_type == APFS_TYPE_DIR_REC && k.len() >= 12 {
+        u64::from(u32_le(k, 8)? >> 10)
+    } else if jk.obj_type == APFS_TYPE_FILE_EXTENT && k.len() >= 16 {
+        k.get(8..16)
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_le_bytes)
+            .ok_or_else(oor)?
     } else {
         0
     };
-    Ok((jk.obj_id, jk.obj_type, hash))
+    Ok((jk.obj_id, jk.obj_type, third))
 }
 
 /// The directory entry in record `(k, v)` of a directory whose names are
@@ -378,7 +385,7 @@ impl Catalog {
         obj_type: u8,
         f: &mut dyn FnMut(&[u8], &[u8]) -> Result<(), ContainerError>,
     ) -> Result<(), ContainerError> {
-        let range = ((obj_id, obj_type, 0), (obj_id, obj_type, u32::MAX));
+        let range = ((obj_id, obj_type, 0), (obj_id, obj_type, u64::MAX));
         self.walk(dev, &self.root, 0, Some(range), f)
     }
 
@@ -513,8 +520,21 @@ impl Catalog {
         dev: &mut D,
         stream_id: u64,
     ) -> Result<Vec<FileExtent>, ContainerError> {
-        use crate::jkey::APFS_TYPE_FILE_EXTENT;
+        self.stream_extents_in(dev, stream_id, 0, u64::MAX)
+    }
 
+    /// The extents of data stream `stream_id` that hold bytes of
+    /// `from..to`, in logical order. Extents are keyed by their logical
+    /// address, so only the leaves that can hold those are read: a small
+    /// read of a file edited in many places reads one path down the tree,
+    /// not the file's whole extent list.
+    fn stream_extents_in<D: BlockDevice>(
+        &self,
+        dev: &mut D,
+        stream_id: u64,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<FileExtent>, ContainerError> {
         let mut out: Vec<FileExtent> = Vec::new();
         let bsz = u64::from(self.block_size);
         let mut push = |logical_addr: u64, v: &[u8]| -> Result<(), ContainerError> {
@@ -549,12 +569,20 @@ impl Catalog {
         };
         match &self.sealed {
             Some(s) => {
-                self.for_each_fext(dev, &s.fext_root, stream_id, 0, &mut |logical, v| {
+                let span = (stream_id, from, to);
+                self.for_each_fext(dev, &s.fext_root, span, 0, &mut |logical, v| {
                     push(logical, v)
                 })?;
             }
             None => {
-                self.for_each_record_of(dev, stream_id, APFS_TYPE_FILE_EXTENT, &mut |k, v| {
+                // Extents do not overlap, so the one holding byte `from`
+                // starts in the child whose range takes in `from`; a child
+                // that ends below it holds none of them.
+                let range = (
+                    (stream_id, APFS_TYPE_FILE_EXTENT, from),
+                    (stream_id, APFS_TYPE_FILE_EXTENT, to),
+                );
+                self.walk(dev, &self.root, 0, Some(range), &mut |k, v| {
                     let jk = JKey::parse(k)?;
                     if jk.obj_type != APFS_TYPE_FILE_EXTENT || jk.obj_id != stream_id {
                         return Ok(());
@@ -568,24 +596,28 @@ impl Catalog {
                 })?;
             }
         }
+        // The leaves read hold neighbours of the range as well.
+        out.retain(|e| e.logical_addr < to && e.logical_addr.saturating_add(e.len) > from);
         out.sort_by_key(|e| e.logical_addr);
         Ok(out)
     }
 
-    /// Calls `f(logical_addr, value)` for every record of `stream_id` in the
-    /// file-extent tree below `node`. Records are ordered by `(private_id,
-    /// logical_addr)`, so only the children whose key range can hold the
-    /// stream are read: child `i` holds keys from its own key up to the next
-    /// child's.
+    /// Calls `f(logical_addr, value)` for the records of stream `span.0` in
+    /// the file-extent tree below `node` that can hold bytes of
+    /// `span.1..span.2` (and their neighbours in the leaves read). Records
+    /// are ordered by `(private_id, logical_addr)`, so only the children
+    /// whose key range can hold those are read: child `i` holds keys from
+    /// its own key up to the next child's.
     #[allow(clippy::type_complexity)]
     fn for_each_fext<D: BlockDevice>(
         &self,
         dev: &mut D,
         node: &BtreeNode,
-        stream_id: u64,
+        span: (u64, u64, u64),
         depth: u8,
         f: &mut dyn FnMut(u64, &[u8]) -> Result<(), ContainerError>,
     ) -> Result<(), ContainerError> {
+        let (stream_id, from, to) = span;
         if depth > MAX_CATALOG_TREE_DEPTH {
             return Err(ContainerError::Parse(ParseError::BadField {
                 field: "fext tree depth",
@@ -608,16 +640,16 @@ impl Catalog {
         }
         for i in 0..node.nkeys {
             let (k, v) = node.fixed_kv(i, FEXT_RECORD_SIZE, PHYSICAL_CHILD_SIZE)?;
-            let (first_id, _) = fext_key(k)?;
-            if first_id > stream_id {
+            if fext_key(k)? > (stream_id, to) {
                 break;
             }
             let next = i.checked_add(1).filter(|&n| n < node.nkeys);
             if let Some(n) = next {
                 let (nk, _) = node.fixed_kv(n, FEXT_RECORD_SIZE, PHYSICAL_CHILD_SIZE)?;
-                // The next child starts before any record of this stream
-                // could follow: nothing of it is here.
-                if fext_key(nk)? <= (stream_id, 0) {
+                // The next child starts at or before the first record that
+                // can hold byte `from` (extents do not overlap): nothing
+                // wanted is here.
+                if fext_key(nk)? <= (stream_id, from) {
                     continue;
                 }
             }
@@ -630,7 +662,7 @@ impl Catalog {
             if child.level.checked_add(1) != Some(node.level) {
                 return Err(bad_level(child.level).into());
             }
-            self.for_each_fext(dev, &child, stream_id, depth.saturating_add(1), f)?;
+            self.for_each_fext(dev, &child, span, depth.saturating_add(1), f)?;
         }
         Ok(())
     }
@@ -667,7 +699,7 @@ impl Catalog {
         dir_inode: u64,
         hash: u32,
     ) -> Result<Vec<DirEntry>, ContainerError> {
-        let pos = (dir_inode, APFS_TYPE_DIR_REC, hash);
+        let pos = (dir_inode, APFS_TYPE_DIR_REC, u64::from(hash));
         let mut out: Vec<DirEntry> = Vec::new();
         self.walk(dev, &self.root, 0, Some((pos, pos)), &mut |k, v| {
             if key_pos(k)? == pos {
@@ -723,23 +755,22 @@ impl Catalog {
         offset: usize,
         len: usize,
     ) -> Result<Vec<u8>, ContainerError> {
-        let extents: Vec<(u64, u64, u64)> = self
-            .stream_extents(dev, stream_oid)?
-            .into_iter()
-            .map(|e| (e.logical_addr, e.len, e.phys_block_num))
-            .collect();
-
         // A data stream cannot be larger than the device it lives on. Reject an
         // implausible on-disk dstream/xattr size before allocating the output
         // buffer, so a crafted size (up to ~16 EiB) cannot drive an OOM.
         if size as u64 > dev.size() {
             return Err(oor());
         }
-        if offset >= size {
+        if offset >= size || len == 0 {
             return Ok(Vec::new());
         }
         let want_total = len.min(size - offset);
         let range_end = offset + want_total;
+        let extents: Vec<(u64, u64, u64)> = self
+            .stream_extents_in(dev, stream_oid, offset as u64, range_end as u64)?
+            .into_iter()
+            .map(|e| (e.logical_addr, e.len, e.phys_block_num))
+            .collect();
         let mut out = vec![0u8; want_total];
         for (logical, extent_len, paddr) in extents {
             let Ok(logical) = usize::try_from(logical) else {
@@ -1198,7 +1229,10 @@ impl Catalog {
 
         let inode = self.inode_record(dev, inode_num)?.ok_or_else(oor)?;
         if !inode.is_compressed() {
-            return self.read_file_range(dev, inode_num, offset, len);
+            // The same as `read_file_range`, without looking the inode up
+            // a second time: this runs for every read the mount answers.
+            let size = inode.dstream.as_ref().map(|d| d.size).unwrap_or(0) as usize;
+            return self.read_stream_range(dev, inode.private_id, size, offset, len);
         }
         let attr = self
             .get_xattr(dev, inode_num, DECMPFS_ATTRIBUTE)?

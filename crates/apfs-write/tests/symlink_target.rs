@@ -85,7 +85,13 @@ mod symlink_tests {
             if !dev.starts_with("/dev/disk") {
                 continue;
             }
-            if parent_dev.is_none() && !dev.trim_start_matches("/dev/disk").contains('s') {
+            // hdiutil can list disk10 before disk9: the image's own node is the
+            // lowest-numbered whole disk (shorter name, then smaller).
+            if !dev.trim_start_matches("/dev/disk").contains('s')
+                && parent_dev
+                    .as_deref()
+                    .is_none_or(|p: &str| (p.len(), p) > (dev.len(), dev))
+            {
                 parent_dev = Some(dev.to_string());
             }
             if apfs_dev.is_none() && line.contains("Apple_APFS") {
@@ -322,11 +328,12 @@ mod symlink_tests {
         let disk = attached
             .lines()
             .filter_map(|l| l.split_whitespace().next())
-            .find(|d| {
-                d.starts_with("/dev/disk") && !d.trim_start_matches("/dev/disk").contains('s')
-            })
-            .expect("no whole-disk node")
-            .to_string();
+            .filter_map(|d| d.strip_prefix("/dev/disk"))
+            .filter(|n| !n.contains('s'))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .min()
+            .map(|n| format!("/dev/disk{n}"))
+            .expect("no whole-disk node");
         let mount = attached
             .lines()
             .find_map(|l| l.find("/Volumes/").map(|p| l[p..].trim().to_string()))
@@ -368,11 +375,12 @@ mod symlink_tests {
         let disk = attached
             .lines()
             .filter_map(|l| l.split_whitespace().next())
-            .find(|d| {
-                d.starts_with("/dev/disk") && !d.trim_start_matches("/dev/disk").contains('s')
-            })
-            .expect("no whole-disk node")
-            .to_string();
+            .filter_map(|d| d.strip_prefix("/dev/disk"))
+            .filter(|n| !n.contains('s'))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .min()
+            .map(|n| format!("/dev/disk{n}"))
+            .expect("no whole-disk node");
         let mount = attached
             .lines()
             .find_map(|l| l.find("/Volumes/").map(|p| l[p..].trim().to_string()))

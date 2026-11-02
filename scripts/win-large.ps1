@@ -120,8 +120,10 @@ function Copy-Check($p, [string]$name, [int64]$bytes) {
 function Test-L3($p) {
     $n = [int](10000 / $scale)
     $src = Join-Path $work "small$n"
-    if (-not (Test-Path $src)) {
-        New-Item -ItemType Directory $src | Out-Null
+    # Made again when any file is missing: a run stopped while making them
+    # left a part, and the copy then had only that part to copy.
+    if (@(Get-ChildItem $src -File -ErrorAction SilentlyContinue).Count -ne $n) {
+        New-Item -ItemType Directory -Force $src | Out-Null
         $rng = New-Object System.Random 3
         for ($i = 0; $i -lt $n; $i++) {
             $b = New-Object byte[] ($rng.Next(4KB, 64KB))

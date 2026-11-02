@@ -82,11 +82,12 @@ mod cab_container_write {
         attach_output(extra)
             .lines()
             .filter_map(|l| l.split_whitespace().next())
-            .find(|d| {
-                d.starts_with("/dev/disk") && !d.trim_start_matches("/dev/disk").contains('s')
-            })
+            .filter_map(|d| d.strip_prefix("/dev/disk"))
+            .filter(|n| !n.contains('s'))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .min()
+            .map(|n| format!("/dev/disk{n}"))
             .expect("no whole-disk node")
-            .to_string()
     }
 
     fn attach_output(extra: &[&str]) -> String {
@@ -356,11 +357,12 @@ mod cab_container_write {
         let disk = out
             .lines()
             .filter_map(|l| l.split_whitespace().next())
-            .find(|d| {
-                d.starts_with("/dev/disk") && !d.trim_start_matches("/dev/disk").contains('s')
-            })
-            .expect("no whole-disk node")
-            .to_string();
+            .filter_map(|d| d.strip_prefix("/dev/disk"))
+            .filter(|n| !n.contains('s'))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .min()
+            .map(|n| format!("/dev/disk{n}"))
+            .expect("no whole-disk node");
         let mount = out
             .lines()
             .find_map(|l| l.find("/Volumes/").map(|p| l[p..].trim().to_string()))

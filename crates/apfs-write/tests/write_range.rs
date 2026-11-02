@@ -158,11 +158,12 @@ mod write_range {
         let parent = stdout
             .lines()
             .filter_map(|l| l.split_whitespace().next())
-            .find(|d| {
-                d.starts_with("/dev/disk") && !d.trim_start_matches("/dev/disk").contains('s')
-            })
-            .expect("no whole-disk node")
-            .to_string();
+            .filter_map(|d| d.strip_prefix("/dev/disk"))
+            .filter(|n| !n.contains('s'))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .min()
+            .map(|n| format!("/dev/disk{n}"))
+            .expect("no whole-disk node");
         (mount, parent)
     }
 
@@ -491,17 +492,15 @@ mod write_range {
             .expect("hdiutil attach");
         assert!(out.status.success(), "hdiutil attach failed");
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        let first = |pred: &dyn Fn(&str) -> bool| {
-            stdout
-                .lines()
-                .filter_map(|l| l.split_whitespace().next())
-                .find(|d| pred(d))
-                .map(str::to_string)
-        };
-        let parent = first(&|d| {
-            d.starts_with("/dev/disk") && !d.trim_start_matches("/dev/disk").contains('s')
-        })
-        .expect("no whole-disk node");
+        let parent = stdout
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter_map(|d| d.strip_prefix("/dev/disk"))
+            .filter(|n| !n.contains('s'))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .min()
+            .map(|n| format!("/dev/disk{n}"))
+            .expect("no whole-disk node");
         // The volume is on the container disk hdiutil synthesizes, typed
         // with the APFS volume GUID; the partition itself does not mount.
         let dev = stdout

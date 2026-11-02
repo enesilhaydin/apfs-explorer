@@ -74,11 +74,12 @@ mod full_fold {
         let parent = stdout
             .lines()
             .filter_map(|l| l.split_whitespace().next())
-            .find(|d| {
-                d.starts_with("/dev/disk") && !d.trim_start_matches("/dev/disk").contains('s')
-            })
-            .expect("no whole-disk node")
-            .to_string();
+            .filter_map(|d| d.strip_prefix("/dev/disk"))
+            .filter(|n| !n.contains('s'))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .min()
+            .map(|n| format!("/dev/disk{n}"))
+            .expect("no whole-disk node");
 
         std::fs::write(format!("{mount}/stra\u{df}e"), b"sharp-s").expect("write sharp-s name");
         std::fs::write(format!("{mount}/\u{fb01}le"), b"ligature").expect("write ligature name");

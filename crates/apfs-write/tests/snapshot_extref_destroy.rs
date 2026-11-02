@@ -165,7 +165,13 @@ mod extref_destroy {
             if !dev.starts_with("/dev/disk") {
                 continue;
             }
-            if parent_dev.is_none() && !dev.trim_start_matches("/dev/disk").contains('s') {
+            // hdiutil can list disk10 before disk9: the image's own node is the
+            // lowest-numbered whole disk (shorter name, then smaller).
+            if !dev.trim_start_matches("/dev/disk").contains('s')
+                && parent_dev
+                    .as_deref()
+                    .is_none_or(|p: &str| (p.len(), p) > (dev.len(), dev))
+            {
                 parent_dev = Some(dev.to_string());
             }
             if apfs_dev.is_none() && line.contains("Apple_APFS") {

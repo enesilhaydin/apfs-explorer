@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-02
+
+### Changed
+
+- A read of part of a file looks up only the extents that hold that part.
+  Every edit splits a file's extent, and a read gathered all of the file's
+  extent records first, so on Windows, where a program reads such a file
+  4 KiB at a time, each request walked the whole list. Catalog walks now
+  bound file extents by their logical address the way they bound
+  directory entries by name hash, and a read looks the inode up once. A
+  file with 2400 extents, read 4 KiB at a time with its metadata cached:
+  397 ms -> 40 ms for 7200 reads; the first read from a cold start reads
+  the device 2 times instead of 57. On Windows, a 256 MiB file given 1000
+  scattered 4 KiB edits in a later mount, read in 4 KiB requests from an
+  image: 3.9 s -> 1.7 s (the same file unedited: 1.45 s).
+
 ## [1.1.0] - 2026-11-02
 
 Every change below was arbitrated the same way: a failing test on a

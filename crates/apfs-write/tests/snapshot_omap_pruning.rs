@@ -126,11 +126,12 @@ mod snapshot_omap_pruning {
         attached
             .lines()
             .filter_map(|l| l.split_whitespace().next())
-            .find(|d| {
-                d.starts_with("/dev/disk") && !d.trim_start_matches("/dev/disk").contains('s')
-            })
+            .filter_map(|d| d.strip_prefix("/dev/disk"))
+            .filter(|n| !n.contains('s'))
+            .filter_map(|n| n.parse::<u32>().ok())
+            .min()
+            .map(|n| format!("/dev/disk{n}"))
             .expect("no whole-disk node")
-            .to_string()
     }
     fn detach(disk: &str) {
         for attempt in 0..8u64 {

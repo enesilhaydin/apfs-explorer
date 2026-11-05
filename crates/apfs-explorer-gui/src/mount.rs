@@ -34,11 +34,12 @@ use windows::Win32::UI::Shell::{
 
 /// WinFsp launcher service class names (must match the MSI registration).
 /// `apfs-mount` is read-only; `apfs-mount-rw` adds `--writable`. The writable
-/// class is still SAFE: apfs-mount's snapshot-guard downgrades to read-only on
-/// any volume that has snapshots (#149), and only clean-volume writes (which are
-/// fsck-validated on real hardware) actually proceed.
+/// class writes under snapshots too: they keep the catalog versions they froze
+/// (#11).
 const LAUNCH_CLASS: &str = "apfs-mount";
 const LAUNCH_CLASS_RW: &str = "apfs-mount-rw";
+/// Mounts a snapshot of a volume, always read-only.
+const LAUNCH_CLASS_SNAP: &str = "apfs-mount-snap";
 
 /// `CREATE_NO_WINDOW` - suppress the transient console window Windows would
 /// otherwise pop when the GUI spawns the console-subsystem `launchctl-x64.exe`.
@@ -58,6 +59,8 @@ pub enum MountError {
     OpenFailed(String),
     #[error("no mount tracked for drive {0}")]
     NotTracked(u32),
+    #[error("listing the volumes failed: {0}")]
+    VolumeList(String),
 }
 
 /// Per-drive launcher instance name (unique per physical drive index).
@@ -69,23 +72,41 @@ fn instance_name(drive: u32) -> String {
 /// drive letter via the WinFsp launcher. Returns the assigned letter (`"M:"`).
 ///
 /// `writable` selects the launcher class: `apfs-mount-rw` (which passes
-/// `--writable`) vs the read-only `apfs-mount`. Writable is still safe - the
-/// helper's snapshot-guard refuses writes on snapshotted volumes and only
-/// clean-volume writes (fsck-validated) proceed.
-pub fn mount(drive: u32, writable: bool) -> Result<String, MountError> {
+/// `--writable`) vs the read-only `apfs-mount`.
+///
+/// `volume` is the volume's slot in the container (as `volume list` gives
+/// it); `snapshot`, the xid of a snapshot to mount instead of the volume as
+/// it is now, which is always read-only.
+pub fn mount(
+    drive: u32,
+    writable: bool,
+    volume: u32,
+    snapshot: Option<u64>,
+) -> Result<String, MountError> {
     let launchctl = locate_launchctl()?;
     let letter = first_free_drive_letter().ok_or(MountError::NoFreeLetter)?;
     let instance = instance_name(drive);
-    let class = if writable {
-        LAUNCH_CLASS_RW
-    } else {
-        LAUNCH_CLASS
+    let class = match (snapshot, writable) {
+        (Some(_), _) => LAUNCH_CLASS_SNAP,
+        (None, true) => LAUNCH_CLASS_RW,
+        (None, false) => LAUNCH_CLASS,
     };
-
     // launchctl start <class> <instance> <args...>  → args map to %1, %2 …
-    // i.e. apfs-mount --drive <drive> --mount <letter> [--writable] --wait-for-kill.
+    // i.e. apfs-mount --drive <drive> --mount <letter> --volume-index <volume>
+    // [--writable | --snapshot-xid <xid>] --wait-for-kill.
+    let mut args = vec![
+        "start".to_string(),
+        class.to_string(),
+        instance.clone(),
+        drive.to_string(),
+        letter.clone(),
+        volume.to_string(),
+    ];
+    if let Some(xid) = snapshot {
+        args.push(format!("{xid:#x}"));
+    }
     let out = Command::new(&launchctl)
-        .args(["start", class, &instance, &drive.to_string(), &letter])
+        .args(&args)
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| MountError::Launchctl("start", e.to_string()))?;
@@ -123,10 +144,10 @@ pub fn unmount(drive: u32) -> Result<(), MountError> {
     let launchctl = locate_launchctl()?;
     let instance = instance_name(drive);
 
-    // The drive may have been mounted via either class (read-only or writable),
-    // so stop both - the non-matching one is a harmless no-op.
+    // The drive may have been mounted via any class (read-only, writable or
+    // a snapshot), so stop each - the non-matching ones are harmless no-ops.
     let mut any_ok = false;
-    for class in [LAUNCH_CLASS, LAUNCH_CLASS_RW] {
+    for class in [LAUNCH_CLASS, LAUNCH_CLASS_RW, LAUNCH_CLASS_SNAP] {
         match Command::new(&launchctl)
             .args(["stop", class, &instance])
             .creation_flags(CREATE_NO_WINDOW)
@@ -155,6 +176,25 @@ pub fn unmount(drive: u32) -> Result<(), MountError> {
         return Err(MountError::NotTracked(drive));
     }
     Ok(())
+}
+
+/// The volumes of `\\.\PhysicalDrive<drive>` and their snapshots, as the
+/// installed `apfs-mount volume list --drive N --json` reports them (JSON).
+/// It opens the drive read-only and shared, so a drive with a volume
+/// mounted is listed too.
+pub fn list_volumes(drive: u32) -> Result<String, MountError> {
+    let exe = std::env::current_exe()
+        .map_err(|e| MountError::VolumeList(e.to_string()))?
+        .with_file_name("apfs-mount.exe");
+    let out = Command::new(&exe)
+        .args(["volume", "list", "--drive", &drive.to_string(), "--json"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| MountError::VolumeList(format!("{}: {e}", exe.display())))?;
+    if !out.status.success() {
+        return Err(MountError::VolumeList(combine_output(&out)));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Poll for `<letter>\` to exist, up to `timeout_seconds`.

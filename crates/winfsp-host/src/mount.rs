@@ -11,8 +11,7 @@ use apfs_write::file as apfs_write_file;
 use apfs_write::txn::{Transaction, TxnError};
 
 use crate::group::{
-    commit_group, write_in_group, write_in_group_keeping_names, GroupClock, GroupDev, GroupError,
-    Policy,
+    commit_group, write_in_group_as, GroupClock, GroupDev, GroupError, Names, Policy,
 };
 use crate::ops::{apply_op, HostOp, OpOutcome};
 use widestring::U16CStr;
@@ -707,7 +706,7 @@ impl<D: WritableBlockDevice + Send + 'static> ApfsFs<D> {
     where
         F: FnOnce(&mut Transaction<D>, &[u8], &[u8]) -> Result<R, TxnError>,
     {
-        self.with_writable_as(false, op)
+        self.with_writable_as(Names::Changed, op)
     }
 
     /// [`Self::with_writable`] for an operation that adds, removes and
@@ -717,10 +716,10 @@ impl<D: WritableBlockDevice + Send + 'static> ApfsFs<D> {
     where
         F: FnOnce(&mut Transaction<D>, &[u8], &[u8]) -> Result<R, TxnError>,
     {
-        self.with_writable_as(true, op)
+        self.with_writable_as(Names::Kept, op)
     }
 
-    fn with_writable_as<R, F>(&self, keeps_names: bool, op: F) -> winfsp::Result<R>
+    fn with_writable_as<R, F>(&self, names: Names<'_>, op: F) -> winfsp::Result<R>
     where
         F: FnOnce(&mut Transaction<D>, &[u8], &[u8]) -> Result<R, TxnError>,
     {
@@ -745,11 +744,7 @@ impl<D: WritableBlockDevice + Send + 'static> ApfsFs<D> {
                 .clock
                 .lock()
                 .map_err(|_| winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-            let result = if keeps_names {
-                write_in_group_keeping_names(view, &mut clock, op)
-            } else {
-                write_in_group(view, &mut clock, op)
-            };
+            let result = write_in_group_as(view, &mut clock, names, op);
             self.group_open.store(clock.is_open(), Ordering::SeqCst);
             (result, clock.full(&self.policy))
         };
@@ -1867,7 +1862,11 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
         {
             // BUG-01: surface the unlink result - a dropped error left a file
             // the user asked to delete still on disk with no indication.
-            if let Err(e) = self.with_writable(|txn, vsb_raw, omap_raw| {
+            let removed = Names::Removed {
+                parent: parent_ino,
+                name: &canonical_name,
+            };
+            if let Err(e) = self.with_writable_as(removed, |txn, vsb_raw, omap_raw| {
                 apfs_write_file::unlink(txn, vsb_raw, omap_raw, parent_ino, &canonical_name)
             }) {
                 tracing::error!("cleanup: unlink failed for {:?}: {:?}", context.path, e);
@@ -2669,49 +2668,22 @@ pub(crate) fn ensure_winfsp_dll() {
 /// whether some open handle still holds written content, for the tray's
 /// dirty indicator.
 ///
-/// Snapshot-guard for the writable gate (#149). Writing to a CLEAN volume is
-/// fsck-validated on real hardware; writing to a SNAPSHOTTED volume hits the
-/// unproven snapshot-pinned sm_fq free path (fsck-fails). Returns the EFFECTIVE
-/// writable flag: false (read-only) when `requested` is false, the volume has
-/// snapshots, or the snapshot count cannot be read.
+/// Whether the mount writes: when it was asked to. A volume with snapshots
+/// is written as any other (#11): a write copies the catalog nodes on its
+/// path and the snapshots keep the versions they froze. It used to be
+/// mounted read-only, because every write there rewrote the whole catalog.
 pub(crate) fn effective_writable<D: apfs_core::block_device::BlockDevice>(
     fsview: &mut FsView<D>,
     requested: bool,
 ) -> bool {
-    if !requested {
-        return false;
-    }
-    // TEST-ONLY escape hatch (#149 real-USB validation): bypass the snapshot
-    // guard when APFS_FORCE_WRITABLE=1. NOT used by the GUI/launcher - only when
-    // an operator explicitly exercises the snapshot-pinned write path on a
-    // scratch/reformattable disk. Logged loudly so it can never pass silently.
-    if std::env::var("APFS_FORCE_WRITABLE").as_deref() == Ok("1") {
-        // Print the snapshot state to stdout so the operator can confirm this is
-        // a genuine snapshotted-volume (#149) write, not a clean-volume write.
-        let snap = fsview.volume_has_snapshots();
-        println!("[FORCE_WRITABLE] snapshot-guard BYPASSED; volume_has_snapshots={snap:?}");
-        tracing::warn!(
-            "APFS_FORCE_WRITABLE=1: snapshot-guard BYPASSED (volume_has_snapshots={snap:?})"
-        );
-        return true;
-    }
-    match fsview.volume_has_snapshots() {
-        Ok(false) => true,
-        Ok(true) => {
-            tracing::warn!(
-                "writable refused: volume has snapshots - mounting read-only \
-                 (writing to snapshotted volumes is not yet supported, #149)"
-            );
-            false
-        }
-        Err(e) => {
-            tracing::warn!(
-                "writable refused: could not read snapshot count ({e}) - \
-                 mounting read-only for safety"
-            );
-            false
+    if requested {
+        match fsview.volume_has_snapshots() {
+            Ok(true) => tracing::info!("writable mount of a volume with snapshots"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("could not read the snapshot count: {e}"),
         }
     }
+    requested
 }
 
 pub fn mount_apfs(
@@ -2719,6 +2691,7 @@ pub fn mount_apfs(
     mountpoint: &str,
     writable: bool,
     selector: apfs::VolumeSelector,
+    snapshot: Option<&apfs::SnapshotRef>,
     // winfsp 0.13: FileSystemHost::new returns FileSystemHost<T, FineGuard> (default S)
 ) -> winfsp::Result<(
     FileSystemHost<ApfsFs<Dev>, FineGuard>,
@@ -2730,6 +2703,8 @@ pub fn mount_apfs(
     ensure_winfsp_dll();
     let init = winfsp::winfsp_init().map_err(io_err("winfsp_init"))?;
     let _ = init;
+    // A snapshot is never written: the drive is opened for reading only.
+    let writable = writable && snapshot.is_none();
     let (pd, range) = match drive {
         Some(n) => {
             let mut pd = if writable {
@@ -2774,12 +2749,11 @@ pub fn mount_apfs(
     let presence =
         crate::winraw::DrivePresence::open(pd.number()).map_err(io_err("DrivePresence::open"))?;
     let dev = CachingBlockDevice::new(OffsetBlockDevice::new(pd, range.offset, range.length));
-    let mut fsview =
-        FsView::open_selected(GroupDev::Plain(dev), selector).map_err(io_err("FsView::open"))?;
-    // Snapshot-guard (#149): writing to a CLEAN volume is fsck-validated on real
-    // hardware; writing to a SNAPSHOTTED volume hits the unproven snapshot-pinned
-    // sm_fq free path (fsck-fails). Refuse writable + fall back to read-only when
-    // snapshots are present.
+    let mut fsview = match snapshot {
+        Some(s) => FsView::open_snapshot(GroupDev::Plain(dev), selector, s),
+        None => FsView::open_selected(GroupDev::Plain(dev), selector),
+    }
+    .map_err(io_err("FsView::open"))?;
     let writable = effective_writable(&mut fsview, writable);
     // P14 (FINDING-05): stable Windows volume serial from the APFS volume UUID,
     // OR 1 so it is never zero (Windows treats serial 0 as "unknown").

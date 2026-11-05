@@ -167,7 +167,7 @@ pub fn write_in_group<D: WritableBlockDevice, R>(
     clock: &mut GroupClock,
     op: impl FnOnce(&mut Transaction<D>, &[u8], &[u8]) -> Result<R, TxnError>,
 ) -> Result<R, GroupError> {
-    write_in_group_as(view, clock, false, op)
+    write_in_group_as(view, clock, Names::Changed, op)
 }
 
 /// [`write_in_group`] for an operation that adds, removes and renames no
@@ -177,13 +177,39 @@ pub fn write_in_group_keeping_names<D: WritableBlockDevice, R>(
     clock: &mut GroupClock,
     op: impl FnOnce(&mut Transaction<D>, &[u8], &[u8]) -> Result<R, TxnError>,
 ) -> Result<R, GroupError> {
-    write_in_group_as(view, clock, true, op)
+    write_in_group_as(view, clock, Names::Kept, op)
 }
 
-fn write_in_group_as<D: WritableBlockDevice, R>(
+/// [`write_in_group`] for an operation that removes the entry `name` (as
+/// the volume stores it) of directory `parent` and changes no other name:
+/// the reader's listing of the directory loses that entry and is not read
+/// again.
+pub fn write_in_group_removing<D: WritableBlockDevice, R>(
     view: &mut FsView<GroupDev<D>>,
     clock: &mut GroupClock,
-    keeps_names: bool,
+    parent: u64,
+    name: &str,
+    op: impl FnOnce(&mut Transaction<D>, &[u8], &[u8]) -> Result<R, TxnError>,
+) -> Result<R, GroupError> {
+    write_in_group_as(view, clock, Names::Removed { parent, name }, op)
+}
+
+/// What an operation does to the volume's names, so the reader drops no
+/// more of what it has cached than the operation changed.
+#[derive(Clone, Copy)]
+pub enum Names<'a> {
+    /// No entry added, removed or renamed.
+    Kept,
+    /// Only the entry `name` of directory `parent` removed.
+    Removed { parent: u64, name: &'a str },
+    /// Anything else.
+    Changed,
+}
+
+pub fn write_in_group_as<D: WritableBlockDevice, R>(
+    view: &mut FsView<GroupDev<D>>,
+    clock: &mut GroupClock,
+    names: Names<'_>,
     op: impl FnOnce(&mut Transaction<D>, &[u8], &[u8]) -> Result<R, TxnError>,
 ) -> Result<R, GroupError> {
     if matches!(view.dev_mut(), GroupDev::Plain(_)) {
@@ -210,10 +236,11 @@ fn write_in_group_as<D: WritableBlockDevice, R>(
     let out = txn.atomically(|t| op(t, &vsb, &omap))?;
     let staged = txn.staged_volume_block(vsb_oid);
     clock.note(Instant::now(), txn.staged_bytes());
-    match staged {
-        Some(p) if keeps_names => view.rebind_keeping_names(p)?,
-        Some(p) => view.rebind(p)?,
-        None => {}
+    match (staged, names) {
+        (Some(p), Names::Kept) => view.rebind_keeping_names(p)?,
+        (Some(p), Names::Removed { parent, name }) => view.rebind_removing(p, parent, name)?,
+        (Some(p), Names::Changed) => view.rebind(p)?,
+        (None, _) => {}
     }
     Ok(out)
 }
@@ -227,11 +254,14 @@ pub type Committed<D> = (Result<(), TxnError>, Result<FsView<GroupDev<D>>, FsErr
 /// reopened even when the commit failed, from the last durable checkpoint,
 /// so the mount keeps serving.
 pub fn commit_group<D: WritableBlockDevice>(
-    view: FsView<GroupDev<D>>,
+    mut view: FsView<GroupDev<D>>,
     sel: VolumeSelector,
     clock: &mut GroupClock,
 ) -> Committed<D> {
     clock.reset();
+    // The committed volume is what the view read last, so what it cached
+    // of the names still holds after a commit that succeeded.
+    let names = view.take_names();
     let (committed, dev) = match view.into_dev() {
         GroupDev::Open(txn) => match (*txn).commit_recoverable() {
             Ok(d) => (Ok(()), d),
@@ -245,9 +275,21 @@ pub fn commit_group<D: WritableBlockDevice>(
             )
         }
     };
+    // Every block the commit wrote went through the device, which dropped
+    // what it held of it, so the rest of the read cache still matches the
+    // disk. Dropping all of it made every commit read the metadata again:
+    // deleting a folder of 99 000 files, one commit a second, read the disk
+    // 1.3 million times. A failed commit may have stopped part way, so the
+    // cache goes with it.
     let mut dev = dev;
-    dev.invalidate_read_cache();
-    (committed, FsView::open_selected(GroupDev::Plain(dev), sel))
+    if committed.is_err() {
+        dev.invalidate_read_cache();
+    }
+    let mut reopened = FsView::open_selected(GroupDev::Plain(dev), sel);
+    if let (Ok(()), Ok(view)) = (&committed, &mut reopened) {
+        view.adopt_names(names);
+    }
+    (committed, reopened)
 }
 
 #[cfg(test)]

@@ -313,8 +313,24 @@ impl Catalog {
         vol: &VolumeSuperblock,
         block_size: u32,
     ) -> Result<Self, ContainerError> {
-        let omap = Omap::open(dev, vol.omap_oid, block_size)?;
-        let xid = vol.obj.xid;
+        Self::open_at(dev, vol, vol.omap_oid, vol.obj.xid, block_size)
+    }
+
+    /// Open the catalog tree of `vol` through the object map at `omap_oid`,
+    /// resolving every node at transaction `xid`. A snapshot is read this
+    /// way: its frozen volume superblock names the catalog root, the live
+    /// volume's object map (which snapshots share) maps it, and the
+    /// snapshot's transaction picks the versions it froze.
+    /// [linux-apfs-rw snapshot.c apfs_switch_to_snapshot + btree.c
+    ///  apfs_mounted_xid]
+    pub fn open_at<D: BlockDevice>(
+        dev: &mut D,
+        vol: &VolumeSuperblock,
+        omap_oid: u64,
+        xid: u64,
+        block_size: u32,
+    ) -> Result<Self, ContainerError> {
+        let omap = Omap::open(dev, omap_oid, block_size)?;
         let root = read_catalog_node(
             dev,
             &omap,

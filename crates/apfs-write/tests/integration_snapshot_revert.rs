@@ -7,10 +7,10 @@
 //!       --test integration_snapshot_revert -- --test-threads=1
 //!
 //! Covers: revert_to_snapshot (W6-GAP-2)
-//!   R1: write → snap → write → revert → image consistent, 0 snapshots after
-//!   R2: snap_1 → write → snap_2 → write → revert(snap_2) → snap_1 survives
+//!   R1: write → snap → write → revert → image consistent, the snapshot stays
+//!   R2: snap_1 → write → snap_2 → write → revert(snap_2) → both survive
 //!   R3: revert to nonexistent xid → Err(SnapshotNotFound)
-//!   R4: mid-chain revert → Err(InvalidArgument)
+//!   R4: revert to an older snapshot → the later one goes, it stays
 #![cfg_attr(
     test,
     allow(
@@ -185,8 +185,12 @@ mod revert_tests {
             txn.commit().expect("commit revert");
         }
 
-        // After revert: 0 snapshots (snapshot became live).
-        assert_eq!(read_snap_count(IMG), 0, "R1: no snapshots after revert");
+        // After revert: the snapshot reverted to stays, as on macOS.
+        assert_eq!(
+            read_snap_count(IMG),
+            1,
+            "R1: the snapshot stays after revert"
+        );
         let xid_final = read_current_xid(IMG);
         println!("R1: final xid = {xid_final:#x}");
         assert!(xid_final >= snap_xid, "R1: final xid must be >= snap_xid");
@@ -252,13 +256,12 @@ mod revert_tests {
             txn.commit().expect("commit revert snap_2");
         }
 
-        // snap_2 became live; snap_1 remains in the snap_meta tree.
-        // Our conservative implementation decrements num_snapshots by 1
-        // (removes snap_2 entry), leaving snap_1 with count = 1.
+        // The volume is back at snap_2; snap_1 and snap_2 both remain (the
+        // snapshot reverted to stays, as on macOS).
         let snap_count = read_snap_count(IMG);
         assert_eq!(
-            snap_count, 1,
-            "R2: snap_1 must survive revert of snap_2; got {snap_count}"
+            snap_count, 2,
+            "R2: snap_1 and snap_2 must survive revert of snap_2; got {snap_count}"
         );
 
         println!("R2 PASS: revert(snap_2) succeeded; snap_1 survives with count=1");
@@ -292,11 +295,11 @@ mod revert_tests {
     }
 
     // -----------------------------------------------------------------------
-    // R4: mid-chain revert rejected (only most-recent snapshot supported)
+    // R4: revert to an older snapshot drops the later ones
     // -----------------------------------------------------------------------
 
     #[test]
-    fn r4_mid_chain_revert_rejected() {
+    fn r4_mid_chain_revert_drops_later_snapshots() {
         if !check_gate() {
             println!("R4: APFS_WRITE_SCRATCH not set - skip");
             return;
@@ -319,17 +322,12 @@ mod revert_tests {
             txn.commit().expect("commit snap_2");
         }
 
-        // Attempt revert to snap_1 (not most-recent) must fail.
+        // Revert to snap_1 (not most-recent): snap_2 goes, snap_1 stays, as
+        // on macOS.
         let (vsb, omap) = read_vsb_omap_raw(IMG);
         let mut txn = open_txn(IMG);
-        let result = revert_to_snapshot(&mut txn, &vsb, &omap, snap1_xid);
-        drop(txn);
-
-        match result {
-            Err(TxnError::InvalidArgument(_)) => {
-                println!("R4 PASS: mid-chain revert correctly rejected with InvalidArgument");
-            }
-            other => panic!("R4: expected InvalidArgument for mid-chain revert, got {other:?}"),
-        }
+        revert_to_snapshot(&mut txn, &vsb, &omap, snap1_xid).expect("revert to snap_1");
+        txn.commit().expect("commit revert to snap_1");
+        assert_eq!(read_snap_count(IMG), 1, "R4: only snap_1 remains");
     }
 }

@@ -1,0 +1,50 @@
+[package]
+name = "apfs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "GPL-3.0-only"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+apfs-core = { path = "../crates/apfs-core" }
+apfs = { path = "../crates/apfs" }
+
+# Kept out of the main workspace: it builds with a nightly toolchain and
+# libFuzzer instrumentation.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse_blocks"
+path = "fuzz_targets/parse_blocks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decompress"
+path = "fuzz_targets/decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "open_image"
+path = "fuzz_targets/open_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "names"
+path = "fuzz_targets/names.rs"
+test = false
+doc = false
+bench = false

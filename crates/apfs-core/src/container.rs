@@ -25,6 +25,13 @@ pub struct VolumeInfo {
     pub role: VolumeRole,
     /// Raw `apfs_fs_flags` u64.
     pub features: u64,
+    /// The volume's file data is encrypted (FileVault): it cannot be read.
+    pub encrypted: bool,
+    /// A system volume (Preboot, Recovery, VM, ...), not one a user's files
+    /// are on: a mount that names no volume skips these.
+    pub system: bool,
+    /// Physical root of the volume's snapshot metadata tree (0 for none).
+    pub snap_meta_tree_oid: u64,
 }
 
 /// Convenience constructor for an out-of-range / overflow `ContainerError`.
@@ -215,12 +222,16 @@ impl Container {
                 )?;
                 if let Ok(v) = crate::volume::VolumeSuperblock::parse(&buf) {
                     let role = v.volume_role();
+                    let (encrypted, system) = (v.is_encrypted(), v.is_system());
                     out.push(VolumeInfo {
                         index: slot,
                         uuid: v.uuid,
                         name: v.name,
                         role,
                         features: v.fs_flags,
+                        encrypted,
+                        system,
+                        snap_meta_tree_oid: v.snap_meta_tree_oid,
                     });
                 }
             }

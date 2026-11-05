@@ -287,6 +287,9 @@ function Test-S5 {
     try {
         $p = Start-Mount
         $root = "$Letter\soak"
+        # The fixed seed reuses file names, so a previous run's files would
+        # make the renames collide.
+        if (Test-Path $root) { Remove-Item -Recurse -Force $root }
         New-Item -ItemType Directory -Force $root | Out-Null
         $rng = New-Object System.Random 1234
         $sha = [System.Security.Cryptography.SHA256]::Create()

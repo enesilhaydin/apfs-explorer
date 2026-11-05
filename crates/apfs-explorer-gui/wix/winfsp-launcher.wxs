@@ -8,7 +8,8 @@
   reads its service classes). ForceDeleteOnUninstall removes the class on
   uninstall. The CommandLine is read-only by construction (it carries no
   writable flag): %1 is the physical drive index, %2 is the drive letter the
-  GUI chose.
+  GUI chose, %3 the volume's slot in the container. The snapshot class adds
+  %4, the snapshot's xid, and is read-only too.
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Fragment>
@@ -20,7 +21,7 @@
           <RegistryValue Type="string" Name="Executable"
                          Value="[INSTALLDIR]apfs-mount.exe" KeyPath="yes" />
           <RegistryValue Type="string" Name="CommandLine"
-                         Value="--drive %1 --mount %2 --wait-for-kill" />
+                         Value="--drive %1 --mount %2 --volume-index %3 --wait-for-kill" />
           <!-- Administrators and SYSTEM only. WD (Everyone) let any user on
                the machine ask the launcher to start this service, and the
                launcher runs it as SYSTEM with Credentials=0, so an ordinary
@@ -43,13 +44,30 @@
           <RegistryValue Type="string" Name="Executable"
                          Value="[INSTALLDIR]apfs-mount.exe" KeyPath="yes" />
           <RegistryValue Type="string" Name="CommandLine"
-                         Value="--drive %1 --mount %2 --writable --wait-for-kill" />
+                         Value="--drive %1 --mount %2 --volume-index %3 --writable --wait-for-kill" />
           <!-- Administrators and SYSTEM only. WD (Everyone) let any user on
                the machine ask the launcher to start this service, and the
                launcher runs it as SYSTEM with Credentials=0, so an ordinary
                account could obtain raw access to any physical drive by
                number - read-write for the -rw service, and reading a disk
                raw bypasses every file permission on it either way. -->
+          <RegistryValue Type="string" Name="Security"
+                         Value="D:P(A;;RPWPLC;;;BA)(A;;RPWPLC;;;SY)" />
+          <RegistryValue Type="integer" Name="JobControl" Value="1" />
+          <RegistryValue Type="integer" Name="Credentials" Value="0" />
+        </RegistryKey>
+      </Component>
+      <!-- Snapshot class: a volume as one of its snapshots holds it, always
+           read-only (apfs-mount ignores any writable request for one). -->
+      <Component Id="ApfsMountLauncherClassSnap" Guid="*">
+        <RegistryKey Root="HKLM"
+                     Key="SOFTWARE\WOW6432Node\WinFsp\Services\apfs-mount-snap"
+                     ForceDeleteOnUninstall="yes">
+          <RegistryValue Type="string" Name="Executable"
+                         Value="[INSTALLDIR]apfs-mount.exe" KeyPath="yes" />
+          <RegistryValue Type="string" Name="CommandLine"
+                         Value="--drive %1 --mount %2 --volume-index %3 --snapshot-xid %4 --wait-for-kill" />
+          <!-- Administrators and SYSTEM only, as for the other classes. -->
           <RegistryValue Type="string" Name="Security"
                          Value="D:P(A;;RPWPLC;;;BA)(A;;RPWPLC;;;SY)" />
           <RegistryValue Type="integer" Name="JobControl" Value="1" />

@@ -3,7 +3,7 @@
 //! wrappers around the platform-specific `drives` / `mount` modules so the
 //! cross-platform check on macOS doesn't trip over Windows-only APIs.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Information about a single physical disk surfaced to the UI.
 #[derive(Debug, Clone, Serialize)]
@@ -28,6 +28,57 @@ pub struct DriveInfo {
     pub letter: String,
 }
 
+/// One snapshot of a volume, as `apfs-mount volume list --json` gives it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotEntry {
+    pub name: String,
+    /// The snapshot's transaction, in hex (`0x1a2`): what a mount names.
+    pub xid: String,
+    /// Creation time, nanoseconds since 1970-01-01 UTC.
+    pub created: u64,
+}
+
+/// One volume of a drive's container.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeEntry {
+    /// Slot in the container, what `--volume-index` takes.
+    pub index: u32,
+    pub name: String,
+    pub role: String,
+    pub encrypted: bool,
+    /// The volume a mount picks when none is named.
+    pub default: bool,
+    pub snapshots: Vec<SnapshotEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VolumeList {
+    volumes: Vec<VolumeEntry>,
+}
+
+/// The volumes of physical drive `drive` and their snapshots.
+#[tauri::command]
+pub async fn list_volumes(drive: u32) -> Result<Vec<VolumeEntry>, String> {
+    #[cfg(windows)]
+    {
+        let json = crate::mount::list_volumes(drive).map_err(|e| {
+            tracing::error!(drive, "volume list failed: {e}");
+            e.to_string()
+        })?;
+        serde_json::from_str::<VolumeList>(&json)
+            .map(|l| l.volumes)
+            .map_err(|e| {
+                tracing::error!(drive, "volume list unreadable: {e}");
+                format!("volume list unreadable: {e}")
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = drive;
+        Ok(Vec::new())
+    }
+}
+
 #[tauri::command]
 pub async fn list_drives() -> Result<Vec<DriveInfo>, String> {
     #[cfg(windows)]
@@ -41,26 +92,36 @@ pub async fn list_drives() -> Result<Vec<DriveInfo>, String> {
 }
 
 #[tauri::command]
-pub async fn mount_drive(drive: u32, writable: bool) -> Result<String, String> {
+pub async fn mount_drive(
+    drive: u32,
+    writable: bool,
+    volume: u32,
+    snapshot: Option<String>,
+) -> Result<String, String> {
+    // A snapshot is named by its xid in hex, as `volume list` gives it.
+    let snapshot = match snapshot.as_deref() {
+        Some(x) => Some(
+            u64::from_str_radix(x.trim_start_matches("0x"), 16)
+                .map_err(|_| format!("not a snapshot xid: {x:?}"))?,
+        ),
+        None => None,
+    };
     // Writable is OPT-IN (read-only stays the UI's default/primary action).
     // Safe to honor now: the COW data-integrity tier shipped (post-commit
     // checkpoint verify; fsync barriers; macOS differential-validated), and the
-    // launcher's writable class + apfs-mount's snapshot-guard ensure only
-    // CLEAN-volume writes (fsck-validated on real hardware) proceed - any volume
-    // with snapshots is forced read-only (#149).
-    if writable {
-        tracing::info!(drive, "mount_drive: writable (opt-in) requested");
-    }
+    // launcher's writable class writes along the paths to the changed records,
+    // under snapshots as well (they keep what they froze; #11).
+    tracing::info!(drive, writable, volume, ?snapshot, "mount_drive requested");
     #[cfg(windows)]
     {
-        crate::mount::mount(drive, writable).map_err(|e| {
-            tracing::error!(drive, writable, "mount failed: {e}");
+        crate::mount::mount(drive, writable, volume, snapshot).map_err(|e| {
+            tracing::error!(drive, writable, volume, ?snapshot, "mount failed: {e}");
             e.to_string()
         })
     }
     #[cfg(not(windows))]
     {
-        let _ = drive;
+        let _ = (drive, volume, snapshot);
         Err("mount is only supported on Windows".into())
     }
 }

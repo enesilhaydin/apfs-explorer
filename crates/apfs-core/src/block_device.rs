@@ -37,11 +37,10 @@ pub trait WritableBlockDevice: BlockDevice {
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), BlockError>;
 
     /// Drop any internal read caches. A read-only cache layer must override
-    /// this; raw devices keep the default no-op. Callers invoke it between
-    /// a committed transaction and a fresh container open to guarantee the
-    /// next read observes durable on-disk state (defense-in-depth: per-write
-    /// invalidation in `write_at` should already suffice, but a full drop
-    /// removes any residual aliasing across an FS reopen).
+    /// this; raw devices keep the default no-op. Per-write invalidation in
+    /// `write_at` keeps a cache in step with the writes that pass through
+    /// it; callers drop the whole cache when that cannot be relied on, such
+    /// as after a commit that failed part way.
     fn invalidate_read_cache(&mut self) {}
 
     /// Force all previously-written blocks to durable media. The COW

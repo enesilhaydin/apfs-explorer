@@ -1,0 +1,46 @@
+name: Fuzz
+
+# The parsers turn what a drive holds into errors, never a panic or memory
+# without bound: libFuzzer runs every target for a while each week. macOS,
+# because the seed images for open_image are made with hdiutil.
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds per target"
+        default: "300"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Seed corpus
+        run: sh scripts/fuzz-seeds.sh
+      - name: Run targets
+        env:
+          SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '300' }}
+        run: |
+          cd fuzz
+          for t in parse_blocks decompress names; do
+            cargo +nightly fuzz run "$t" -O -- -max_total_time="$SECONDS_PER_TARGET" \
+              -rss_limit_mb=2048 -timeout=20 -max_len=65536
+          done
+          cargo +nightly fuzz run open_image -O -- -max_total_time="$SECONDS_PER_TARGET" \
+            -rss_limit_mb=3072 -timeout=30 -max_len=2300000
+      - name: Keep what was found
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/

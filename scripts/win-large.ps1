@@ -179,6 +179,8 @@ function Test-L5($p) {
     $n = [int](100000 / $scale)
     Step $p "L5 $n entries in one folder" {
         $d = "$Letter\wide"
+        # A run before this one left its folder: start from an empty one.
+        if (Test-Path $d) { Remove-Item $d -Recurse -Force }
         New-Item -ItemType Directory $d | Out-Null
         $tc = Measure-Command { for ($i = 0; $i -lt $n; $i++) { [System.IO.File]::WriteAllBytes("$d\e$i", [byte[]]@()) } }
         $tl = Measure-Command { $count = [System.IO.Directory]::GetFiles($d).Count }

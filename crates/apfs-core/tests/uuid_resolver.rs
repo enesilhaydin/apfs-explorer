@@ -192,6 +192,9 @@ fn volume_info_fields_accessible() {
         name: "TestVol".to_string(),
         role: VolumeRole::Data,
         features: 0xDEAD,
+        encrypted: false,
+        system: false,
+        snap_meta_tree_oid: 0,
     };
     assert_eq!(info.index, 3);
     assert_eq!(info.uuid, uuid);

@@ -1,7 +1,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 //! apfs - safe high-level filesystem API over `apfs-core`. `FsView` is the
 //! OS-agnostic layer a mount host (winfsp-host / FUSE) delegates to.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub use apfs_core::case_fold;
 
@@ -33,6 +33,15 @@ pub enum VolumeSelector {
     Uuid([u8; 16]),
 }
 
+/// Which snapshot of a volume to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotRef {
+    /// The snapshot with this name.
+    Name(String),
+    /// The snapshot that froze this transaction.
+    Xid(u64),
+}
+
 /// Errors surfaced by the high-level filesystem view.
 #[derive(Debug, thiserror::Error)]
 pub enum FsError {
@@ -50,6 +59,15 @@ pub enum FsError {
     /// The path names nothing in the volume.
     #[error("no such path: {0}")]
     NotFound(String),
+    /// The volume has no snapshot by that name or transaction.
+    #[error("no such snapshot: {0}")]
+    NoSnapshot(String),
+    /// The snapshot's content is not on this volume (a dataless snapshot).
+    #[error("snapshot {0:?} is dataless: its content is not on this volume")]
+    DatalessSnapshot(String),
+    /// The view reads a snapshot, which is never written.
+    #[error("this view reads snapshot {xid:#x}, which cannot be written")]
+    ReadOnlySnapshot { xid: u64 },
 }
 
 impl From<ContainerError> for FsError {
@@ -115,6 +133,9 @@ pub struct FsView<D: BlockDevice> {
     case_insensitive: bool,
     path_cache: HashMap<String, u64>,
     dir_cache: HashMap<u64, DirListing>,
+    /// The transaction of the snapshot this view reads, or `None` for the
+    /// volume as it is now. A snapshot view hands out nothing to write with.
+    snapshot: Option<u64>,
     /// Volume superblock paddr - needed by the WinFsp write path to fetch
     /// vsb_raw bytes for apfs-write API calls (Transaction::begin + write_file
     /// + create_file + unlink + rename all take a `vsb_raw: &[u8]` argument).
@@ -128,6 +149,14 @@ pub struct FsView<D: BlockDevice> {
     selector: VolumeSelector,
 }
 
+/// A view's cached paths and listings, carried to a new view of the same
+/// volume state by [`FsView::take_names`] and [`FsView::adopt_names`].
+pub struct NameCache {
+    vol_paddr: u64,
+    paths: HashMap<String, u64>,
+    dirs: HashMap<u64, DirListing>,
+}
+
 /// A directory's entries as listed, with each name's comparison key mapped
 /// to the first entry carrying it, so a name lookup is one hash probe
 /// instead of a fold of every entry.
@@ -136,6 +165,9 @@ struct DirListing {
     entries: Vec<DirEntry>,
     /// Index into `entries` by the key the volume compares names by.
     by_key: HashMap<String, usize>,
+    /// Entries removed since the listing was read, by index. They stay in
+    /// `entries` so a removal costs no shift of a large directory.
+    removed: HashSet<usize>,
 }
 
 /// How names compare on a volume: folded (case-insensitive), normalized
@@ -174,7 +206,28 @@ impl DirListing {
         for (i, e) in entries.iter().enumerate() {
             by_key.entry(how.key(&e.name)).or_insert(i);
         }
-        Self { entries, by_key }
+        Self {
+            entries,
+            by_key,
+            removed: HashSet::new(),
+        }
+    }
+
+    /// Drop the entry `name` (as the volume stores it) and give its inode,
+    /// or `None` when the listing has no such name.
+    fn remove(&mut self, name: &str, how: NameMatch) -> Option<u64> {
+        let i = self.by_key.remove(&how.key(name))?;
+        self.removed.insert(i);
+        self.entries.get(i).map(|e| e.file_id)
+    }
+
+    /// The entries still in the directory, in listing order.
+    fn live(&self) -> impl Iterator<Item = &DirEntry> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.removed.contains(i))
+            .map(|(_, e)| e)
     }
 }
 
@@ -183,10 +236,18 @@ impl DirListing {
 const VSB_QUOTA_BLOCK_COUNT: usize = 0x50;
 const VSB_ALLOC_COUNT: usize = 0x58;
 
-/// Up to `max` of `entries` (sorted by name) that sort after `after`.
-fn page_after(entries: &[DirEntry], after: Option<&str>, max: usize) -> Vec<DirEntry> {
+/// Up to `max` entries of `listing` that sort after `after`.
+fn page_after(listing: &DirListing, after: Option<&str>, max: usize) -> Vec<DirEntry> {
+    let entries = &listing.entries;
     let start = after.map_or(0, |a| entries.partition_point(|e| e.name.as_str() <= a));
-    entries.iter().skip(start).take(max).cloned().collect()
+    entries
+        .iter()
+        .enumerate()
+        .skip(start)
+        .filter(|(i, _)| !listing.removed.contains(i))
+        .take(max)
+        .map(|(_, e)| e.clone())
+        .collect()
 }
 
 /// Normalize a path into non-empty components (leading/trailing/duplicate
@@ -296,10 +357,9 @@ impl<D: BlockDevice> FsView<D> {
     /// transaction last staged, so lookups see the operation's changes
     /// before they are committed.
     pub fn rebind(&mut self, vol_paddr: u64) -> Result<(), FsError> {
-        self.rebind_to(vol_paddr)?;
         self.path_cache.clear();
         self.dir_cache.clear();
-        Ok(())
+        self.rebind_to(vol_paddr)
     }
 
     /// [`Self::rebind`] after an operation that changed no name: no entry
@@ -312,8 +372,67 @@ impl<D: BlockDevice> FsView<D> {
         self.rebind_to(vol_paddr)
     }
 
+    /// [`Self::rebind`] after an operation that removed the entry `name` (as
+    /// the volume stores it) of directory `parent` and changed no other
+    /// name. The directory's cached listing loses that one entry instead of
+    /// being read again: a program deleting a large folder lists it between
+    /// deletes, and reading it again each time made every delete cost the
+    /// folder's size.
+    pub fn rebind_removing(
+        &mut self,
+        vol_paddr: u64,
+        parent: u64,
+        name: &str,
+    ) -> Result<(), FsError> {
+        // Cheap to resolve again, and any spelling of the removed path goes.
+        self.path_cache.clear();
+        if let Err(e) = self.rebind_to(vol_paddr) {
+            // The name is gone from the volume, whatever this view now reads.
+            self.dir_cache.clear();
+            return Err(e);
+        }
+        let how = self.name_match();
+        let gone = self.dir_cache.get_mut(&parent).map(|l| l.remove(name, how));
+        match gone {
+            // A removed directory's own listing goes with it.
+            Some(Some(ino)) => {
+                self.dir_cache.remove(&ino);
+            }
+            // The listing did not hold the name: it no longer says what
+            // the directory holds.
+            Some(None) => {
+                self.dir_cache.remove(&parent);
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Take the cached paths and listings, to hand to the view that reads
+    /// the volume once this view's changes are committed.
+    pub fn take_names(&mut self) -> NameCache {
+        NameCache {
+            vol_paddr: self.vol_paddr,
+            paths: std::mem::take(&mut self.path_cache),
+            dirs: std::mem::take(&mut self.dir_cache),
+        }
+    }
+
+    /// Use `names`, taken from a view of the same state of the volume: the
+    /// view whose changes were committed into what this view reads. Names
+    /// taken at another volume superblock are dropped.
+    pub fn adopt_names(&mut self, names: NameCache) {
+        if self.snapshot.is_none() && names.vol_paddr == self.vol_paddr {
+            self.path_cache = names.paths;
+            self.dir_cache = names.dirs;
+        }
+    }
+
     fn rebind_to(&mut self, vol_paddr: u64) -> Result<(), FsError> {
         use apfs_core::volume::VolumeSuperblock;
+        if let Some(xid) = self.snapshot {
+            return Err(FsError::ReadOnlySnapshot { xid });
+        }
         let mut raw = vec![0u8; self.bsz];
         self.dev
             .read_at(vol_paddr.saturating_mul(self.bsz as u64), &mut raw)?;
@@ -345,12 +464,113 @@ impl<D: BlockDevice> FsView<D> {
     /// `Default` prefers the `Data` role and falls back to the first
     /// non-system volume.
     pub fn open_selected(mut dev: D, sel: VolumeSelector) -> Result<Self, FsError> {
+        let (vol_paddr, vol, bsz) = Self::select_volume(&mut dev, sel)?;
+        let catalog = Catalog::open(&mut dev, &vol, bsz as u32)?;
+        Ok(Self::from_parts(
+            dev, catalog, &vol, vol_paddr, bsz, sel, None,
+        ))
+    }
+
+    /// Open the volume picked by `sel` as snapshot `snap` holds it, read
+    /// only. The snapshot's frozen volume superblock names its catalog;
+    /// the live volume's object map, which snapshots share, maps it at the
+    /// snapshot's transaction.
+    /// [linux-apfs-rw snapshot.c apfs_switch_to_snapshot; apfs.kext
+    ///  apfs_snap_lookup_internal: name -> xid -> snapshot metadata]
+    pub fn open_snapshot(
+        mut dev: D,
+        sel: VolumeSelector,
+        snap: &SnapshotRef,
+    ) -> Result<Self, FsError> {
+        use apfs_core::volume::VolumeSuperblock;
+        let (_, vol, bsz) = Self::select_volume(&mut dev, sel)?;
+        let all = apfs_core::snapshot::list(&mut dev, vol.snap_meta_tree_oid, bsz as u32)?;
+        let found = all
+            .into_iter()
+            .find(|s| match snap {
+                SnapshotRef::Name(n) => s.name == *n,
+                SnapshotRef::Xid(x) => s.xid == *x,
+            })
+            .ok_or_else(|| {
+                FsError::NoSnapshot(match snap {
+                    SnapshotRef::Name(n) => n.clone(),
+                    SnapshotRef::Xid(x) => format!("{x:#x}"),
+                })
+            })?;
+        if found.flags & apfs_core::snapshot::SNAP_META_PENDING_DATALESS != 0 {
+            return Err(FsError::DatalessSnapshot(found.name));
+        }
+        let mut raw = vec![0u8; bsz];
+        dev.read_at(found.sblock_oid.saturating_mul(bsz as u64), &mut raw)?;
+        let frozen = VolumeSuperblock::parse(&raw)?;
+        let catalog = Catalog::open_at(&mut dev, &frozen, vol.omap_oid, found.xid, bsz as u32)?;
+        tracing::info!(name = %found.name, xid = found.xid, "opened APFS snapshot");
+        Ok(Self::from_parts(
+            dev,
+            catalog,
+            &frozen,
+            found.sblock_oid,
+            bsz,
+            sel,
+            Some(found.xid),
+        ))
+    }
+
+    /// The snapshots of the volume this view reads, oldest first (none for
+    /// a view of a snapshot: a snapshot holds no snapshots).
+    pub fn snapshots(&mut self) -> Result<Vec<apfs_core::SnapshotMeta>, FsError> {
+        use apfs_core::volume::VolumeSuperblock;
+        let mut raw = vec![0u8; self.bsz];
+        self.dev
+            .read_at(self.vol_paddr.saturating_mul(self.bsz as u64), &mut raw)?;
+        let vol = VolumeSuperblock::parse(&raw)?;
+        Ok(apfs_core::snapshot::list(
+            &mut self.dev,
+            vol.snap_meta_tree_oid,
+            self.bsz as u32,
+        )?)
+    }
+
+    /// The transaction of the snapshot this view reads, if it reads one.
+    pub fn snapshot_xid(&self) -> Option<u64> {
+        self.snapshot
+    }
+
+    fn from_parts(
+        dev: D,
+        catalog: Catalog,
+        vol: &apfs_core::volume::VolumeSuperblock,
+        vol_paddr: u64,
+        bsz: usize,
+        selector: VolumeSelector,
+        snapshot: Option<u64>,
+    ) -> Self {
+        Self {
+            dev,
+            catalog,
+            names_hashed: vol.names_are_hashed(),
+            case_insensitive: vol.is_case_insensitive(),
+            path_cache: HashMap::with_capacity(64),
+            dir_cache: HashMap::with_capacity(16),
+            vol_paddr,
+            bsz,
+            selector,
+            snapshot,
+        }
+    }
+
+    /// The volume `sel` picks: its superblock's address, the superblock,
+    /// and the container's block size. An encrypted volume is refused.
+    fn select_volume(
+        dev: &mut D,
+        sel: VolumeSelector,
+    ) -> Result<(u64, apfs_core::volume::VolumeSuperblock, usize), FsError> {
         use apfs_core::omap::Omap;
         use apfs_core::volume::VolumeSuperblock;
 
         // Copy out the container fields we need so we can drop the borrow on
         // `c` before the volume-scan loop (which re-borrows `dev` mutably).
-        let c = Container::open(&mut dev)?;
+        let c = Container::open(dev)?;
         let bsz = c.superblock.block_size as usize;
         let block_size = c.superblock.block_size;
         let xid = c.superblock.obj.xid;
@@ -362,7 +582,7 @@ impl<D: BlockDevice> FsView<D> {
             return Err(FsError::NoVolume);
         }
 
-        let omap = Omap::open(&mut dev, omap_oid, block_size)?;
+        let omap = Omap::open(dev, omap_oid, block_size)?;
 
         // Resolve every volume superblock so the selector can inspect roles.
         struct Cand {
@@ -373,7 +593,7 @@ impl<D: BlockDevice> FsView<D> {
         let mut cands: Vec<Cand> = Vec::with_capacity(fs_slots.len());
         for &(slot, oid) in &fs_slots {
             let index = slot as usize;
-            let paddr = match omap.resolve(&mut dev, oid, xid, block_size)? {
+            let paddr = match omap.resolve(dev, oid, xid, block_size)? {
                 Some(p) => p,
                 None => continue,
             };
@@ -440,20 +660,7 @@ impl<D: BlockDevice> FsView<D> {
             });
         }
 
-        let names_hashed = vol.names_are_hashed();
-        let case_insensitive = vol.is_case_insensitive();
-        let catalog = Catalog::open(&mut dev, &vol, block_size)?;
-        Ok(Self {
-            dev,
-            catalog,
-            names_hashed,
-            case_insensitive,
-            path_cache: HashMap::with_capacity(64),
-            dir_cache: HashMap::with_capacity(16),
-            vol_paddr,
-            bsz,
-            selector: sel,
-        })
+        Ok((vol_paddr, vol, bsz))
     }
 
     /// Return raw VSB and volume omap header bytes (each one block).
@@ -463,6 +670,9 @@ impl<D: BlockDevice> FsView<D> {
     /// the LATEST on-disk state - important after a previous transaction
     /// has just bumped the VSB xid.
     pub fn read_vsb_omap_raw(&mut self) -> Result<(Vec<u8>, Vec<u8>), FsError> {
+        if let Some(xid) = self.snapshot {
+            return Err(FsError::ReadOnlySnapshot { xid });
+        }
         let mut vsb_raw = vec![0u8; self.bsz];
         self.dev
             .read_at(self.vol_paddr * self.bsz as u64, &mut vsb_raw)?;
@@ -494,23 +704,21 @@ impl<D: BlockDevice> FsView<D> {
         Ok(omap.entries(&mut self.dev, self.bsz as u32)?)
     }
 
-    fn listing(&mut self, ino: u64) -> Result<&[DirEntry], FsError> {
+    fn listing(&mut self, ino: u64) -> Result<&DirListing, FsError> {
         use std::collections::hash_map::Entry;
         if self.dir_cache.len() >= DIR_CACHE_LIMIT && !self.dir_cache.contains_key(&ino) {
             self.dir_cache.clear();
         }
         let how = self.name_match();
-        if let Entry::Vacant(e) = self.dir_cache.entry(ino) {
-            let v = self
-                .catalog
-                .list_dir(&mut self.dev, ino, self.names_hashed)?;
-            e.insert(DirListing::new(v, how));
-        }
-        Ok(self
-            .dir_cache
-            .get(&ino)
-            .map(|l| l.entries.as_slice())
-            .unwrap_or(&[]))
+        Ok(match self.dir_cache.entry(ino) {
+            Entry::Occupied(o) => o.into_mut(),
+            Entry::Vacant(e) => {
+                let v = self
+                    .catalog
+                    .list_dir(&mut self.dev, ino, self.names_hashed)?;
+                e.insert(DirListing::new(v, how))
+            }
+        })
     }
 
     /// How names compare on this volume.
@@ -612,7 +820,7 @@ impl<D: BlockDevice> FsView<D> {
     /// List a directory's entries (cached), sorted by name byte for byte.
     pub fn read_dir(&mut self, path: &str) -> Result<Vec<DirEntry>, FsError> {
         match self.lookup(path)? {
-            Some(ino) => Ok(self.listing(ino)?.to_vec()),
+            Some(ino) => Ok(self.listing(ino)?.live().cloned().collect()),
             None => Err(FsError::NotFound(path.to_string())),
         }
     }
@@ -911,22 +1119,48 @@ mod tests {
 
     #[test]
     fn pages_cover_a_listing_once_in_order() {
-        let mut v: Vec<DirEntry> = (0..1000).map(|i| entry(&format!("f{i}"), i)).collect();
-        v.sort_by(|a, b| a.name.cmp(&b.name));
+        let l = DirListing::new(
+            (0..1000).map(|i| entry(&format!("f{i}"), i)).collect(),
+            NameMatch::Exact,
+        );
         let mut seen = Vec::new();
         let mut after: Option<String> = None;
         loop {
-            let page = page_after(&v, after.as_deref(), 64);
+            let page = page_after(&l, after.as_deref(), 64);
             if page.is_empty() {
                 break;
             }
             after = page.last().map(|e| e.name.clone());
             seen.extend(page.into_iter().map(|e| e.name));
         }
-        let want: Vec<String> = v.iter().map(|e| e.name.clone()).collect();
+        let want: Vec<String> = l.entries.iter().map(|e| e.name.clone()).collect();
         assert_eq!(seen, want);
         // A marker that is not itself a name resumes after where it sorts.
-        let page = page_after(&v, Some("f5000"), 2);
+        let page = page_after(&l, Some("f5000"), 2);
         assert_eq!(page[0].name, "f501");
+    }
+
+    #[test]
+    fn a_removed_entry_leaves_pages_and_lookups() {
+        let mut l = DirListing::new(
+            (0..10).map(|i| entry(&format!("F{i}"), 100 + i)).collect(),
+            NameMatch::Folded,
+        );
+        // Removed by the name as stored; any case finds it before.
+        assert!(l.by_key.contains_key(&NameMatch::Folded.needle_key("f3")));
+        assert_eq!(l.remove("F3", NameMatch::Folded), Some(103));
+        assert_eq!(l.remove("F3", NameMatch::Folded), None);
+        assert!(!l.by_key.contains_key(&NameMatch::Folded.needle_key("f3")));
+        assert_eq!(l.remove("F0", NameMatch::Folded), Some(100));
+        assert_eq!(l.remove("F9", NameMatch::Folded), Some(109));
+        let names = |v: Vec<DirEntry>| v.into_iter().map(|e| e.name).collect::<Vec<_>>();
+        // Paging around and across the removed names skips them.
+        assert_eq!(names(page_after(&l, None, 3)), ["F1", "F2", "F4"]);
+        assert_eq!(names(page_after(&l, Some("F2"), 2)), ["F4", "F5"]);
+        assert_eq!(names(page_after(&l, Some("F8"), 5)), Vec::<String>::new());
+        assert_eq!(names(l.live().cloned().collect()).len(), 7);
+        // The other names are still found by key.
+        let i = l.by_key[&NameMatch::Folded.needle_key("f4")];
+        assert_eq!(l.entries[i].file_id, 104);
     }
 }

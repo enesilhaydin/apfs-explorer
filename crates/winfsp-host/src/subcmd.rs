@@ -45,8 +45,8 @@ pub enum Subcommand {
         src: String,
         dst: String,
     },
-    /// `volume list --image <path>`
-    VolumeList { image: String },
+    /// `volume list (--image <path> | --drive <N>) [--json]`
+    VolumeList { target: Target, json: bool },
 }
 
 // ---------------------------------------------------------------------------
@@ -140,8 +140,11 @@ fn parse_volume(args: &[String]) -> Result<Subcommand, String> {
 
     match action {
         "list" => {
-            let image = require_flag("--image", &args[1..])?;
-            Ok(Subcommand::VolumeList { image })
+            let rest = &args[1..];
+            Ok(Subcommand::VolumeList {
+                target: parse_target(rest)?,
+                json: rest.iter().any(|a| a == "--json"),
+            })
         }
         other => Err(format!("volume: unknown action {other:?} (expected list)")),
     }
@@ -180,7 +183,7 @@ fn run(cmd: Subcommand) -> i32 {
     match cmd {
         Subcommand::Snapshot { target, op } => run_snapshot(&target, op),
         Subcommand::Clone { image, src, dst } => run_clone(&image, &src, &dst),
-        Subcommand::VolumeList { image } => run_volume_list(&image),
+        Subcommand::VolumeList { target, json } => run_volume_list(&target, json),
     }
 }
 
@@ -532,47 +535,140 @@ fn run_clone(image: &str, src: &str, dst: &str) -> i32 {
 // volume list
 // ---------------------------------------------------------------------------
 
-fn run_volume_list(image: &str) -> i32 {
-    let mut dev = match open_container_ro(image) {
-        Ok(d) => d,
+fn run_volume_list(target: &Target, json: bool) -> i32 {
+    let done = match target {
+        Target::Image(path) => {
+            open_container_ro(path).and_then(|mut dev| volume_list_on(&mut dev, json))
+        }
+        Target::Drive(n) => volume_list_on_drive(*n, json),
+    };
+    match done {
+        Ok(()) => 0,
         Err(e) => {
             eprintln!("error: {e}");
-            return 1;
+            1
         }
-    };
-    let container = match Container::open(&mut dev) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: container open: {e:?}");
-            return 1;
-        }
-    };
-    let volumes = match container.list_volumes(&mut dev) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("error: list_volumes: {e:?}");
-            return 1;
-        }
-    };
+    }
+}
 
+#[cfg(not(windows))]
+fn volume_list_on_drive(_n: u32, _json: bool) -> Result<(), String> {
+    Err("--drive is only supported on Windows".to_string())
+}
+
+/// `\\.\PhysicalDrive<n>` read-only and shared: listing reads, so a drive
+/// with a volume mounted is listed too.
+#[cfg(windows)]
+fn volume_list_on_drive(n: u32, json: bool) -> Result<(), String> {
+    let mut pd =
+        crate::winraw::PhysicalDrive::open(n).map_err(|e| format!("open PhysicalDrive{n}: {e}"))?;
+    let sec = pd.sector();
+    let range = crate::gpt::find_apfs_container(&mut pd, sec)
+        .map_err(|e| format!("find apfs container: {e:?}"))?;
+    volume_list_on(
+        &mut OffsetBlockDevice::new(pd, range.offset, range.length),
+        json,
+    )
+}
+
+fn volume_list_on<D: BlockDevice>(dev: &mut D, json: bool) -> Result<(), String> {
+    if json {
+        println!("{}", volumes_json(dev)?);
+        return Ok(());
+    }
+    let container = Container::open(dev).map_err(|e| format!("container open: {e:?}"))?;
+    let volumes = container
+        .list_volumes(dev)
+        .map_err(|e| format!("list_volumes: {e:?}"))?;
     if volumes.is_empty() {
         println!("(no volumes found)");
-        return 0;
+        return Ok(());
     }
-
     println!("{:<5} {:<36} {:<12} {:<20}", "IDX", "UUID", "ROLE", "NAME");
     println!("{}", "-".repeat(76));
     for v in &volumes {
-        let uuid_str = format_uuid(&v.uuid);
         println!(
             "{:<5} {:<36} {:<12} {}",
             v.index,
-            uuid_str,
+            format_uuid(&v.uuid),
             format!("{:?}", v.role),
             v.name
         );
     }
-    0
+    Ok(())
+}
+
+/// The container's volumes and each one's snapshots as JSON, for the app:
+/// `{"volumes":[{"index","uuid","name","role","encrypted","system",
+/// "default","snapshots":[{"name","xid","created"}]}]}`. `default` marks
+/// the volume a mount picks when it names none (the Data volume, else the
+/// first that is not a system volume), `xid` is hex as `--snapshot-xid`
+/// takes it, `created` nanoseconds since 1970.
+fn volumes_json<D: BlockDevice>(dev: &mut D) -> Result<String, String> {
+    let container = Container::open(dev).map_err(|e| format!("container open: {e:?}"))?;
+    let bsz = container.superblock.block_size;
+    let volumes = container
+        .list_volumes(dev)
+        .map_err(|e| format!("list_volumes: {e:?}"))?;
+    let default = volumes
+        .iter()
+        .position(|v| v.role == apfs_core::VolumeRole::Data)
+        .or_else(|| volumes.iter().position(|v| !v.system));
+    let mut out = String::from("{\"volumes\":[");
+    for (i, v) in volumes.iter().enumerate() {
+        // A snapshot tree that cannot be read lists no snapshots; the
+        // volume itself can still be mounted.
+        let snaps = apfs_core::snapshot::list(dev, v.snap_meta_tree_oid, bsz).unwrap_or_else(|e| {
+            eprintln!("volume {}: snapshots unreadable: {e:?}", v.index);
+            Vec::new()
+        });
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"index\":{},\"uuid\":{},\"name\":{},\"role\":{},\"encrypted\":{},\"system\":{},\"default\":{},\"snapshots\":[",
+            v.index,
+            json_string(&format_uuid(&v.uuid)),
+            json_string(&v.name),
+            json_string(&format!("{:?}", v.role)),
+            v.encrypted,
+            v.system,
+            default == Some(i),
+        ));
+        for (j, sn) in snaps.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "{{\"name\":{},\"xid\":{},\"created\":{}}}",
+                json_string(&sn.name),
+                json_string(&format!("{:#x}", sn.xid)),
+                sn.create_time
+            ));
+        }
+        out.push_str("]}");
+    }
+    out.push_str("]}");
+    Ok(out)
+}
+
+/// `s` as a JSON string literal.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -608,11 +704,12 @@ pub fn print_subcmd_usage() {
          apfs-mount snapshot delete <target> --xid <xid>\n\
          apfs-mount snapshot revert <target> --xid <xid>\n\
          apfs-mount clone           --image <path> --src <vol-path> --dst <vol-path>\n\
-         apfs-mount volume  list    --image <path>\n\
+         apfs-mount volume  list    <target> [--json]\n\
          \n\
          Note: <target> is --image <path> or, on Windows, --drive <N> (a drive\n\
                that is not mounted; N as in Get-Disk).\n\
          Note: <path> is an APFS container image or a GPT disk image holding one.\n\
+         Note: revert deletes the snapshots taken after <xid>; <xid> itself stays.\n\
          Note: <xid> is decimal or hex (e.g. 0x1a2).\n\
          Note: <vol-path> is volume-relative POSIX path (e.g. /dir/file.txt)."
     );
@@ -733,8 +830,55 @@ mod tests {
         if !std::path::Path::new(IMG).exists() {
             gen_scratch();
         }
-        let code = run_volume_list(IMG);
+        let code = run_volume_list(&Target::Image(IMG.to_string()), false);
         assert_eq!(code, 0, "volume list failed");
+    }
+
+    /// The JSON the app reads names each volume, marks the one a mount
+    /// picks by default, and lists its snapshots with the xid a mount takes.
+    #[test]
+    fn volume_list_json_names_volumes_and_snapshots() {
+        if !check_gate() {
+            println!("volume_list_json: APFS_WRITE_SCRATCH not set - skip");
+            return;
+        }
+        let img = "/tmp/apfs-subcmd-volume-json.img";
+        let o = std::process::Command::new("cargo")
+            .args([
+                "run",
+                "--quiet",
+                "-p",
+                "xtask",
+                "--",
+                "gen-scratch",
+                img,
+                "64",
+            ])
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "gen-scratch failed");
+        let snap = Subcommand::Snapshot {
+            target: Target::Image(img.to_string()),
+            op: SnapOp::Create("before \"edit\"".to_string()),
+        };
+        assert_eq!(run(snap), 0, "snapshot create failed");
+        let mut dev = open_container_ro(img).unwrap();
+        let json = volumes_json(&mut dev).unwrap();
+        assert!(json.starts_with("{\"volumes\":[{\"index\":0,"), "{json}");
+        assert!(json.contains("\"default\":true"), "{json}");
+        assert!(json.contains("\"encrypted\":false"), "{json}");
+        assert!(json.contains("\"name\":\"before \\\"edit\\\"\""), "{json}");
+        assert!(json.contains("\"xid\":\"0x"), "{json}");
+        let _ = std::fs::remove_file(img);
+    }
+
+    #[test]
+    fn json_strings_are_escaped() {
+        assert_eq!(
+            json_string("a\"b\\c\nd\u{1}é"),
+            "\"a\\\"b\\\\c\\nd\\u0001é\""
+        );
     }
 
     /// try_dispatch returns false for unknown first token.

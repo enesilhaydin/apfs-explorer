@@ -29,6 +29,9 @@
 //! --volume-index <N>     select volume at position N in the container's
 //!                        fs_oids array (0-based). Mutually exclusive with
 //!                        --volume-uuid and --volume-role.
+//! --snapshot <NAME>      mount the volume as snapshot NAME holds it,
+//!                        read-only (`snapshot list` shows the names).
+//! --snapshot-xid <XID>   the same, naming the snapshot by its xid.
 
 #[cfg(not(windows))]
 fn main() {
@@ -179,6 +182,7 @@ fn run_mount(args: &[String]) {
     let mut volume_uuid: Option<String> = None;
     let mut volume_role: Option<String> = None;
     let mut volume_index: Option<u32> = None;
+    let mut snapshot: Option<apfs::SnapshotRef> = None;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -218,6 +222,28 @@ fn run_mount(args: &[String]) {
             "--volume-index" => {
                 volume_index = it.next().and_then(|s| s.parse().ok());
             }
+            "--snapshot" | "--snapshot-xid" => {
+                if snapshot.is_some() {
+                    eprintln!("error: --snapshot and --snapshot-xid are mutually exclusive");
+                    std::process::exit(1);
+                }
+                let Some(v) = it.next() else {
+                    eprintln!("error: {a} needs a value");
+                    std::process::exit(1);
+                };
+                snapshot = Some(if a == "--snapshot" {
+                    apfs::SnapshotRef::Name(v.clone())
+                } else {
+                    let hex = v.trim_start_matches("0x").trim_start_matches("0X");
+                    match u64::from_str_radix(hex, 16) {
+                        Ok(x) => apfs::SnapshotRef::Xid(x),
+                        Err(_) => {
+                            eprintln!("error: --snapshot-xid takes a hex xid, as `snapshot list` prints it");
+                            std::process::exit(1);
+                        }
+                    }
+                });
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -228,6 +254,12 @@ fn run_mount(args: &[String]) {
                 std::process::exit(1);
             }
         }
+    }
+
+    // A snapshot is never written.
+    if snapshot.is_some() && writable {
+        println!("a snapshot mounts read-only; --writable is ignored");
+        writable = false;
     }
 
     // Validate: at most one volume selector.
@@ -389,7 +421,13 @@ fn run_mount(args: &[String]) {
 
     if let Some(img_path) = image {
         // -- image mode --
-        match winfsp_host::image_mount::mount_apfs_image(&img_path, writable, &mount, selector) {
+        match winfsp_host::image_mount::mount_apfs_image(
+            &img_path,
+            writable,
+            &mount,
+            selector,
+            snapshot.as_ref(),
+        ) {
             Ok((mut host, dirty)) => run_host!(host, dirty, None),
             Err(e) => {
                 eprintln!("image mount failed: {e:?}");
@@ -398,7 +436,7 @@ fn run_mount(args: &[String]) {
         }
     } else {
         // -- physical drive mode --
-        match winfsp_host::mount::mount_apfs(drive, &mount, writable, selector) {
+        match winfsp_host::mount::mount_apfs(drive, &mount, writable, selector, snapshot.as_ref()) {
             Ok((mut host, dirty, presence)) => run_host!(host, dirty, Some(presence)),
             Err(e) => {
                 eprintln!("mount failed: {e:?}");
@@ -452,10 +490,15 @@ VOLUME SELECTION (at most one; default: the user Data volume):
   roles: none system user recovery vm preboot installer data
          baseband update xart hardware backup
 
+SNAPSHOT (read-only; `apfs-mount snapshot list` shows them):
+  --snapshot <NAME>     mount the volume as snapshot NAME holds it
+  --snapshot-xid <XID>  the same, by the xid `snapshot list` prints
+
 EXAMPLES:
   apfs-mount --drive 2                      read-only mount of PhysicalDrive2, auto letter
   apfs-mount --drive 2 --mount E:           read-only mount at E:
   apfs-mount --image backup.dmg --mount E:  mount a disk image at E:
+  apfs-mount --drive 2 --snapshot before-edit   the volume as that snapshot holds it
 
 "#
     );

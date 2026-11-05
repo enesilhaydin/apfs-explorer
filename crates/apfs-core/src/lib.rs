@@ -41,6 +41,10 @@ pub use jkey::{JKey, ROOT_DIR_INO_NUM};
 pub mod catalog;
 pub use catalog::{Catalog, DirEntry};
 
+/// The snapshots a volume records.
+pub mod snapshot;
+pub use snapshot::SnapshotMeta;
+
 pub mod inode;
 pub use inode::{Inode, JDstream};
 

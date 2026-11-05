@@ -284,9 +284,10 @@ impl<D: BlockDevice> BlockDevice for CachingBlockDevice<D> {
 }
 
 impl<D: WritableBlockDevice> WritableBlockDevice for CachingBlockDevice<D> {
-    /// Drop the entire read-ahead set. Used by `with_writable` between a
-    /// committed transaction and the next FsView open so the reopened
-    /// container always re-reads metadata from the durable inner device.
+    /// Drop the entire read-ahead set. Used after a commit that failed part
+    /// way, so the reopened container re-reads metadata from the inner
+    /// device. A commit that succeeded keeps the cache: its writes went
+    /// through [`Self::write_at`], which drops what they overlap.
     fn invalidate_read_cache(&mut self) {
         self.blocks.clear();
         self.lru.clear();

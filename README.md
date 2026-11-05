@@ -41,14 +41,14 @@
 | Files macOS stored compressed (zlib, LZVN, LZFSE, LZBITMAP): read; written back uncompressed | ✅ Full |
 | Clones macOS made: read; writing to one side copies only that file's stream | ✅ Full |
 | Many operations to one checkpoint (write grouping, at most ~1 s open) | ✅ Full |
-| Snapshot create / list / delete / revert | ✅ Full |
+| Snapshot create / list / delete / revert, and mounting one read-only | ✅ Full |
 | Clone (reflink) via CLI / image | ✅ Full |
 | Symlink + Windows reparse round-trip | ✅ Full |
 | BSD flags (hidden, immutable, append-only) | ✅ Full |
 | NFD normalization + full Unicode case-fold | ✅ Full |
 | Image-mount mode (`.img` / `.dmg` raw, whole disk or bare container) | ✅ Full |
 | CLI subcommands (mount, snapshot, clone, volume list) | ✅ Full |
-| Desktop GUI (detect / mount / browse / unmount) | ✅ Full |
+| Desktop GUI (detect / pick a volume or snapshot / mount / browse / unmount) | ✅ Full |
 | Audit-verified against reference implementations | ✅ Full |
 | Real-disk validated against macOS (fsck-clean, macOS keeps editing what we wrote) | ✅ Full |
 | Hard links: read | ✅ Full |
@@ -99,10 +99,11 @@ Why it goes both ways:
   read twice is read from the drive twice, where NTFS answers the second
   time from memory.
 
-Memory: the mount process holds a few MB of its own idle, 6 to 15 MB
-through a 5-minute mixed workload (12 000 operations), and at most about
-60 MB while copying 10 000 files or editing a 2 GiB file; its metadata
-cache is capped at 64 MiB.
+Memory: the mount process holds a few MB of its own idle. Its metadata
+cache, capped at 64 MiB, now outlives each commit, so the process grows
+to about 80 MB through a 5-minute mixed workload (12 600 operations) and
+stays there, and reaches about 110 MB at most in the largest tests
+(100 000 files in one folder).
 
 ---
 
@@ -156,10 +157,15 @@ apfs-mount --drive 2 --volume-role system
 apfs-mount --image disk.img --volume-index 1
 apfs-mount --image disk.img --volume-uuid 1F2E3D4C-5B6A-7980-A1B2-C3D4E5F60718
 
+# Mount the volume as one of its snapshots holds it (always read-only)
+apfs-mount --drive 2 --snapshot before-edit
+apfs-mount --drive 2 --snapshot-xid 0x1a2
+
 # One-shot subcommands (no WinFsp needed). --image takes a whole-disk image
 # (GPT) or a bare container; the snapshot ones also take --drive N, a drive
 # that is not mounted (they refuse one that is):
 apfs-mount volume   list   --image disk.img
+apfs-mount volume   list   --drive 2 --json     # also lists each volume's snapshots
 apfs-mount snapshot list   --drive 2
 apfs-mount snapshot create --image disk.img --name before-edit
 apfs-mount snapshot delete --drive 2 --xid 0x1a2   # xid as `snapshot list` prints it
@@ -233,13 +239,6 @@ silently on first run when absent. No separate download is needed.
   has no hard-link support. The library can create hard links.
 - Writing to a file macOS stored compressed writes it back uncompressed (as
   macOS itself does on the first write to one).
-- A volume that has snapshots is mounted read-only even when writing was
-  asked for. The library writes under snapshots (and its tests check the
-  result with `fsck_apfs`), but it rewrites the whole catalog for every
-  operation there: on a USB drive holding 120 000 files, deleting 20 files
-  under a snapshot took 11 s. Delete the snapshots (on a Mac, or with
-  `apfs-mount snapshot delete --drive N` while the drive is not mounted) to
-  write from Windows.
 - Extended attributes (xattrs) are not shown to Windows programs.
 - Write support requires WinFsp 2.1 or later.
 - FileVault / sealed volumes / Fusion Drive: not supported (out of scope).
@@ -287,6 +286,9 @@ as Intel Macs.
 **Snapshot compatibility?**
 Snapshots created by APFS Explorer are compatible with macOS: `diskutil apfs
 listSnapshots` shows them by name, and the volume passes `fsck_apfs` with them.
+Writing to a volume that has snapshots (Time Machine's included) leaves them
+as they are: each keeps the files as they were when it was taken, and the app
+can mount any of them read-only.
 
 **Hard links?**
 Reading existing hard links works. Creating them from Windows does not: WinFsp

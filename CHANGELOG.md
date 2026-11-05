@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-05
+
+### Added
+
+- Mounting a volume as one of its snapshots holds it, read-only:
+  `apfs-mount --drive N --snapshot <name>` (or `--snapshot-xid <xid>`, as
+  `snapshot list` prints it; `--image` too). The snapshot's frozen volume
+  superblock names its catalog, which the live object map maps at the
+  snapshot's transaction; `--writable` is ignored for a snapshot. In the
+  library: `FsView::open_snapshot`, `FsView::snapshots` and
+  `apfs_core::snapshot::list`. Checked against macOS mounting the same
+  snapshot (`mount_apfs -s`): the files read the same, byte for byte, and
+  files changed or deleted after the snapshot read as they were. (#12)
+- The app lists the volumes of a drive and their snapshots: a drive whose
+  container holds several volumes gets a volume picker, and a volume with
+  snapshots a choice between the volume as it is now and each snapshot
+  (mounted read-only). Behind it, `apfs-mount volume list` takes
+  `--drive N` (opened read-only and shared, so a drive with a volume
+  mounted is listed too) and `--json`; the launcher classes take the
+  volume (`--volume-index %3`), and a new `apfs-mount-snap` class mounts a
+  snapshot (`--snapshot-xid %4`). (#18)
+
+### Changed
+
+- Writing to a volume that has snapshots changes the catalog along the
+  paths to the changed records, as without one. Every operation under a
+  snapshot rewrote the whole catalog and object map (deleting 20 files
+  under a snapshot on a drive of 120 000 took 11 s). A rewritten catalog
+  node now keeps the versions a snapshot froze mapped for it and gains
+  one at the new transaction; only versions newer than the newest snapshot
+  are replaced and released, and the volume's block count follows what is
+  written and released. On 3000 files under a snapshot: creating a file
+  writes 26 blocks (295 before; 25 without a snapshot), a range write 19,
+  a rename 22, an unlink 23. Checked with `fsck_apfs` after single and
+  grouped operations, against macOS reading the volume and the snapshot
+  and then writing to the volume itself, and after deleting the snapshot.
+  (#11)
+- So the Windows mount (and the app) writes to a volume that has
+  snapshots, Time Machine's included, instead of mounting it read-only.
+  Checked on Windows: a volume with a snapshot mounted writable took 200
+  new files, an edit, 101 deletions and a rename in under a second; back
+  on a Mac it was `fsck_apfs`-clean, read as written, and the snapshot
+  (mounted with `mount_apfs -s`) still held every file as it was.
+- `snapshot revert` (and `revert_to_snapshot`) works the way macOS does:
+  it reverts to any snapshot, deleting the ones taken after it, and keeps
+  the snapshot it reverts to. Only the latest snapshot could be reverted
+  to, and the revert deleted it. Everything happens in one transaction,
+  so the volume is either reverted or untouched. The snapshot kept names
+  the revert's transaction rather than the one it first froze (its name,
+  creation time and content are the same). Checked with four snapshots,
+  reverting to the second and again after more writes: `fsck_apfs`-clean
+  each time, and macOS reads the reverted files. (#13)
+- Deleting a large folder on the Windows mount is 23 times faster: 99 000
+  files on a USB drive went in 72 s with `Remove-Item -Recurse`, against
+  28 minutes before. Every commit dropped the whole read cache, and every
+  delete dropped the folder's cached listing, which Windows asks for again
+  after each delete, so the folder was read from the disk over and over.
+  The read cache now outlives a commit (each write already drops what it
+  overlaps), a delete takes only its own name out of the listing, and the
+  cached names carry over a commit.
+
+### Fixed
+
+- A volume with many snapshots. The snapshot metadata tree was read and
+  written as a single node, which holds about 25 snapshots: taking one more
+  failed, and on a volume where macOS had grown the tree past one node (a
+  Time Machine disk) `snapshot list`, `delete` and `revert` failed. The
+  object map's snapshot tree had the same limit at 142 snapshots, and only
+  its root was freed when it was rebuilt. Both trees are now read at any
+  depth and written with as many levels as they need, every old node is
+  freed, and the volume's block count follows the node counts. Checked
+  with 150 snapshots: both trees go past one node, taking, deleting and
+  reverting stay `fsck_apfs`-clean, macOS lists the same snapshots, and
+  after macOS deletes one from a tree written here it reads back as macOS
+  left it. (#14)
+
 ## [1.1.1] - 2026-11-02
 
 ### Changed

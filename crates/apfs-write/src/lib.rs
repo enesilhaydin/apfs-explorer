@@ -3,6 +3,7 @@
 
 pub mod file;
 pub(crate) mod free_runs;
+pub(crate) mod phys_tree;
 pub mod scratch;
 pub mod sm_fq;
 pub mod snapshot;

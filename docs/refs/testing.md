@@ -57,10 +57,24 @@ GitHub Actions runners** (no personal Mac required):
 
 ## Fuzzing
 
-- `cargo-fuzz` targets: superblock, omap, btree node, file extent, decmpfs header,
-  keybag. Short smoke run in CI; longer run nightly.
-- Every panic/crash found → first write a failing test (add to corpus), then fix
-  (TDD bugfix rule).
+`fuzz/` holds `cargo-fuzz` targets (nightly toolchain, kept out of the main
+workspace):
+
+| Target | Input |
+|---|---|
+| `parse_blocks` | every block and record parser: object header, container and volume superblocks, object map, B-tree nodes and each of their records, inode, data stream, extended fields, keys, extended attributes, decmpfs header |
+| `decompress` | LZVN, LZBITMAP and the decmpfs decoder (zlib, LZFSE, LZVN, LZBITMAP; attribute and resource fork) |
+| `names` | case folding, normalization and name hashing |
+| `open_image` | the input as a whole drive: find the container, open the volume, walk every directory, read files and attributes, list the snapshots and open each |
+
+```sh
+sh scripts/fuzz-seeds.sh                       # macOS: seed images for open_image
+cd fuzz && cargo +nightly fuzz run open_image -O -- -max_len=2300000 -rss_limit_mb=3072
+```
+
+The `Fuzz` workflow runs every target each week (and on demand) on macOS,
+where the seed images can be made. Every crash found: first a failing test
+from the input, then the fix (TDD bugfix rule).
 
 ## CI summary (`.github/workflows/ci.yml`)
 
@@ -70,6 +84,6 @@ GitHub Actions runners** (no personal Mac required):
 | test | ubuntu | Layer 1 + coverage |
 | gen-fixtures | macos | `xtask gen-fixtures` (cache/LFS) |
 | win-integration | windows | Layer 2(a): WinFsp + mount fixture |
-| fuzz-smoke | ubuntu | `cargo-fuzz` short run |
+| fuzz (`fuzz.yml`) | macos | every `cargo-fuzz` target, weekly and on demand |
 
 Real hardware (Layer 2b) runs manually or on a schedule - SSH target is kept private.

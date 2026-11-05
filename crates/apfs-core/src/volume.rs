@@ -129,6 +129,9 @@ pub const APFS_FS_UNENCRYPTED: u64 = 0x0000_0001;
 /// before any mutation, which we do not implement.
 pub const APFS_INCOMPAT_SEALED_VOLUME: u64 = 0x0000_0020;
 
+/// Offset of `apfs_snap_meta_tree_oid` in the volume superblock.
+const VSB_SNAP_META_TREE_OID: usize = 0x98;
+
 /// Offset of `apfs_fext_tree_oid` in the volume superblock.
 /// [linux-apfs-rw apfs_raw.h /*400*/ integrity_meta_oid + 8; decoded on a
 /// macOS cryptex volume: 0x408 names a physical FEXT_TREE root]
@@ -143,6 +146,9 @@ pub struct VolumeSuperblock {
     pub incompatible_features: u64,
     pub omap_oid: u64,
     pub root_tree_oid: u64,
+    /// `apfs_snap_meta_tree_oid` u64@0x98: physical root of the snapshot
+    /// metadata tree (0 on a volume without one).
+    pub snap_meta_tree_oid: u64,
     /// `apfs_fext_tree_oid` u64@0x408: on a sealed volume, the physical root
     /// of the tree holding every file extent (the catalog holds none).
     pub fext_tree_oid: u64,
@@ -178,6 +184,7 @@ impl VolumeSuperblock {
         let incompatible_features = u64_le(block, 56)?;
         let omap_oid = u64_le(block, 128)?;
         let root_tree_oid = u64_le(block, 136)?;
+        let snap_meta_tree_oid = u64_le(block, VSB_SNAP_META_TREE_OID)?;
         let fext_tree_oid = u64_le(block, VSB_FEXT_TREE_OID)?;
         let fs_flags = u64_le(block, 264)?;
         let role = u16_le(block, 964)?;
@@ -208,6 +215,7 @@ impl VolumeSuperblock {
             incompatible_features,
             omap_oid,
             root_tree_oid,
+            snap_meta_tree_oid,
             fext_tree_oid,
             name,
             uuid,

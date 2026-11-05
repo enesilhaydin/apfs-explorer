@@ -188,7 +188,7 @@ mod multi {
         assert_eq!(snap_count(), 2, "after snap2: BOTH snapshots retained");
         assert!(snap2 > snap1, "snap2 xid must exceed snap1");
 
-        // revert most-recent (snap_2) - snap_1 must survive, still fsck-clean.
+        // revert most-recent (snap_2) - snap_1 must survive, snap_2 stays, still fsck-clean.
         {
             let (vsb, om) = read_vsb_omap();
             let mut txn = open_txn();
@@ -196,7 +196,11 @@ mod multi {
             txn.commit().expect("commit revert");
         }
         fsck_clean("after-revert-snap2");
-        assert_eq!(snap_count(), 1, "after revert(snap2): snap1 survives");
+        assert_eq!(
+            snap_count(),
+            2,
+            "after revert(snap2): snap1 survives and snap2 stays, as on macOS"
+        );
 
         println!(
             "#139 PASS: two snapshots retained, revert leaves earlier snapshot, all fsck-clean"

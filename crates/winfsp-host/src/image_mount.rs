@@ -112,6 +112,7 @@ pub fn mount_apfs_image(
     writable: bool,
     mountpoint: &str,
     selector: apfs::VolumeSelector,
+    snapshot: Option<&apfs::SnapshotRef>,
 ) -> winfsp::Result<(
     winfsp::host::FileSystemHost<crate::mount::ApfsFs<ImageDev>, winfsp::host::FineGuard>,
     std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -134,12 +135,13 @@ pub fn mount_apfs_image(
         FileBlockDeviceRw::open_rw(path).map_err(io_err("FileBlockDeviceRw::open_rw"))?;
 
     let dev = CachingBlockDevice::new(OffsetBlockDevice::new(file_dev, range.offset, range.length));
-    let mut fsview = FsView::open_selected(crate::group::GroupDev::Plain(dev), selector)
-        .map_err(io_err("FsView::open"))?;
-    // Snapshot-guard (#149): writing to a CLEAN volume is fsck-validated on real
-    // hardware, but writing to a SNAPSHOTTED volume hits the unproven
-    // snapshot-pinned sm_fq free path (fsck-fails). Refuse writable when the
-    // volume has snapshots and fall back to read-only.
+    // A snapshot is never written.
+    let writable = writable && snapshot.is_none();
+    let mut fsview = match snapshot {
+        Some(s) => FsView::open_snapshot(crate::group::GroupDev::Plain(dev), selector, s),
+        None => FsView::open_selected(crate::group::GroupDev::Plain(dev), selector),
+    }
+    .map_err(io_err("FsView::open"))?;
     let writable = crate::mount::effective_writable(&mut fsview, writable);
     // P14: stable Windows volume serial from the APFS volume UUID (OR 1).
     let serial = {

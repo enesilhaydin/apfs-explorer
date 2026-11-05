@@ -6728,10 +6728,11 @@ fn rewrite_fstree_impl<D: WritableBlockDevice>(
 /// The edits apply in the rebuild's order: the parent patch, then
 /// `update_records`, then `remove_keys`, then `new_records`, so a key removed
 /// and added again is replaced, and a new key already present is refused.
-/// Whether this transaction changes the catalog path by path: on a volume
-/// without snapshots, unless it was asked to rebuild in full.
-fn catalog_by_paths<D: WritableBlockDevice>(txn: &Transaction<D>, vsb_raw: &[u8]) -> bool {
-    !txn.full_rebuild() && rd_u64(vsb_raw, VSBI_NUM_SNAPSHOTS) == 0
+/// Whether this transaction changes the catalog path by path: unless it was
+/// asked to rebuild in full. Under a snapshot as well: the snapshot keeps
+/// the versions of the nodes it froze mapped (see `rewrite_catalog_batch`).
+fn catalog_by_paths<D: WritableBlockDevice>(txn: &Transaction<D>, _vsb_raw: &[u8]) -> bool {
+    !txn.full_rebuild()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6778,9 +6779,15 @@ fn entries_changed(pino: u64, delta: i64, now: u64) -> EditOp {
     }))
 }
 
-/// Apply `batch` to the catalog of a volume without snapshots, rewriting only
-/// the nodes on the paths to the changed records and the object-map nodes
-/// that map them.
+/// Apply `batch` to the catalog, rewriting only the nodes on the paths to
+/// the changed records and the object-map nodes that map them.
+///
+/// Under a snapshot the catalog nodes it froze are shared with it: a
+/// rewritten node gains a mapping at this transaction and keeps every
+/// mapping at or before the newest snapshot's, whose block stays the
+/// snapshot's; only versions newer than the snapshot are replaced and their
+/// blocks released (apfs.kext and linux-apfs-rw copy a node a snapshot
+/// shares the same way, leaving its old version mapped).
 fn rewrite_catalog_batch<D: WritableBlockDevice>(
     txn: &mut Transaction<D>,
     vsb_raw: &[u8],
@@ -6797,6 +6804,13 @@ fn rewrite_catalog_batch<D: WritableBlockDevice>(
         bsz,
     );
     tree.apply(txn, rd_u64(vsb_raw, VSBI_ROOT_TREE_OID), batch)?;
+    let newest_snap = if rd_u64(vsb_raw, VSBI_NUM_SNAPSHOTS) > 0 {
+        let mut vom = vec![0u8; bsz];
+        txn.read_block(rd_u64(vsb_raw, VSBI_OMAP_OID), &mut vom)?;
+        rd_u64(&vom, 64) // om_most_recent_snap
+    } else {
+        0
+    };
     let old_omap_root_paddr = rd_u64(omap_node, 8);
     let remap = remap_catalog_nodes(
         txn,
@@ -6804,12 +6818,18 @@ fn rewrite_catalog_batch<D: WritableBlockDevice>(
         old_omap_root_paddr,
         &tree.remapped,
         new_xid,
-        0,
+        newest_snap,
         bsz,
     )?;
+    // The volume gains a block for each node version written and loses one
+    // for each version released. Without a snapshot every rewritten node
+    // releases its old version, and this is the tree's own growth; under
+    // one, the versions the snapshot keeps stay counted.
+    let written = tree.remapped.iter().filter(|(_, p)| p.is_some()).count() as i64;
+    let released = remap.catalog_superseded.len() as i64;
     Ok(FstreeRewrite {
         omap_tree_paddr: remap.root,
-        node_delta: tree.nodes_added + remap.omap_nodes_added,
+        node_delta: written - released + remap.omap_nodes_added,
         reclaim: Reclaim::Exact {
             omap_nodes: remap.omap_superseded,
             catalog: remap.catalog_superseded,

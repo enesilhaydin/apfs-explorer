@@ -33,6 +33,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_drives,
+            commands::list_volumes,
             commands::mount_drive,
             commands::unmount_drive,
             commands::open_drive_letter,

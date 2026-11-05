@@ -769,7 +769,14 @@ fn verify_scratch(path: &str) -> Result<String, String> {
         }
     };
 
-    let fsck_out = String::from_utf8_lossy(&fsck_result.stdout);
+    // fsck_apfs writes its progress to standard output and its warnings, such
+    // as "apfs_fs_alloc_count is not valid", to standard error: read both.
+    // Reading standard output alone passed volumes whose block count was off.
+    let fsck_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&fsck_result.stdout),
+        String::from_utf8_lossy(&fsck_result.stderr)
+    );
     // fsck_apfs -n returns exit 0 and prints "appears to be OK" even when the
     // container has space-accounting problems - those surface only as "warning:"
     // / "Fix …?" lines (e.g. "overallocation detected", "apfs_fs_alloc_count is

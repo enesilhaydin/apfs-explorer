@@ -114,3 +114,9 @@ xtask/CLAUDE.md
 /docs/m8-realdisk-benchmark.md
 /docs/tested-platforms.md
 /tools/r156-exp/
+
+# Fuzzing: build output, the corpus libFuzzer grows, and what it finds.
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage

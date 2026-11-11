@@ -63,6 +63,12 @@ pub enum ContainerError {
     MissingEphemeral {
         oid: u64,
     },
+    /// The checkpoint gives an ephemeral object a size that is not a whole
+    /// number of blocks, or one too large to be read.
+    BadEphemeralSize {
+        oid: u64,
+        size: u32,
+    },
 }
 
 /// `spaceman_phys_t`: after the 32-byte object header and four u32 sizes
@@ -150,20 +156,13 @@ impl Container {
     /// the current checkpoint, reached through its checkpoint map.
     pub fn free_block_count<D: BlockDevice>(&self, dev: &mut D) -> Result<u64, ContainerError> {
         let nx = &self.superblock;
-        let paddr = crate::checkpoint::ephemeral_paddr(dev, nx, nx.spaceman_oid)?.ok_or(
+        // The whole space manager: on a large container it spans more than
+        // a block, and its checksum covers all of it.
+        let buf = crate::checkpoint::ephemeral_object(dev, nx, nx.spaceman_oid)?.ok_or(
             ContainerError::MissingEphemeral {
                 oid: nx.spaceman_oid,
             },
         )?;
-        let bsz = nx.block_size as usize;
-        let off = paddr
-            .checked_mul(bsz as u64)
-            .ok_or(ContainerError::MissingEphemeral {
-                oid: nx.spaceman_oid,
-            })?;
-        let mut buf = vec![0u8; bsz];
-        dev.read_at(off, &mut buf)?;
-        crate::checksum::verify_block(&buf)?;
         let free = crate::endian::u64_le(&buf, SPACEMAN_MAIN_FREE_COUNT)?;
         let queued = crate::endian::u64_le(&buf, SPACEMAN_MAIN_FREE_QUEUE_COUNT)?;
         Ok(free.saturating_add(queued))

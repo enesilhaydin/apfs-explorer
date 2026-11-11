@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-11
+
+### Fixed
+
+- Drives of about 4 TB and larger showed in Windows Explorer as 1 GB with
+  512 MB free. On a container that large macOS writes the space manager
+  over two blocks, and its checksum covers both; the free-space count read
+  only the first, failed the checksum, and the mount fell back to fixed
+  figures without saying so. The space manager is now read whole, and a
+  failure to read the volume's size is logged. Checked on a 4 TB volume
+  formatted by macOS: total size as `df` reports it. Reading and writing
+  files were not affected: the write path already read the space manager
+  whole. (#23)
+
 ## [1.2.0] - 2026-11-05
 
 ### Added

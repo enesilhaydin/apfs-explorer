@@ -100,14 +100,70 @@ pub fn ephemeral_paddr<D: BlockDevice>(
     nx: &NxSuperblock,
     oid: u64,
 ) -> Result<Option<u64>, ContainerError> {
+    Ok(ephemeral_mapping(dev, nx, oid)?.map(|(paddr, _)| paddr))
+}
+
+/// The most blocks an ephemeral object is read as. The space manager, the
+/// largest, spans a second block on a 4 TB container (its chunk-info
+/// addresses outgrow the first); this leaves room far past any disk.
+const EPHEMERAL_MAX_BLOCKS: u32 = 256;
+
+/// The whole ephemeral object `oid` of the checkpoint `nx`, its checksum
+/// verified over all of it. An object can span several blocks (`cme_size`);
+/// in the checkpoint data area, a ring, it goes on at the area's first block
+/// past its last. Reading only the first block failed the checksum of a
+/// two-block space manager. `Ok(None)` as for [`ephemeral_paddr`].
+pub fn ephemeral_object<D: BlockDevice>(
+    dev: &mut D,
+    nx: &NxSuperblock,
+    oid: u64,
+) -> Result<Option<Vec<u8>>, ContainerError> {
+    let Some((paddr, size)) = ephemeral_mapping(dev, nx, oid)? else {
+        return Ok(None);
+    };
+    let bsize = nx.block_size;
+    let blocks = size / bsize;
+    if size == 0 || size % bsize != 0 || blocks > EPHEMERAL_MAX_BLOCKS {
+        return Err(ContainerError::BadEphemeralSize { oid, size });
+    }
+    let (area, area_len) = (nx.xp_data_base, u64::from(nx.xp_data_blocks & 0x7FFF_FFFF));
+    let in_area = area > 0 && area_len > 0 && {
+        let area = area as u64;
+        paddr >= area && paddr - area < area_len
+    };
+    let bad = || ContainerError::BadEphemeralSize { oid, size };
+    let mut obj = vec![0u8; size as usize];
+    for (i, chunk) in obj.chunks_mut(bsize as usize).enumerate() {
+        let block = if in_area {
+            let area = area as u64;
+            area + (paddr - area + i as u64) % area_len
+        } else {
+            paddr.checked_add(i as u64).ok_or_else(bad)?
+        };
+        let off = block.checked_mul(u64::from(bsize)).ok_or_else(bad)?;
+        dev.read_at(off, chunk)?;
+    }
+    crate::checksum::verify_block(&obj)?;
+    Ok(Some(obj))
+}
+
+/// The block and size (`cme_paddr`, `cme_size`) the checkpoint `nx` gives
+/// the ephemeral object `oid`.
+fn ephemeral_mapping<D: BlockDevice>(
+    dev: &mut D,
+    nx: &NxSuperblock,
+    oid: u64,
+) -> Result<Option<(u64, u32)>, ContainerError> {
     use crate::endian::{u32_le, u64_le};
     use crate::obj::{ObjPhys, OBJECT_TYPE_CHECKPOINT_MAP};
     const XP_DESC_TREE_FLAG: u32 = 0x8000_0000;
     /// `checkpoint_map_phys_t`: `cpm_count` and the first `checkpoint_mapping_t`.
     const MAP_COUNT: usize = 36;
     const MAP_ENTRIES: usize = 40;
-    /// `checkpoint_mapping_t`: 40 bytes, `cme_oid` at 24, `cme_paddr` at 32.
+    /// `checkpoint_mapping_t`: 40 bytes, `cme_size` at 8, `cme_oid` at 24,
+    /// `cme_paddr` at 32.
     const ENTRY_LEN: usize = 40;
+    const ENTRY_SIZE: usize = 8;
     const ENTRY_OID: usize = 24;
     const ENTRY_PADDR: usize = 32;
 
@@ -140,7 +196,8 @@ pub fn ephemeral_paddr<D: BlockDevice>(
         for j in 0..count {
             let entry = MAP_ENTRIES + j * ENTRY_LEN;
             if u64_le(&buf, entry + ENTRY_OID)? == oid {
-                return Ok(Some(u64_le(&buf, entry + ENTRY_PADDR)?));
+                let paddr = u64_le(&buf, entry + ENTRY_PADDR)?;
+                return Ok(Some((paddr, u32_le(&buf, entry + ENTRY_SIZE)?)));
             }
         }
     }
@@ -191,6 +248,48 @@ mod tests {
         dev.0[4096..8192].copy_from_slice(&bad);
         dev.0[8192..12288].copy_from_slice(&sb);
         assert!(ephemeral_paddr(&mut dev, &nx, 1024).is_err());
+    }
+
+    /// A spaceman of two blocks, as macOS writes on a 4 TB container: its
+    /// checksum covers both blocks, and in the checkpoint data area it can
+    /// start on the area's last block and go on at its first.
+    #[test]
+    fn an_ephemeral_object_larger_than_a_block_is_read_whole() {
+        let mut sb = make_sb(9, 1, 3);
+        sb[136..140].copy_from_slice(&0u32.to_le_bytes());
+        sb[140..144].copy_from_slice(&2u32.to_le_bytes());
+        let c = fletcher64(&sb);
+        sb[0..8].copy_from_slice(&c.to_le_bytes());
+        let mut map = [0u8; 4096];
+        map[24..28].copy_from_slice(&(0x4000_000cu32).to_le_bytes());
+        map[36..40].copy_from_slice(&1u32.to_le_bytes());
+        // cme_size 8192, cme_oid 1024, cme_paddr 9: the data area's last block.
+        map[40 + 8..40 + 12].copy_from_slice(&8192u32.to_le_bytes());
+        map[40 + 24..40 + 32].copy_from_slice(&1024u64.to_le_bytes());
+        map[40 + 32..40 + 40].copy_from_slice(&9u64.to_le_bytes());
+        let c = fletcher64(&map);
+        map[0..8].copy_from_slice(&c.to_le_bytes());
+        let mut obj = vec![0u8; 8192];
+        obj[8..16].copy_from_slice(&1024u64.to_le_bytes());
+        obj[24..28].copy_from_slice(&0x8000_0005u32.to_le_bytes());
+        obj[5000] = 0x5A; // in the second block
+        let c = fletcher64(&obj);
+        obj[0..8].copy_from_slice(&c.to_le_bytes());
+        let mut img = vec![0u8; 4096 * 10];
+        img[4096..8192].copy_from_slice(&map);
+        img[8192..12288].copy_from_slice(&sb);
+        img[9 * 4096..10 * 4096].copy_from_slice(&obj[..4096]);
+        img[8 * 4096..9 * 4096].copy_from_slice(&obj[4096..]);
+        let mut dev = MemDev(img);
+        let nx = NxSuperblock::parse(&sb).unwrap();
+        assert_eq!(
+            ephemeral_object(&mut dev, &nx, 1024).unwrap(),
+            Some(obj.clone())
+        );
+        assert_eq!(ephemeral_object(&mut dev, &nx, 5).unwrap(), None);
+        // A damaged second block fails the object's checksum.
+        dev.0[8 * 4096 + 100] ^= 1;
+        assert!(ephemeral_object(&mut dev, &nx, 1024).is_err());
     }
 
     struct MemDev(Vec<u8>);

@@ -848,7 +848,16 @@ impl<D: WritableBlockDevice + Send + 'static> ApfsFs<D> {
                 .free_count
                 .saturating_mul(u64::from(txn.nx.block_size)));
         }
-        Ok(fs.volume_size().map(|(_, free)| free).unwrap_or(u64::MAX))
+        // Unknown free space refuses no write: the allocator still stops one
+        // the volume cannot hold.
+        Ok(fs.volume_size().map(|(_, free)| free).unwrap_or_else(|e| {
+            // Asked before every write: said once.
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!("free space unreadable, not checked: {e:?}");
+            }
+            u64::MAX
+        }))
     }
 
     /// Refuse a write the volume cannot hold, before accepting it.
@@ -1525,7 +1534,16 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
                 let fs = fs_guard
                     .as_mut()
                     .ok_or(winfsp::FspError::NTSTATUS(STATUS_IO_DEVICE_ERROR))?;
-                fs.volume_size().unwrap_or((1u64 << 30, 1u64 << 29))
+                fs.volume_size().unwrap_or_else(|e| {
+                    // Windows asks every few seconds: said once. The figures
+                    // below are what Explorer then shows, so a failure here
+                    // (a 4 TB drive's space manager, #23) is visible as one.
+                    static WARNED: AtomicBool = AtomicBool::new(false);
+                    if !WARNED.swap(true, Ordering::Relaxed) {
+                        tracing::warn!("volume size unreadable, reporting 1 GiB: {e:?}");
+                    }
+                    (1u64 << 30, 1u64 << 29)
+                })
             };
             out_volume_info.total_size = total;
             out_volume_info.free_size = free;

@@ -287,4 +287,112 @@ mod volume_size_macos {
         assert_eq!(total, want_total, "total bytes must be what macOS reports");
         assert_eq!(free, want_free, "free bytes must be what macOS reports");
     }
+
+    /// A raw disk node, read in whole sectors (a character device refuses
+    /// anything else), from the start of the APFS partition.
+    struct RawDisk {
+        f: std::fs::File,
+        base: u64,
+        size: u64,
+    }
+
+    impl apfs_core::block_device::BlockDevice for RawDisk {
+        fn size(&self) -> u64 {
+            self.size
+        }
+        fn read_at(
+            &mut self,
+            offset: u64,
+            buf: &mut [u8],
+        ) -> Result<(), apfs_core::block_device::BlockError> {
+            use std::os::unix::fs::FileExt;
+            let abs = self.base + offset;
+            let start = abs / 4096 * 4096;
+            let end = (abs + buf.len() as u64).div_ceil(4096) * 4096;
+            let mut tmp = vec![0u8; (end - start) as usize];
+            self.f.read_exact_at(&mut tmp, start)?;
+            let skip = (abs - start) as usize;
+            buf.copy_from_slice(&tmp[skip..skip + buf.len()]);
+            Ok(())
+        }
+    }
+
+    const BIG: &str = "/tmp/apfs-volume-4t";
+
+    /// A 4 TB container, as macOS formats it, kept as a sparse image. Its
+    /// space manager spans two blocks, checksummed together: read as one,
+    /// it failed the checksum, and the mount showed the drive as 1 GB with
+    /// 512 MB free (#23).
+    #[test]
+    #[ignore = "macOS: hdiutil"]
+    fn a_4_tb_container_reports_its_size() {
+        if !gate() {
+            return;
+        }
+        let img = format!("{BIG}.sparseimage");
+        let _ = std::fs::remove_file(&img);
+        let out = Command::new("hdiutil")
+            .args(["create", "-quiet", "-size", "4t", "-type", "SPARSE"])
+            .args([
+                "-layout", "GPTSPUD", "-fs", "APFS", "-volname", "BIG4T", BIG,
+            ])
+            .output()
+            .expect("hdiutil create");
+        assert!(out.status.success(), "hdiutil create failed");
+
+        // What macOS reports, from a read-only mount.
+        let out = Command::new("hdiutil")
+            .args(["attach", "-nobrowse", "-readonly", &img])
+            .output()
+            .expect("hdiutil attach");
+        assert!(out.status.success(), "hdiutil attach failed");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let mount = stdout
+            .lines()
+            .find_map(|l| l.find("/Volumes/").map(|p| l[p..].trim().to_string()))
+            .expect("no mount point");
+        let parent = |text: &str| {
+            text.lines()
+                .filter_map(|l| l.split_whitespace().next())
+                .filter_map(|d| d.strip_prefix("/dev/disk"))
+                .filter(|n| !n.contains('s'))
+                .filter_map(|n| n.parse::<u32>().ok())
+                .min()
+                .expect("no whole-disk node")
+        };
+        let (want_total, _) = macos_statfs(&mount);
+        let n = parent(&stdout);
+        assert!(Command::new("hdiutil")
+            .args(["detach", &format!("/dev/disk{n}")])
+            .status()
+            .expect("detach")
+            .success());
+
+        // What we report, from the raw disk.
+        let out = Command::new("hdiutil")
+            .args(["attach", "-nomount", "-readonly", &img])
+            .output()
+            .expect("hdiutil attach");
+        assert!(out.status.success(), "hdiutil attach -nomount failed");
+        let n = parent(&String::from_utf8_lossy(&out.stdout));
+        let raw = format!("/dev/rdisk{n}");
+        let mut f = std::fs::File::open(&raw).expect("open raw disk");
+        let mut head = vec![0u8; 64 * 1024];
+        std::io::Read::read_exact(&mut f, &mut head).expect("read GPT");
+        let (base, len) = find_apfs_range(&head);
+        let result = apfs::FsView::open(RawDisk { f, base, size: len })
+            .map_err(|e| format!("{e:?}"))
+            .and_then(|mut fs| fs.volume_size().map_err(|e| format!("{e:?}")));
+        let _ = Command::new("hdiutil")
+            .args(["detach", &format!("/dev/disk{n}")])
+            .status();
+        let _ = std::fs::remove_file(&img);
+        let (total, free) = result.expect("volume_size on a 4 TB container");
+        println!("4 TB container: macOS total {want_total}; we report total {total} free {free}");
+        assert_eq!(total, want_total, "total bytes must be what macOS reports");
+        // An empty volume: all but the metadata is free. (macOS caps the
+        // free space of a sparse image at what its host has left, so its
+        // own figure is not the one to compare with here.)
+        assert!(free > total / 100 * 99, "free {free} of {total}");
+    }
 }

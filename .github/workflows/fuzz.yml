@@ -30,14 +30,18 @@ jobs:
       - name: Run targets
         env:
           SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '300' }}
+        # The toolchain's own target: a cargo-fuzz built for another
+        # architecture (an x86_64 one on an arm64 runner) otherwise builds
+        # for that, and the toolchain has no library for it.
         run: |
           cd fuzz
+          host=$(rustc +nightly -vV | sed -n 's/^host: //p')
           for t in parse_blocks decompress names; do
-            cargo +nightly fuzz run "$t" -O -- -max_total_time="$SECONDS_PER_TARGET" \
-              -rss_limit_mb=2048 -timeout=20 -max_len=65536
+            cargo +nightly fuzz run "$t" -O --target "$host" -- \
+              -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=2048 -timeout=20 -max_len=65536
           done
-          cargo +nightly fuzz run open_image -O -- -max_total_time="$SECONDS_PER_TARGET" \
-            -rss_limit_mb=3072 -timeout=30 -max_len=2300000
+          cargo +nightly fuzz run open_image -O --target "$host" -- \
+            -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=3072 -timeout=30 -max_len=2300000
       - name: Keep what was found
         if: failure()
         uses: actions/upload-artifact@v7

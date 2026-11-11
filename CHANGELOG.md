@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-11
+
+### Changed
+
+- The Windows mount keeps file data it has read, in a cache of its own
+  capped at 64 MiB, beside the 64 MiB metadata cache. Windows does not
+  cache file data on the mount, so a file read again was read from the
+  drive again. On a USB drive, 4000 reads of 4 KiB at scattered places in
+  a 48 MiB file, done a second time: 1.75 s -> 0.22 s. A file read again
+  in order gains less (0.90 s -> 0.66 s for 48 MiB in 4 KiB pieces): each
+  request still makes the round trip from Windows to the mount. The cache
+  holds disk blocks, which change only through a write that drops them,
+  so it serves every file sharing a block, snapshots included. (#17)
+- The Windows mount logs a volume UUID it cannot read (the drive then gets
+  a stand-in serial number) and file attributes it cannot read while
+  listing a folder (the file is then listed with no size or times), where
+  it passed over both before.
+- Tests: containers of 1, 2, 4, 8, 32 and 64 TiB formatted by macOS, one
+  for each way macOS lays out the space manager as a container grows, are
+  read and written through the library and checked against macOS and
+  `fsck_apfs` (`size_matrix.rs`). The suite's 64 MB images never reached
+  the layout behind #23.
+
 ## [1.2.1] - 2026-11-11
 
 ### Fixed

@@ -17,7 +17,8 @@
     )
 )]
 
-#[cfg(test)]
+// macOS makes the image and the reference times (hdiutil, a Unix symlink).
+#[cfg(all(test, target_os = "macos"))]
 mod operation_times {
     use apfs_core::block_device::{BlockDevice, FileBlockDeviceRw, WritableOffsetBlockDevice};
     use apfs_core::container::Container;

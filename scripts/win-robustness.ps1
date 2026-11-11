@@ -28,7 +28,7 @@ param(
     # The soak keeps at most this much file data alive at once.
     [int]$SoakBudgetMiB = 256,
     # The soak fails when the mount's private memory passes this.
-    [int]$MemoryLimitMiB = 96,
+    [int]$MemoryLimitMiB = 192,
     # A scenario fails when the system's modified (unwritten) page list is
     # still this much larger than before it, once it has had time to drain.
     [int]$LeakLimitMiB = 256,
@@ -357,8 +357,9 @@ function Test-S5 {
         $detail = "ops $ops, files $($live.Count), mismatches $bad, private MB every 30 s: " +
             ($samples -join " ")
         if ($bad -gt 0) { throw $detail }
-        # The block cache may hold up to 64 MiB of metadata by design; more
-        # than that over the process's own few MB is growth with no bound.
+        # The caches may hold up to 64 MiB of metadata and 64 MiB of file
+        # content by design; more than that over the process's own few MB
+        # (and the cached listings) is growth with no bound.
         if ($peak -gt $MemoryLimitMiB) { throw "private memory reached $peak MB; $detail" }
         Result "PASS" $name $detail
     } catch {

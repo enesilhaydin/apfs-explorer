@@ -145,7 +145,10 @@ pub fn mount_apfs_image(
     let writable = crate::mount::effective_writable(&mut fsview, writable);
     // P14: stable Windows volume serial from the APFS volume UUID (OR 1).
     let serial = {
-        let u = fsview.volume_uuid().unwrap_or([0u8; 16]);
+        let u = fsview.volume_uuid().unwrap_or_else(|e| {
+            tracing::warn!("volume UUID unreadable, serial falls back to 1: {e:?}");
+            [0u8; 16]
+        });
         u32::from_le_bytes([u[0], u[1], u[2], u[3]]) | 1
     };
 

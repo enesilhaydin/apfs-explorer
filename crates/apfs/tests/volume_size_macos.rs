@@ -17,7 +17,9 @@
     )
 )]
 
-#[cfg(test)]
+// macOS formats and reports the volumes (hdiutil, statvfs); the raw disk is
+// read with Unix file calls.
+#[cfg(all(test, target_os = "macos"))]
 mod volume_size_macos {
     use apfs_core::block_device::{FileBlockDeviceRw, WritableOffsetBlockDevice};
     use std::process::Command;

@@ -95,15 +95,16 @@ Why it goes both ways:
 - APFS writes an edit to new blocks (copy-on-write), so a file edited in
   many places is read from several places on the drive; NTFS edits in
   place. And Windows does not cache file data on the mount (with WinFsp's
-  data caching on, copies of 4 GiB files hung in the kernel), so a file
-  read twice is read from the drive twice, where NTFS answers the second
-  time from memory.
+  data caching on, copies of 4 GiB files hung in the kernel). The mount
+  keeps the last 64 MiB of file data it read, so scattered reads done
+  again come from memory (4000 reads of 4 KiB in a 48 MiB file: 1.75 s,
+  then 0.22 s), but each request still makes the round trip to the
+  user-space process, where NTFS answers from the kernel's cache.
 
-Memory: the mount process holds a few MB of its own idle. Its metadata
-cache, capped at 64 MiB, now outlives each commit, so the process grows
-to about 80 MB through a 5-minute mixed workload (12 600 operations) and
-stays there, and reaches about 110 MB at most in the largest tests
-(100 000 files in one folder).
+Memory: the mount process holds a few MB of its own idle. Its two caches,
+metadata and file data, are capped at 64 MiB each and outlive each
+commit, so the process grows with use and stops there: about 160 MB
+through a 5-minute mixed workload (12 900 operations).
 
 ---
 

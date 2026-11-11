@@ -55,6 +55,36 @@ GitHub Actions runners** (no personal Mac required):
   in `tests/fixtures/` via Git LFS
 - `xtask gen-fixtures` is reproducible locally and in CI; images are kept small (<64 MB)
 
+## Size matrix (macOS)
+
+Small images cover the format but not its sizes: the space manager changes
+shape as a container grows, and a test suite of 64 MB images never sees it.
+`crates/apfs-write/tests/size_matrix.rs` has macOS format sparse raw files of
+1, 2, 4, 8, 32 and 64 TiB, each standing for one layout macOS uses:
+
+| Size | Layout |
+|---|---|
+| 1 TiB | one-block space manager and internal pool bitmap |
+| 2 TiB | internal pool bitmap over several blocks |
+| 4 TiB | space manager over two blocks |
+| 8 TiB | chunk-info addresses in address blocks (CABs) |
+| 32 TiB | block numbers past 2^32 |
+| 64 TiB | all of the above at once |
+
+Each size first checks that macOS laid it out in its class, then checks the
+reader against macOS (total size against `statvfs`, macOS's files byte for
+byte) and the writer against `fsck_apfs` and macOS reading back files written
+over several transactions, a snapshot included. The run takes about a minute
+and a few hundred MB of disk:
+
+```
+APFS_WRITE_SCRATCH=1 cargo test -p apfs-write --features write \
+  --test size_matrix -- --include-ignored --nocapture
+```
+
+A container of a new size class, or a structure whose shape depends on size,
+gets a row here.
+
 ## Fuzzing
 
 `fuzz/` holds `cargo-fuzz` targets (nightly toolchain, kept out of the main

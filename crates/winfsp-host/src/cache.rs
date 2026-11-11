@@ -57,6 +57,18 @@ const CONTENT_WINDOWS: usize = 4;
 /// window of 1 MiB for each read 1 MiB to use 8 KiB.
 const READ_AHEAD_AFTER: u64 = 16 << 10;
 
+/// Granularity of the content cache: one APFS block. A block's content
+/// never changes in place (copy-on-write), and a write through this device
+/// drops what it overlaps, so a cached block holds what the device holds,
+/// whichever files share it.
+const CONTENT_BLOCK: u64 = 4096;
+
+/// Content blocks kept: 64 MiB, a budget of its own beside the metadata's.
+/// Windows does not cache file data on the mount (its data caching hung
+/// copies of large files), so without it a file read twice was read from
+/// the drive twice.
+const CONTENT_BLOCKS: usize = (64 << 20) / CONTENT_BLOCK as usize;
+
 /// Content read ahead from the device offset `at`, last used at `used`.
 struct Window {
     at: u64,
@@ -86,6 +98,10 @@ pub struct CachingBlockDevice<D: BlockDevice> {
     content_end: u64,
     /// Bytes read in order up to and including the last content read.
     streak: u64,
+    /// Content blocks read, each with the stamp of its last use.
+    content: HashMap<u64, (Vec<u8>, u64)>,
+    /// Content blocks by the stamp of their last use, oldest first.
+    content_lru: BTreeMap<u64, u64>,
 }
 
 impl<D: BlockDevice> CachingBlockDevice<D> {
@@ -100,22 +116,120 @@ impl<D: BlockDevice> CachingBlockDevice<D> {
             windows: Vec::new(),
             content_end: u64::MAX,
             streak: 0,
+            content: HashMap::new(),
+            content_lru: BTreeMap::new(),
         }
     }
 
-    /// A content read (`offset..end`, larger than a block): from the window
-    /// when it holds it; a read that continues the previous one refills the
-    /// window from where it starts; any other goes to the device as asked.
+    /// A content read (`offset..end`): from the content cache when it holds
+    /// every block of it; otherwise read as below, and the whole blocks it
+    /// covers kept.
     fn read_content(&mut self, offset: u64, end: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         let in_order = offset == self.content_end;
         self.content_end = end;
-        let (len, size) = (buf.len() as u64, self.size);
+        let len = buf.len() as u64;
         self.streak = if in_order {
             self.streak.saturating_add(len)
         } else {
             len
         };
+        if self.content_hit(offset, end, buf) {
+            return Ok(());
+        }
         let stamp = self.next_stamp();
+        self.fetch_content(offset, end, buf, in_order, stamp)?;
+        self.keep_content(offset, buf);
+        Ok(())
+    }
+
+    /// Copy `offset..end` out of the content cache if it holds all of it.
+    /// Each block gets a stamp of its own: the eviction order is keyed by
+    /// stamp, and blocks sharing one left all but one out of it.
+    fn content_hit(&mut self, offset: u64, end: u64, buf: &mut [u8]) -> bool {
+        let (first, last) = (offset / CONTENT_BLOCK, (end - 1) / CONTENT_BLOCK);
+        if !(first..=last).all(|idx| self.content.contains_key(&idx)) {
+            return false;
+        }
+        for idx in first..=last {
+            let stamp = self.next_stamp();
+            let Some((block, used)) = self.content.get_mut(&idx) else {
+                return false;
+            };
+            self.content_lru.remove(used);
+            *used = stamp;
+            self.content_lru.insert(stamp, idx);
+            let bstart = idx * CONTENT_BLOCK;
+            let (from, to) = (bstart.max(offset), (bstart + CONTENT_BLOCK).min(end));
+            let (Some(src), Some(dst)) = (
+                block.get((from - bstart) as usize..(to - bstart) as usize),
+                buf.get_mut((from - offset) as usize..(to - offset) as usize),
+            ) else {
+                return false;
+            };
+            dst.copy_from_slice(src);
+        }
+        true
+    }
+
+    /// Keep every whole block `buf` (read at `offset`) covers, each under a
+    /// stamp of its own.
+    fn keep_content(&mut self, offset: u64, buf: &[u8]) {
+        let end = offset + buf.len() as u64;
+        let first = offset.div_ceil(CONTENT_BLOCK);
+        let last = end / CONTENT_BLOCK;
+        for idx in first..last {
+            let bstart = idx * CONTENT_BLOCK;
+            let from = (bstart - offset) as usize;
+            let Some(src) = buf.get(from..from + CONTENT_BLOCK as usize) else {
+                continue;
+            };
+            if let Some((_, used)) = self.content.remove(&idx) {
+                self.content_lru.remove(&used);
+            }
+            if self.content.len() >= CONTENT_BLOCKS {
+                if let Some((_, evict)) = self.content_lru.pop_first() {
+                    self.content.remove(&evict);
+                }
+            }
+            let stamp = self.next_stamp();
+            self.content.insert(idx, (src.to_vec(), stamp));
+            self.content_lru.insert(stamp, idx);
+        }
+    }
+
+    /// Drop the cached content blocks holding any of `offset..end`.
+    fn forget_content(&mut self, offset: u64, end: u64) {
+        let (first, last) = (offset / CONTENT_BLOCK, (end - 1) / CONTENT_BLOCK);
+        if last - first >= self.content.len() as u64 {
+            let lru = &mut self.content_lru;
+            self.content.retain(|&idx, (_, used)| {
+                let keep = idx < first || idx > last;
+                if !keep {
+                    lru.remove(used);
+                }
+                keep
+            });
+        } else {
+            for idx in first..=last {
+                if let Some((_, used)) = self.content.remove(&idx) {
+                    self.content_lru.remove(&used);
+                }
+            }
+        }
+    }
+
+    /// Read content the cache does not hold: from the window when it holds
+    /// it; a read that continues the previous one refills the window from
+    /// where it starts; any other goes to the device as asked.
+    fn fetch_content(
+        &mut self,
+        offset: u64,
+        end: u64,
+        buf: &mut [u8],
+        in_order: bool,
+        stamp: u64,
+    ) -> Result<(), BlockError> {
+        let (len, size) = (buf.len() as u64, self.size);
         let oor = || BlockError::OutOfRange { offset, len, size };
         if let Some(w) = self.windows.iter_mut().find(|w| w.holds(offset, end)) {
             w.used = stamp;
@@ -206,7 +320,8 @@ impl<D: BlockDevice> BlockDevice for CachingBlockDevice<D> {
 
     /// File content, whatever its size: Windows passes a program's 4 KiB
     /// reads through as they come, and kept as metadata they filled the
-    /// whole cache (97 MB of mount memory after reading large files).
+    /// whole cache (97 MB of mount memory after reading large files). It is
+    /// kept in the content cache instead, within that cache's own budget.
     fn read_content_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), BlockError> {
         let len = buf.len() as u64;
         if len == 0 {
@@ -292,12 +407,14 @@ impl<D: WritableBlockDevice> WritableBlockDevice for CachingBlockDevice<D> {
         self.blocks.clear();
         self.lru.clear();
         self.windows.clear();
+        self.content.clear();
+        self.content_lru.clear();
         self.inner.invalidate_read_cache();
     }
 
     /// Write-through: forward to the inner device, then invalidate any
-    /// cached blocks that overlap the written range. The cache is a
-    /// read-ahead cache only; we do not buffer writes (the inner
+    /// cached metadata, read-ahead and content that overlaps the written
+    /// range. The caches hold reads only; we do not buffer writes (the inner
     /// PhysicalDrive opens with FILE_FLAG_WRITE_THROUGH for durability).
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
         let len = buf.len() as u64;
@@ -330,6 +447,7 @@ impl<D: WritableBlockDevice> WritableBlockDevice for CachingBlockDevice<D> {
             self.forget(idx);
         }
         self.forget_window(offset, end);
+        self.forget_content(offset, end);
         result
     }
 
@@ -552,6 +670,138 @@ mod tests {
             "{} device reads for 2 MiB",
             dev.inner.reads
         );
+    }
+
+    /// Scattered 4 KiB reads, as Windows passes a program's reads through:
+    /// a block read once comes from memory the next time.
+    #[test]
+    fn content_read_again_comes_from_memory() {
+        let data = pattern(8 << 20);
+        let mut dev = CachingBlockDevice::new(CountedMem {
+            data: data.clone(),
+            reads: 0,
+            bytes: 0,
+        });
+        let blocks: Vec<usize> = (0..300).map(|i| (i * 677) % 2048).collect();
+        let read_all = |dev: &mut CachingBlockDevice<CountedMem>| {
+            for &k in &blocks {
+                let mut b = vec![0u8; 4096];
+                dev.read_content_at((k * 4096) as u64, &mut b).unwrap();
+                assert_eq!(b, &data[k * 4096..(k + 1) * 4096], "block {k}");
+            }
+        };
+        read_all(&mut dev);
+        let first = dev.inner.reads;
+        assert!(first > 0);
+        read_all(&mut dev);
+        assert_eq!(dev.inner.reads, first, "the second pass reads the device");
+        assert!(
+            dev.blocks.is_empty(),
+            "content stays out of the block cache"
+        );
+    }
+
+    #[test]
+    fn a_write_drops_the_content_it_overlaps() {
+        let data = pattern(4 << 20);
+        let mut dev = CachingBlockDevice::new(MemRw { data: data.clone() });
+        let mut b = vec![0u8; 4096];
+        dev.read_content_at(65536, &mut b).unwrap();
+        dev.read_content_at(3 << 20, &mut b).unwrap();
+        // A write inside the block, then one over the whole of another.
+        dev.write_at(65536 + 1024, &[0xCD; 512]).unwrap();
+        dev.write_at(3 << 20, &[0xEF; 4096]).unwrap();
+        dev.read_content_at(65536, &mut b).unwrap();
+        let mut want = data[65536..65536 + 4096].to_vec();
+        want[1024..1536].fill(0xCD);
+        assert_eq!(b, want, "the read sees the write inside the block");
+        dev.read_content_at(3 << 20, &mut b).unwrap();
+        assert_eq!(
+            b,
+            vec![0xEF; 4096],
+            "the read sees the write over the block"
+        );
+        dev.invalidate_read_cache();
+        assert!(dev.content.is_empty(), "dropping the cache drops content");
+    }
+
+    #[test]
+    fn the_content_cache_holds_its_budget() {
+        let n = CONTENT_BLOCKS + 10;
+        let data = pattern(n * 4096);
+        let mut dev = CachingBlockDevice::new(CountedMem {
+            data,
+            reads: 0,
+            bytes: 0,
+        });
+        let mut b = vec![0u8; 4096];
+        // Last block first, so no read is in order and none is read ahead.
+        for k in (0..n).rev() {
+            dev.read_content_at((k * 4096) as u64, &mut b).unwrap();
+        }
+        assert_eq!(dev.content.len(), CONTENT_BLOCKS);
+        let before = dev.inner.reads;
+        dev.read_content_at(0, &mut b).unwrap();
+        assert_eq!(dev.inner.reads, before, "the newest block stays");
+        dev.read_content_at(((n - 1) * 4096) as u64, &mut b)
+            .unwrap();
+        assert_eq!(dev.inner.reads, before + 1, "the oldest block went");
+        assert_eq!(dev.content.len(), CONTENT_BLOCKS);
+    }
+
+    /// Reads of many blocks each, as a copy makes: every block gets its own
+    /// place in the eviction order, so the budget holds. Sharing one place
+    /// per read let the cache grow by all but one block of every read.
+    #[test]
+    fn large_reads_keep_the_content_budget() {
+        let data = pattern(CONTENT_BLOCKS * 4096 + (8 << 20));
+        let mut dev = CachingBlockDevice::new(CountedMem {
+            data: data.clone(),
+            reads: 0,
+            bytes: 0,
+        });
+        for (k, off) in (0..data.len()).step_by(1 << 20).enumerate() {
+            let len = (1 << 20).min(data.len() - off);
+            let mut b = vec![0u8; len];
+            dev.read_content_at(off as u64, &mut b).unwrap();
+            assert_eq!(b, &data[off..off + len], "read {k}");
+            assert!(
+                dev.content.len() <= CONTENT_BLOCKS,
+                "read {k}: {}",
+                dev.content.len()
+            );
+            assert_eq!(dev.content.len(), dev.content_lru.len(), "read {k}");
+        }
+        // Again, read back from the middle: hits refresh blocks one by one.
+        let mut b = vec![0u8; 1 << 20];
+        dev.read_content_at((CONTENT_BLOCKS * 4096) as u64, &mut b)
+            .unwrap();
+        assert_eq!(dev.content.len(), dev.content_lru.len());
+    }
+
+    #[test]
+    fn unaligned_content_reads_are_exact() {
+        let data = pattern(2 << 20);
+        let mut dev = CachingBlockDevice::new(CountedMem {
+            data: data.clone(),
+            reads: 0,
+            bytes: 0,
+        });
+        let reads: Vec<(usize, usize)> = (0..400)
+            .map(|i| {
+                (
+                    (i * 7919 + i * i * 13) % ((2 << 20) - 70_000),
+                    1 + (i * 4099) % 66_000,
+                )
+            })
+            .collect();
+        for _ in 0..2 {
+            for &(off, len) in &reads {
+                let mut b = vec![0u8; len];
+                dev.read_content_at(off as u64, &mut b).unwrap();
+                assert_eq!(b, &data[off..off + len], "off={off} len={len}");
+            }
+        }
     }
 
     #[test]

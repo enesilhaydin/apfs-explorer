@@ -1414,8 +1414,17 @@ impl<D: WritableBlockDevice + Send + 'static> FileSystemContext for ApfsFs<D> {
                     } else {
                         format!("{}/{}", context.path, e.name)
                     };
-                    if let Some(a) = fs.getattr(&child).ok().flatten() {
-                        Self::fill_info(&a, di.file_info_mut());
+                    match fs.getattr(&child) {
+                        Ok(Some(a)) => Self::fill_info(&a, di.file_info_mut()),
+                        Ok(None) => {}
+                        // Still listed, so the rest of the folder shows, but
+                        // with no size or times: said, not passed over.
+                        Err(e) => {
+                            static WARNED: AtomicBool = AtomicBool::new(false);
+                            if !WARNED.swap(true, Ordering::Relaxed) {
+                                tracing::warn!("listing {child:?}: attributes unreadable: {e:?}");
+                            }
+                        }
                     }
                     if !di.append_to_buffer(buffer, &mut cursor) {
                         // Buffer full - WinFsp will re-call with marker = the
@@ -2776,7 +2785,12 @@ pub fn mount_apfs(
     // P14 (FINDING-05): stable Windows volume serial from the APFS volume UUID,
     // OR 1 so it is never zero (Windows treats serial 0 as "unknown").
     let serial = {
-        let u = fsview.volume_uuid().unwrap_or([0u8; 16]);
+        let u = fsview.volume_uuid().unwrap_or_else(|e| {
+            // Every volume would then share serial 1: Windows tells them
+            // apart by it, so say why.
+            tracing::warn!("volume UUID unreadable, serial falls back to 1: {e:?}");
+            [0u8; 16]
+        });
         u32::from_le_bytes([u[0], u[1], u[2], u[3]]) | 1
     };
 
